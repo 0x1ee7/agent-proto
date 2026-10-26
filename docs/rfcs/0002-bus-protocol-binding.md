@@ -61,7 +61,7 @@ Terms below are not defined in RFC-0001.
 
 [0002-003] Subject tokens MUST NOT contain the characters `.`, `*`, `>`, whitespace or any character outside `[a-z0-9-]` except as already allowed by the grammars above and the task id rule in [0002-004]. A receiver MUST treat any other subject as addressed to nobody and drop it with a bus-level error where a reply is possible (section 4.7).
 
-[0002-004] Task ids placed in subjects MUST be UUIDv7 strings in lowercase hexadecimal with hyphens (36 characters). The Worker assigns every task id (RFC-0001 4.4, L4). A Worker MUST NOT accept client-supplied task ids for new tasks.
+[0002-004] Task ids placed in subjects MUST be UUIDv7 strings in lowercase hexadecimal with hyphens (36 characters). The Worker assigns every task id (RFC-0001 4.4, L4). A Worker MUST NOT accept client-supplied task ids for new tasks. A request that names a task id the Worker does not hold MUST be answered `TASK_NOT_FOUND` (A2A section 3.4.2 requires TaskNotFoundError for a client taskId that does not reference an existing task); the Worker MUST NOT create a task under a client-supplied id.
 
 [0002-005] Subject families are exactly:
 
@@ -109,11 +109,17 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 
 [0002-021] The proto message names above are those of the A2A v1.0 protobuf (`lf.a2a.v1`, L1). A binding MUST NOT add fields to them. Where A2A requires a field to be absent, the binding MUST keep it absent.
 
-[0002-022] A Worker MUST implement every operation token whose A2A operation it can serve. An operation the Worker does not serve MUST be answered with the error defined for it in section 4.8 (capability validation, A2A section 3.3.4), not silently dropped.
+[0002-022] A Worker MUST implement every operation token whose A2A operation it can serve. An operation the Worker does not serve MUST be answered with the error defined for it in section 4.8 (capability validation, A2A section 3.3.4), not silently dropped. For `card-ext`, a Worker whose card has `capabilities.extendedAgentCard` false or absent MUST answer `UNSUPPORTED_OPERATION`; `EXTENDED_AGENT_CARD_NOT_CONFIGURED` applies only when the card declares `extendedAgentCard` true and no extended card is configured (A2A sections 3.3.4 and 3.1.11).
 
 [0002-023] A request subject whose operation token is not in the table of [0002-020] MUST be answered with `google.rpc.Status` code `UNIMPLEMENTED` (12), reason `UNSUPPORTED_OPERATION`, domain `a2a-protocol.org`. The binding defines no aliases on the bus: method names such as `message/send` are not valid operation tokens. Aliasing of HTTP method names is an ingress concern of the gateway only (R-I6, RFC-0008).
 
 [0002-024] The `push-*` operations are capability-gated. A Worker that declares `capabilities.pushNotifications` false (the M1 default for bus agents, section 4.9) MUST reply to every `push-*` request with `PushNotificationNotSupportedError` (A2A section 3.3.4). Webhook delivery is therefore not a bus feature in M1; subscribers use event subjects (section 4.5).
+
+[0002-087] `historyLength` (A2A sections 3.1.3 and 3.2.4) bounds the history of each Task the Worker returns on `send`, `stream`, `get` and `list`. Unset returns the history the Worker retains (RFC-0005 [0005-045]). A value N returns at most N history messages. Zero requests no history messages: the Task's `history` field is omitted. A Worker MUST NOT return more messages than the value requested. `subscribe` has no `historyLength` in A2A v1.0 and is not affected.
+
+[0002-088] A `list` reply (ListTasks) MUST carry `nextPageToken` on every page (empty on the last page) and `totalSize` (A2A section 3.1.4). `statusTimestampAfter` selects tasks whose status timestamp is at or after the given value, not strictly after (A2A section 3.1.4). With `includeArtifacts` false the `artifacts` field MUST be omitted from each Task. A `list` result MUST contain only tasks visible to the requester (RFC-0005 [0005-004]).
+
+[0002-089] A Worker that cannot accept a client-supplied `contextId` MUST reject the request with `INVALID_PARAMS` and MUST NOT generate a new context in its place (A2A section 3.4.1). The `contextId` a Worker stores is scoped to the origin of the request (RFC-0005 [0005-002]); two origins never share a context.
 
 ### 4.4 Bus headers
 
@@ -170,7 +176,7 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 
 [0002-043] A requester consuming an event subject MUST ignore events whose `seq` is not greater than the highest `seq` it has already processed for that task (idempotent handling, L5). A gap (a received `seq` greater than the previous highest plus one) MUST be treated as a broken stream: the requester MUST fetch the task with `get` and resubscribe from the highest processed `seq` (section 4.5.2).
 
-[0002-044] A stream end is the first event whose `TaskStatusUpdateEvent.status.state` is terminal (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`) or interrupted (`INPUT_REQUIRED`). That event MUST carry the header `A2AB-Stream-End: true` (L3). No event after the stream end is published for that task until the task is resumed by a new `send` (L10). Note the conflict with A2A section 3.1.2, recorded in section 7.
+[0002-044] A stream end is the first event whose `TaskStatusUpdateEvent.status.state` is terminal (`COMPLETED`, `FAILED`, `CANCELED`, `REJECTED`) or interrupted (`INPUT_REQUIRED`, or `AUTH_REQUIRED`, which no M1 Worker emits per [0005-009]). That event MUST carry the header `A2AB-Stream-End: true` (L3). No event after the stream end is published for that task until the task is resumed by a new `send` (L10). Note the conflict with A2A section 3.1.2, recorded in section 7.
 
 [0002-045] The Worker MUST NOT rely on subscribers being present. Events are durable (RFC-0010): a subscriber that connects later replays from the sequence it needs. Delivery of events to requesters through durable consumer reads is an M1 gap of the NATS binding (RFC-0010 [0010-060]; section 9 O-9).
 
@@ -178,7 +184,7 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 
 #### 4.5.1 SendMessage and SendStreamingMessage
 
-[0002-050] `send` (SendMessage) with `configuration.returnImmediately` false or absent MUST NOT reply until the task reaches a terminal or interrupted state, or until the Worker has produced a Message response, and then MUST reply with `SendMessageResponse` holding that Task or Message. The wait is also bounded by the smaller of the caller's timeout and the task deadline (RFC-0005 [0005-046]); at that bound the reply carries the current non-terminal Task. With `returnImmediately` true the Worker MUST reply as soon as the Task (or Message) is recorded and processing continues in the background (A2A sections 3.2.2 and 3.3.3). Note the conflict with A2A section 3.1.1, recorded in section 7.
+[0002-050] `send` (SendMessage) with `configuration.returnImmediately` false or absent MUST NOT reply until the task reaches a terminal or interrupted state (`INPUT_REQUIRED`, or `AUTH_REQUIRED`, which no M1 Worker emits), or until the Worker has produced a Message response, and then MUST reply with `SendMessageResponse` holding that Task or Message. The wait is also bounded by the smaller of the caller's timeout and the task deadline (RFC-0005 [0005-046]); at that bound the reply carries the current non-terminal Task. With `returnImmediately` true the Worker MUST reply as soon as the Task (or Message) is recorded and processing continues in the background (A2A sections 3.2.2 and 3.3.3). Note the conflict with A2A section 3.1.1, recorded in section 7.
 
 [0002-051] The reply to a `send` that carries a Task MUST contain header `A2AB-Last-Seq` equal to the highest `seq` recorded for that task at the time of the reply (0 if none), and the Task MUST carry `Task.metadata["urn:a2abus:ext:sequence:1"]` with `seq` equal to that value (RFC-0005 [0005-021]). The requester uses it as the starting point for any event subscription.
 
@@ -230,6 +236,8 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 
 [0002-090] A Worker answers a request either with the success payload of section 4.3 or with a `google.rpc.Status` message, selected by `A2AB-Payload-Type: google.rpc.Status`. An error reply MUST carry exactly one `google.rpc.ErrorInfo` detail. Its `domain` is `a2a-protocol.org` for A2A errors and `a2abus.v1` for bus-level errors.
 
+[0002-096] Validation errors for an A2A operation (`InvalidParamsError`, `ExtensionDataInvalid`) SHOULD carry a `google.rpc.BadRequest` detail whose `fieldViolations` name the failing field (A2A section 3.3.2). The `ErrorInfo` stays the only `ErrorInfo` detail (section 4.8 [0002-090]).
+
 [0002-091] A2A errors MUST use the status code and `ErrorInfo.reason` below. The `reason` is the A2A error name in UPPER_SNAKE_CASE without the `Error` suffix (A2A section 11.6). `status.code` values are gRPC codes, and these are the codes the HTTP gateway (RFC-0008) maps to HTTP status.
 
 | A2A error | `status.code` | `ErrorInfo.reason` |
@@ -280,6 +288,10 @@ The table follows the A2A canonical mapping (A2A section 5.4); the gRPC codes ar
 [0002-103] Bus agents M1 declare `capabilities.streaming` true when `stream` and `subscribe` are served and `capabilities.pushNotifications` false (section 4.3 [0002-024]). `capabilities.extendedAgentCard` is true only when an extended card is configured.
 
 [0002-104] Card signing (JWS, RFC 8785 canonicalization) is owned by RFC-0007 and RFC-0004 (L11). This RFC adds no card content beyond [0002-100] to [0002-103].
+
+[0002-085] The bus Agent Card (RFC-0004 storage, served by the gateway under [0002-102]) MUST NOT declare `securitySchemes` or `security`. Bus credentials are RFC-0007 signatures and bus permissions. A2A card security is not used on the bus until RFC-0007 defines a scheme for it. A custom binding must address security (A2A sections 12.6 and 13); section 6 of this RFC does so. The gateway's HTTP view is derived by RFC-0003 and stays spec-pure.
+
+[0002-086] A change to this binding that breaks an existing wire contract MUST use a new binding URI (A2A section 5.8). The M1 URI is `urn:a2abus:binding:bus:1`. A Worker migrating to a new URI MAY declare both `supportedInterfaces` entries during the migration; each entry MUST describe the wire contract its URI names.
 
 ### 4.10 Payload size and large content
 
@@ -522,6 +534,8 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 
 **What is lost.** Relative to a direct HTTP A2A exchange, the bus binding adds no loss of A2A semantics. Push webhooks are not offered on the bus in M1 (section 4.3 [0002-024]). Clients that need push use the gateway, which may implement webhook delivery from the event subject (open issue O-1).
 
+**Spike findings: deliberate deviations and tolerance.** Verified by spike a2a-binding-conformance (stub) and the Hermes spike; real-model behaviour is not observed. D-1 Protobuf payloads on the bus (0002-035, 0002-037, 0002-038): bus-only; the gateway emits proto-JSON (RFC-0008), so HTTP clients see no change. D-2 No push on the bus (0002-024): via the gateway a client that sends push credentials gets `PUSH_NOTIFICATION_NOT_SUPPORTED`; RFC-0008 owns the gateway behaviour and the credential rule. D-3 Bounded blocking wait (0002-050): when the bound passes, the reply carries the non-terminal Task, which A2A section 3.2.2 does not allow for a blocking send; a client must poll with `get`. D-4 Stream closes at `INPUT_REQUIRED` (0002-044): A2A section 3.1.2 says terminal only, section 11.7 says terminal or interrupted; this binding follows 11.7, and a requester recovers with `subscribe` (0002-062). D-5 Not a deviation: an empty `A2A-Version` is rejected with `VersionNotSupportedError` (0002-080); Hermes accepts absent versions, which the bridge tolerates (RFC-0008). D-6 No AUTH_REQUIRED in M1 (0002-044, 0002-050): no M1 Worker requests in-task auth, so A2A section 7.6.1 is not triggered; an external peer AUTH_REQUIRED is mapped to FAILED by the bridge (RFC-0008).
+
 ## 6. Security considerations
 
 - **T4 Replay and duplication.** `A2AB-Msg-Id` (UUIDv7), `A2AB-Nonce` (signed), `A2AB-Ts` and `A2AB-Ttl-Ms` bound replay. Dedupe for submissions and events is in RFC-0005 and RFC-0011. Event `A2AB-Msg-Id` is stable across re-publish (section 4.4 [0002-031]).
@@ -564,7 +578,7 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 | [0002-001] | Publish from a test client on subject without root; expect drop or reject | MUST |
 | [0002-002] | Use an agent id outside the grammar; expect `MALFORMED_MESSAGE` | MUST |
 | [0002-003] | Subject with `*` or uppercase token; expect no delivery | MUST |
-| [0002-004] | Client-supplied task id on a new `send`; expect the Worker to assign its own | MUST |
+| [0002-004] | Client-supplied task id on a new `send` expects the Worker to assign its own; `send` with an unknown taskId expects `TASK_NOT_FOUND` | MUST |
 | [0002-005] | Publish on an undefined family; expect no Worker reaction | MUST |
 | [0002-006] | Worker publish on another agent's event subject; expect bus permission denial (bus-mem fault test) | MUST |
 | [0002-007] | Start two Worker instances for one agent; expect presence conflict (RFC-0004) | MUST |
@@ -575,7 +589,7 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 | [0002-014] | Gateway-set origin honored from gateway sender only; same header from other sender ignored | MUST |
 | [0002-020] | Each operation token round-trip with proto payloads | MUST |
 | [0002-021] | Diff generated proto types against `lf.a2a.v1`; no added fields | MUST |
-| [0002-022] | Unserved operation returns the specified error, not silence | MUST |
+| [0002-022] | Unserved operation returns the specified error, not silence; `card-ext` with `extendedAgentCard` false expects `UNSUPPORTED_OPERATION` | MUST |
 | [0002-023] | Send `message/send` as operation token; expect `UNIMPLEMENTED` | MUST |
 | [0002-024] | `push-create` on bus agent; expect `PUSH_NOTIFICATION_NOT_SUPPORTED` | MUST |
 | [0002-030] | Header table check: presence per message kind | MUST |
@@ -591,7 +605,7 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 | [0002-041] | Event payload check: one of statusUpdate or artifactUpdate, no Task element | MUST |
 | [0002-042] | Events of one task strictly increasing seq from 1; no publish before ack | MUST |
 | [0002-043] | Duplicate seq ignored; seq gap triggers get and resubscribe | MUST |
-| [0002-044] | Stream end header on first terminal or interrupted event only | MUST |
+| [0002-044] | Stream end header on first terminal or interrupted event only; interrupted includes `AUTH_REQUIRED`, which M1 never emits | MUST |
 | [0002-045] | Subscriber started after completion replays all events | MUST |
 | [0002-046] | Terminal-task events present 24 h after terminal; after event max age events absent and `get` serves the authoritative snapshot; max age configured at least max(7 d, T_task + 24 h) | MUST |
 | [0002-050] | Blocking `send` returns only at terminal or interrupted; `returnImmediately` returns at Task | MUST |
@@ -629,6 +643,12 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 | [0002-111] | Blob URL form and hash match content | MUST |
 | [0002-112] | Corrupted blob fails verification; cross-tenant reference rejected | MUST |
 | [0002-113] | Oversize payload without reference: `PAYLOAD_TOO_LARGE`, no truncation | MUST |
+| [0002-085] | Bus card with `securitySchemes` or `security` rejected by card check | MUST |
+| [0002-086] | Breaking wire change published under the old binding URI; expect a new URI | MUST |
+| [0002-087] | `historyLength` 0 returns no history and omits the field; N returns at most N messages | MUST |
+| [0002-088] | `list` reply without `nextPageToken` rejected; `statusTimestampAfter` equal to a status timestamp includes the task; `includeArtifacts` false omits artifacts | MUST |
+| [0002-089] | Unacceptable client `contextId` expects `INVALID_PARAMS`; no new context generated | MUST |
+| [0002-096] | Validation error carries a `BadRequest` detail naming the field | SHOULD |
 
 Levels: MUST = required for any conformant bus binding; SHOULD = recommended, failures reported by the suite.
 

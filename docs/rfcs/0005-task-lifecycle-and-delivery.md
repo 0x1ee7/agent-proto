@@ -45,7 +45,7 @@ Terms from RFC-0001 (Worker, Backend, task, seq, ev subject) are used as defined
 - [0005-001] The owner Worker MUST assign the task id (UUIDv7) for every task it creates. A requester MUST NOT choose a task id for a new task; a SendMessage carrying an unknown task id returns TaskNotFoundError.
 - [0005-002] If a new SendMessage omits contextId, the Worker MUST assign one (UUIDv7). Context ids are scoped by (effective origin, contextId) as defined in RFC-0008; the same contextId string from another origin names a different context and never matches. The gateway never rewrites contextId. A continuation (section 4.2, [0005-008]) MUST carry both the task id and the contextId of the existing task; a mismatch returns TaskNotFoundError, not a new task.
 - [0005-003] Only the owner Worker MAY publish events for a task. Requests for a task id addressed to any other agent MUST return TaskNotFoundError.
-- [0005-004] A task is visible only to its effective origin (RFC-0008; for a bus caller, the agent identity that created it) and to operator identities (RFC-0007). Requests from any other origin MUST return TaskNotFoundError (wire: gRPC NOT_FOUND with ErrorInfo reason `TASK_NOT_FOUND` and domain `a2a-protocol.org` per RFC-0002 [0002-091]; JSON-RPC -32001 via RFC-0008), so that task ids cannot be probed.
+- [0005-004] A task is visible only to its effective origin (RFC-0008; for a bus caller, the agent identity that created it) and to operator identities (RFC-0007). This applies to GetTask, ListTasks, CancelTask, SubscribeToTask and contextId history. Requests from any other origin MUST return TaskNotFoundError (wire: gRPC NOT_FOUND with ErrorInfo reason `TASK_NOT_FOUND` and domain `a2a-protocol.org` per RFC-0002 [0002-091]; JSON-RPC -32001 via RFC-0008), so that task ids cannot be probed. A ListTasks result contains only tasks visible to the requester.
 
 ### 4.2 States and transitions
 
@@ -150,10 +150,14 @@ stateDiagram-v2
 
 ### 4.8 Read consistency and history
 
-- [0005-044] GetTask and ListTasks MUST be served from the owner store and MUST reflect the last committed state. ListTasks is ordered by last update, newest first, with the A2A paging defaults (pageSize 50, maximum 100).
-- [0005-045] historyLength is interpreted as: unset returns all retained messages; 0 returns no history (the field is omitted); N greater than 0 returns at most the N most recent messages. History contains messages only, never events. This resolves the wording conflict D-2.
-- [0005-046] With returnImmediately false, SendMessage MUST wait until the task is interrupted or terminal, or until the smaller of the caller's timeout and the task deadline. If the wait ends first, the reply is the Task in its current non-terminal state, and the task continues. With returnImmediately true, the reply follows the commit of the SUBMITTED state.
+- [0005-044] GetTask and ListTasks MUST be served from the owner store and MUST reflect the last committed state. ListTasks is ordered by last update, newest first, with the A2A paging defaults (pageSize 50, maximum 100). Every ListTasks reply MUST carry `nextPageToken` (empty on the last page) and `totalSize` (A2A section 3.1.4). `statusTimestampAfter` selects tasks whose status timestamp is at or after the given value, not strictly after. The result contains only tasks visible under [0005-004].
+- [0005-045] historyLength is interpreted as: unset returns all retained messages; 0 returns no history (the field is omitted); N greater than 0 returns at most the N most recent messages. History contains messages only, never events. The rule applies to SendMessage, SendStreamingMessage, GetTask and ListTasks; SubscribeToTask has no historyLength (A2A section 3.1.6) and is not affected. This resolves the wording conflict D-2 and GAP-C.
+- [0005-046] With returnImmediately false, SendMessage MUST wait until the task is interrupted (INPUT_REQUIRED, or AUTH_REQUIRED per A2A section 3.2.2; M1 never emits AUTH_REQUIRED, [0005-009]) or terminal, or until the smaller of the caller's timeout and the task deadline. If the wait ends first, the reply is the Task in its current non-terminal state, and the task continues. With returnImmediately true, the reply follows the commit of the SUBMITTED state.
 - [0005-047] A new task may share a contextId with an earlier task. A SendMessage without a task id always creates a new task, even inside an existing context (`a2a-spec-notes.md` section 3.5).
+
+- [0005-051] A CancelTask from an origin other than the task's origin MUST return TaskNotFoundError (wire -32001, `TASK_NOT_FOUND`), never TaskNotCancelableError (-32002). TaskNotCancelableError applies only to a same-origin cancel of a terminal task ([0005-038]). A bridge fronting an external agent MUST apply the same rule to that agent's replies (Hermes returned -32002 for a cross-origin cancel in spike hermes-a2a, T23).
+
+- [0005-052] A bridge that forwards to an external agent with a shared context model (Hermes) MUST namespace the external contextId per bus origin, derived from the origin and the bus contextId, so that two origins never share model history. The bridge MUST NOT forward GetTask, CancelTask or SubscribeToTask for a task id owned by another origin (it returns TaskNotFoundError, [0005-004]), and MUST NOT send ListTasks to an external agent at all. RFC-0008 and RFC-0009 implement this rule; this RFC states it. Spike hermes-a2a: T21 shared model history, T22 cross-origin GetTask returned the full task, T24 ListTasks exposed another origin's tasks.
 
 ### 4.9 Failure code registry
 
@@ -290,7 +294,7 @@ ACP agents (omp `--mode acp`, `claude-agent-acp`, `acp-omp-claude.md`):
 | 0005-001 | Send with a client-chosen task id; expect TaskNotFoundError and no task created | MUST |
 | 0005-002 | Continuation with mismatched contextId; expect TaskNotFoundError | MUST |
 | 0005-003 | Second agent requests a task owned by another; expect TaskNotFoundError | MUST |
-| 0005-004 | Unrelated identity calls GetTask on a task; expect TaskNotFoundError | MUST |
+| 0005-004 | Unrelated identity calls GetTask, ListTasks, CancelTask or SubscribeToTask; expect TaskNotFoundError; ListTasks lists only visible tasks | MUST |
 | 0005-005 | Inject TASK_STATE_UNSPECIFIED in a request; expect InvalidParamsError; check no emission | MUST |
 | 0005-006 | Attempt COMPLETED to WORKING via test hook; expect refusal and audit record | MUST |
 | 0005-007 | Deliver a backend event after COMPLETED; expect no event published and audit record | MUST |
@@ -330,13 +334,15 @@ ACP agents (omp `--mode acp`, `claude-agent-acp`, `acp-omp-claude.md`):
 | 0005-041 | Deadline expires in WORKING and INPUT_REQUIRED; codes DEADLINE_EXCEEDED and APPROVAL_TIMEOUT | MUST |
 | 0005-042 | Owner clock skewed by one hour in test; deadlines still fire at the local configured time | SHOULD |
 | 0005-043 | Terminal task purged after T_task; GetTask returns TaskNotFoundError | MUST |
-| 0005-044 | ListTasks paging and ordering against a populated store | MUST |
+| 0005-044 | ListTasks paging and ordering against a populated store; `nextPageToken` and `totalSize` on every reply; `statusTimestampAfter` at or after | MUST |
 | 0005-045 | historyLength unset, 0 and N; returned history matches each rule | MUST |
-| 0005-046 | Blocking send with a short caller timeout returns the non-terminal Task; task continues | MUST |
+| 0005-046 | Blocking send with a short caller timeout returns the non-terminal Task and the task continues; a simulated INPUT_REQUIRED also returns the blocking send | MUST |
 | 0005-047 | Second SendMessage without task id in an existing context creates a new task | MUST |
 | 0005-048 | Static check: every code emitted appears in the registry table | MUST |
 | 0005-049 | FAILED status carries key a2abus.failure and a readable text part | MUST |
 | 0005-050 | Presence DRAINING: new send refused UNAVAILABLE with reason DRAINING and no task created; a running task still finishes | MUST |
+| 0005-051 | Cross-origin CancelTask expects TaskNotFoundError, not -32002; same-origin cancel of a terminal task still gets TaskNotCancelableError | MUST |
+| 0005-052 | Two origins send the same contextId through the Hermes bridge: no shared model history; cross-origin GetTask, CancelTask and SubscribeToTask are not forwarded; ListTasks is not sent | MUST |
 
 ## 9. Open issues
 

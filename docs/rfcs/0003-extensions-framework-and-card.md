@@ -145,7 +145,7 @@ flowchart TD
 
 [0003-027] `capabilities` on the bus card MUST set `streaming: true` for every M1 bus agent, because the bus binding delivers events for it (RFC-0002 [0002-103], RFC-0005), `pushNotifications: false` in M1, `extendedAgentCard: false` in M1, and `extensions` as in sec 4.2.
 
-[0003-028] The bus card MUST NOT contain the HTTP bearer scheme. Bus authentication is by bus identity (RFC-0010, RFC-0007). The bus card MAY include the `securitySchemes` entry the agent uses on the bus, using the A2A `SecurityScheme` form with a scheme that the bus binding defines (RFC-0002).
+[0003-028] The bus card MUST NOT contain the HTTP bearer scheme and MUST NOT declare `securitySchemes` or `security` (RFC-0002 [0002-085]). Bus authentication is by bus identity (RFC-0010, RFC-0007). A bus card security scheme MAY be added only after RFC-0007 defines one.
 
 ### 4.6 Agent Card: HTTP view
 
@@ -174,7 +174,7 @@ flowchart TD
 
 [0003-036] Each agent's skills MUST be derived from its driver configuration and, where the backend reports them, from the backend's capability report at startup. A skill MUST NOT be advertised for a backend capability the driver does not expose.
 
-[0003-037] Skill ids MUST be unique within a card. Bus-native agents (omp, claude) use the form `<agentId>.<capability>` (lowercase, dot, hyphen allowed). Hermes skills are ingested from its card with their original ids (`toolset.<name>`) and the same agent id prefix is NOT added, because Hermes capability matching uses its own config and the id must stay recognizable to Hermes operators.
+[0003-037] Skill ids MUST be unique within a card and MUST NOT name internal tool names. Bus-native agents (omp, claude) use the form `<agentId>.<capability>` (lowercase, dot, hyphen allowed). Hermes skills are coarse: one skill per Hermes toolset, with id `hermes.<toolset>` (for example `hermes.terminal`), as required by [0003-051]. The agent id prefix is added to every ingested id, so the id is traceable to its Hermes origin.
 
 [0003-038] Skill derivation per agent in M1:
 
@@ -182,9 +182,9 @@ flowchart TD
 |---|---|---|
 | omp | Static driver config for ACP sessions (`omp --mode acp`), with ACP `agentCapabilities` reported at `initialize` (`docs/interop/acp-omp-claude.md` sec 2.3) | `omp.code-edit`, `omp.shell`, `omp.repo-qa` |
 | claude | Static driver config plus claude-agent-acp `agentCapabilities` at `initialize` (sec 4 of the same note) | `claude.code-edit`, `claude.repo-qa` |
-| hermes | Ingested from Hermes card `skills[]` (`docs/interop/hermes.md` sec 2) | `toolset.web`, `toolset.terminal` |
+| hermes | Ingested from Hermes card `skills[]` and grouped by toolset (`docs/interop/hermes.md` sec 2; [0003-051]) | `hermes.web`, `hermes.terminal` |
 
-[0003-039] Skill `tags` MUST include the agent id as the first tag (for example `omp`), followed by backend-specific tags. Tag values MUST be lowercase. For ingested Hermes skills the driver MUST prepend the agent id and keep at most nine of the tags Hermes reports, so that the limit of [0003-034] holds.
+[0003-039] Skill `tags` MUST include the agent id as the first tag (for example `omp`), followed by backend-specific tags. Tag values MUST be lowercase. For ingested Hermes skills the driver MUST prepend the agent id, keep at most nine of the tags Hermes reports, and drop any tag that names an internal tool (so the limit of [0003-034] holds and [0003-051] is met).
 
 ### 4.9 Signing hook
 
@@ -195,6 +195,14 @@ flowchart TD
 [0003-042] A verifier that finds `signatures` on a bus card MUST verify at least one signature with a key trusted under RFC-0007 before using the card for routing. A verifier that finds no signatures MUST reject the card when cross-host trust is enabled, and MAY accept it on a single host in M1 (RFC-0007 sets the trust policy).
 
 [0003-043] The signed form is the bus card. The HTTP view is not signed in M1 (sec 4.6 rule 2).
+
+#### 4.9.1 Sanitization of ingested cards
+
+[0003-050] A bridge that ingests an external agent card (Hermes, `docs/interop/hermes.md`) MUST NOT copy that card into the bus card. It MUST build a new A2A v1.0 `AgentCard` from A2A fields only. Fields outside the A2A v1.0 AgentCard, including Hermes's card-level `security` field, MUST NOT be carried into the bus card or the HTTP view.
+
+[0003-051] The skills of an ingested card MUST be coarse: at most one skill per external toolset, with no internal tool name in any skill id, name, description or tag. A tool that maps to no toolset is grouped under `<agentId>.other`. Skill count MUST respect [0003-034].
+
+[0003-052] The HTTP view derived under [0003-030] from a sanitized bus card inherits the sanitization. The gateway MUST NOT serve an ingested card unchanged under any path (RFC-0008).
 
 ### 4.10 Worked examples
 
@@ -428,7 +436,7 @@ Stock A2A peer (HTTP, the HTTP view only):
 Hermes (A2A HTTP client, `docs/interop/hermes.md` sec 8):
 - Reads only the card's `supportedInterfaces` entry with `protocolBinding: "JSONRPC"` and the RPC `url` (sec 8.3 step 2). The HTTP view provides exactly that.
 - Sends no `A2A-Extensions`, no metadata, and no extension header (sec 8.3 "Not sent"). Our agents therefore apply no request-level extension data to Hermes requests; card-level ceilings still apply.
-- Ignores unknown card fields in its own parse [UNVERIFIED: client-side tolerance, `docs/interop/hermes.md` sec 10]. The HTTP view adds only the fields the A2A spec allows, so the risk is limited to the `capabilities.extensions` entries; this is checked by the M1 interop test (RFC-0014).
+- Ignores unknown card fields in its own parse. Verified by spike hermes-a2a (stub, probe T-probe, Q7 PASS): Hermes accepted a card with unknown fields. Real-model and full-field behaviour remains [UNVERIFIED] (`docs/interop/hermes.md` sec 10). The HTTP view adds only the fields the A2A spec allows, and the M1 interop test (RFC-0014) checks it.
 - Hermes capability matching uses its own `a2a_agents.<name>.capabilities` config (hermes.md sec 8.2), not our skill ids. Skill ids only matter to bus-aware clients.
 - Gateway card requirements (`hermes.md` sec 10 rows 1-2, 12) are satisfied: `supportedInterfaces[0]` is the JSONRPC entry in the HTTP view, and `tenant` echo is handled by RFC-0008.
 
@@ -493,7 +501,7 @@ Attack descriptions are kept generic on purpose. No attack payloads are included
 | 0003-025 | Interface order and fields lint (bus first, four fields each). | MUST |
 | 0003-026 | Client picks the first understood entry. | SHOULD |
 | 0003-027 | Capability flags: `streaming` is `true` on M1 bus cards and gateway cards. | MUST |
-| 0003-028 | Bus card contains no bearer scheme. | MUST |
+| 0003-028 | Bus card contains no bearer scheme, no `securitySchemes` and no `security`. | MUST |
 | 0003-029 | Gateway serves the per-agent view path; `agent.json` returns 404. | MUST |
 | 0003-030 | Diff test: HTTP view equals bus card after rules 1-5. | MUST |
 | 0003-031 | HTTP view validates against the A2A v1.0 card schema. | MUST |
@@ -502,9 +510,9 @@ Attack descriptions are kept generic on purpose. No attack payloads are included
 | 0003-034 | Limit checks per field; publisher rejects over-limit cards. | MUST |
 | 0003-035 | Card version changes on every content change. | MUST |
 | 0003-036 | Skills match the driver's exposed capabilities. | MUST |
-| 0003-037 | Skill id uniqueness; prefix rule for omp and claude; Hermes ids unchanged. | MUST |
+| 0003-037 | Skill id uniqueness; prefix rule for omp and claude; Hermes ids are `hermes.<toolset>`; no tool name in any id. | MUST |
 | 0003-038 | Snapshot test of the M1 skill derivation table. | SHOULD |
-| 0003-039 | Tag rules: agent id first, lowercase; Hermes tags capped at nine plus agent id. | MUST |
+| 0003-039 | Tag rules: agent id first, lowercase; Hermes tags capped at nine plus agent id; no tool name in tags. | MUST |
 | 0003-040 | Signed card publication when signing is enabled. | MUST |
 | 0003-041 | JCS canonical form and EdDSA `kid` check; expired key rejected. | MUST |
 | 0003-042 | Verifier rejects tampered card; rejects unsigned card when cross-host trust is on. | MUST |
@@ -515,12 +523,16 @@ Attack descriptions are kept generic on purpose. No attack payloads are included
 | 0003-047 | Card lint: `approval.mode` is one of the three values; `external` rejected; `none` implies `dangerous: true`; `dangerous` true for a dangerous `nativeMode`; `workspace.isolation` is `worktree` or `copy`. | MUST |
 | 0003-048 | Card lint: budget ceiling keys are only the four listed; absent key leaves runtime config in force. | MUST |
 | 0003-049 | Card lint: `progress` is in the registry and declared only by drivers that emit it; progress data appears only on status events. | MUST |
+| 0003-050 | Ingested Hermes card: bus and HTTP cards contain no `security` field and no field outside the A2A v1.0 AgentCard; diff against the fixture card. | MUST |
+| 0003-051 | Fixture Hermes card with 33 tool skills: published skills are per toolset, at most 50, with no tool name in id, name, description or tags. | MUST |
+| 0003-052 | Gateway request for an ingested agent's card returns only the sanitized view; the raw Hermes card is never served. | MUST |
 
 ## 9. Open issues
 
 1. **Required-extension future.** No M1 extension is required. Default: keep `required: false` and rely on receiver policy. Revisit when a control must not be bypassed by callers that do not activate it.
 2. **Gateway signing of the HTTP view.** Default: unsigned in M1 (sec 4.6 rule 2). Revisit with RFC-0007 when stock peers need to verify the HTTP card cryptographically.
-3. **Hermes card tolerance.** Hermes client-side tolerance for unknown card fields is `[UNVERIFIED]` (`docs/interop/hermes.md` sec 10). Default: the HTTP view keeps only A2A v1.0 fields. The M1 interop test (RFC-0014) confirms it.
+3. **Hermes card tolerance.** Verified by spike hermes-a2a (stub): Hermes accepted a card with unknown fields (Q7 PASS). Default: the HTTP view keeps only A2A v1.0 fields. Remaining [UNVERIFIED]: Hermes client behaviour with a real model and with every card field (`docs/interop/hermes.md` sec 10); the M1 interop test (RFC-0014) confirms it.
 4. **Streaming on HTTP view.** Closed for M1: `capabilities.streaming` is `true` on the bus card and on the gateway card for every M1 agent, because the gateway serves SSE (RFC-0008 [0008-013]) and the bus delivers events (RFC-0002 [0002-103]).
 5. **Budget and approval key names.** Owned by RFC-0006; the examples here are illustrative. Default: RFC-0006 names win on conflict.
 6. **Live ACP capability check.** Default: skills for omp and claude come from static config until the live `initialize` check (`acp-omp-claude.md` sec 8) confirms the reported capabilities.
+7. **Toolset classification for ingested Hermes skills.** Default: classification follows the Hermes card's toolset grouping; a tool with no toolset goes to `<agentId>.other` ([0003-051]). Revisit if the Hermes card format changes.
