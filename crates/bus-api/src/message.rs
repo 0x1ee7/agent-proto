@@ -7,7 +7,7 @@ use bytes::Bytes;
 
 use crate::error::BusError;
 use crate::headers::Headers;
-use crate::name::{Key, StreamName, Subject};
+use crate::name::{Key, Principal, StreamName, Subject};
 use crate::value::{Revision, StreamSeq};
 
 /// Result of a publish or append.
@@ -74,6 +74,10 @@ impl fmt::Debug for ReplyHandle {
 pub struct Request {
     /// Subject the requester addressed.
     pub subject: Subject,
+    /// Principal that sent the request, as authenticated by the binding
+    /// (RFC-0002 [0002-011]). `None` when the binding cannot attribute it.
+    /// Headers and payload never set this value.
+    pub principal: Option<Principal>,
     /// Request headers.
     pub headers: Headers,
     /// Request payload.
@@ -111,6 +115,7 @@ pub trait Settlement: Send {
 /// settles it (RFC-0011 [0011-015]).
 pub struct Delivery {
     subject: Subject,
+    principal: Option<Principal>,
     headers: Headers,
     payload: Bytes,
     stream_seq: StreamSeq,
@@ -123,6 +128,7 @@ impl Delivery {
     #[must_use]
     pub fn new(
         subject: Subject,
+        principal: Option<Principal>,
         headers: Headers,
         payload: Bytes,
         stream_seq: StreamSeq,
@@ -131,6 +137,7 @@ impl Delivery {
     ) -> Self {
         Self {
             subject,
+            principal,
             headers,
             payload,
             stream_seq,
@@ -155,6 +162,13 @@ impl Delivery {
     #[must_use]
     pub const fn payload(&self) -> &Bytes {
         &self.payload
+    }
+
+    /// Principal that published the message, as authenticated by the binding
+    /// (RFC-0002 [0002-011]). `None` when the binding cannot attribute it.
+    #[must_use]
+    pub const fn principal(&self) -> Option<&Principal> {
+        self.principal.as_ref()
     }
 
     /// Stream sequence of the message.

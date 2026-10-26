@@ -9,6 +9,9 @@ Provides:
 - `MemControl` (implements `BusControl`): virtual clock, fault switches, restart,
   consumer crash, blob corruption.
 - `MemConfig`, `StreamConfig`, `Grant`, `ConfigError`, `m1_capabilities()`.
+- Every request carries `Request::principal`, the caller's principal. Every stored message
+  records its publisher, and `Delivery::principal()` returns it. Headers and payload never
+  change either value.
 
 Uses: `bus-api` (seam, types, errors), `a2a-types` (`TenantId`), `bytes`, `sha2`
 (blob digests), `tokio` (`sync::Notify` for waiting), and `a2a-conformance` as a

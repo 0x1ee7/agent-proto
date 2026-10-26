@@ -166,6 +166,8 @@ pub(crate) struct StoredMsg {
     pub(crate) subject: Subject,
     pub(crate) headers: Headers,
     pub(crate) payload: Bytes,
+    /// Principal that published the message (RFC-0002 [0002-011]).
+    pub(crate) publisher: Principal,
     /// Earliest virtual time the message may be delivered (delay fault).
     pub(crate) visible_at: Duration,
 }
@@ -445,6 +447,7 @@ impl Inner {
         subject: &Subject,
         headers: &Headers,
         payload: Bytes,
+        publisher: &Principal,
     ) -> Result<u64, BusError> {
         let delay = self.faults.delay;
         let extra = match delay {
@@ -474,6 +477,7 @@ impl Inner {
             subject: subject.clone(),
             headers: headers.clone(),
             payload,
+            publisher: publisher.clone(),
             visible_at,
         });
         if let Some(limit) = st.retention {
@@ -829,6 +833,7 @@ mod tests {
                 subject: sub(m),
                 headers: Headers::new(),
                 payload: Bytes::new(),
+                publisher: Principal::anonymous(),
                 visible_at: Duration::ZERO,
             });
             st.next_seq += 1;

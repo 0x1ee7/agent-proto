@@ -180,7 +180,7 @@ impl MemBus {
             check_size(payload.len(), caps.max_message_size)?;
             match captured {
                 Some(stream) => {
-                    let seq = inner.store(&stream, subject, headers, payload)?;
+                    let seq = inner.store(&stream, subject, headers, payload, who)?;
                     PublishAck {
                         stream: Some(stream),
                         seq: Some(StreamSeq::new(seq)),
@@ -294,7 +294,7 @@ impl MemBus {
             }
             inner.dedupe.remove(&key);
         }
-        let seq = inner.store(stream, subject, headers, payload)?;
+        let seq = inner.store(stream, subject, headers, payload, who)?;
         inner.dedupe.insert(
             key,
             Dedupe {
@@ -670,6 +670,7 @@ impl RequestStream for MemRequests {
             let queued: Queued = srv.queue.pop_front()?;
             Some(Ok(Request {
                 subject: queued.subject,
+                principal: Some(queued.requester.clone()),
                 headers: queued.headers,
                 payload: queued.payload,
                 reply: ReplyHandle::new(Box::new(MemReplySink {
@@ -850,6 +851,7 @@ fn next_delivery(
     };
     Some(Ok(Delivery::new(
         msg.subject.clone(),
+        Some(msg.publisher.clone()),
         msg.headers.clone(),
         msg.payload.clone(),
         StreamSeq::new(seq),

@@ -37,7 +37,8 @@ through the `bus-mem` binding (dev-dependency). Requirement IDs guarded there:
 - KV and blobs: 0011-016, 017, 026, 052, 072.
 - Profile and capabilities: 0011-018, 030, 031, 034, 035, 036, 037.
 - Faults and restart: 0011-020, 021, 033, 060, 061, 062, 063, 064, 070, 071.
-- Tenancy: 0011-040, 041, 042, 044.
+- Tenancy: 0011-040 (its body also asserts that a forged `A2AB-Sender` header or payload
+  cannot change the request or delivery principal, RFC-0002 [0002-011]), 041, 042, 044.
 - Errors: 0011-043, 050, 051, 053.
 
 Known gaps, which the rows state as limits of what the suite can observe:

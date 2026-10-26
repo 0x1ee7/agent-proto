@@ -12,6 +12,9 @@ Provides:
 - `value::{StreamSeq, Revision, Digest, InvalidDigest}`; `headers::Headers`.
 - `message::{PublishAck, Request, Reply, ReplyHandle, Delivery, StartPosition, Entry,
   WatchEvent}`.
+- `Request::principal` (public field) and `Delivery::principal()`: the sender principal the
+  binding authenticated (RFC-0002 [0002-011]). Headers and payload never set it; `None`
+  means the binding cannot attribute the message.
 - `error::BusError`: the closed taxonomy. Reason strings are binding-chosen constants.
 - `capabilities::{Capabilities, Persistence, Profile, Requirement, A2A_BUS_M1,
   PROFILE_REGISTRY, ProfileError, M1_MIN_DEDUPE_WINDOW, M1_MIN_MESSAGE_SIZE}`.

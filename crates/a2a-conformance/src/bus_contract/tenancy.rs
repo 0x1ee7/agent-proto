@@ -3,16 +3,18 @@
 
 use std::time::Duration;
 
-use bus_api::bus::Bus;
+use bus_api::bus::{Bus, RequestStream};
 use bus_api::error::BusError;
 use bus_api::headers::Headers;
-use bus_api::message::StartPosition;
+use bus_api::message::{Request, StartPosition};
 use bus_api::name::{Bucket, ConsumerName, Key, KeyPrefix, MsgId, Principal};
 use bus_api::value::Digest;
 use bytes::Bytes;
 
-use super::support::put;
+use super::support::{expect_delivery, headers, next_of, open, put, seq_of};
 use super::{BusFactory, Ctx, bx, expect_denied, pat, settle, subj};
+use crate::driver::join;
+use crate::fixtures::ACK_WAIT;
 
 fn key(text: &str) -> Result<Key, String> {
     Key::parse(text).map_err(|e| format!("key {text}: {e}"))
@@ -90,7 +92,82 @@ pub(super) fn r0011_040<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
                 .await,
         )?;
         Ok::<(), String>(())
-    })
+    })?;
+    principal_not_spoofable(ctx)
+}
+
+/// [0002-011] a received request or delivery carries the principal the binding
+/// authenticated; a forged `A2AB-Sender` header or payload cannot change it.
+/// RFC-0011 has no row for receiver-side sender checks, so the assertion is
+/// recorded under [0011-040].
+fn principal_not_spoofable<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
+    let fx = ctx.fx;
+    let bus = ctx.bus;
+    let echo = pat("rpc.echo")?;
+    let echo_subject = subj("rpc.echo")?;
+    let outsider = fx
+        .outsider
+        .name()
+        .ok_or("outsider principal is anonymous")?;
+    let forged = headers(&[("A2AB-Sender", outsider)])?;
+    let body = Bytes::from(format!("sender={outsider}"));
+    let server = async {
+        let mut requests = bx("serve", bus.serve(&fx.server, &echo).await)?;
+        let req = bx("serve next", requests.next().await)?;
+        if req.principal.as_ref() != Some(&fx.client) {
+            return Err(format!(
+                "request principal {:?}, expected client",
+                req.principal
+            ));
+        }
+        let Request { payload, reply, .. } = req;
+        reply
+            .reply(Headers::new(), payload)
+            .map_err(|e| format!("reply: {e:?}"))?;
+        Ok::<(), String>(())
+    };
+    let client = async {
+        bx(
+            "request",
+            bus.request(&fx.client, &echo_subject, &forged, body.clone(), ACK_WAIT)
+                .await,
+        )?;
+        Ok::<(), String>(())
+    };
+    settle(ctx.control, async {
+        let (s, c) = join(server, client).await;
+        s?;
+        c
+    })?;
+    let subject = subj("suite.spoof040")?;
+    let mut c = settle(
+        ctx.control,
+        open(
+            bus,
+            &fx.client,
+            &fx.stream,
+            "suite-c040s",
+            "suite.>",
+            StartPosition::FromFirst,
+        ),
+    )?;
+    let seq = settle(ctx.control, async {
+        let ack = bx(
+            "publish",
+            bus.publish(&fx.client, &subject, &forged, body.clone())
+                .await,
+        )?;
+        seq_of(&ack)
+    })?;
+    let delivery = settle(ctx.control, next_of(&mut c))?;
+    expect_delivery(&delivery, "suite.spoof040", body.as_ref(), Some(seq))?;
+    if delivery.principal() != Some(&fx.client) {
+        return Err(format!(
+            "delivery principal {:?}, expected client",
+            delivery.principal()
+        ));
+    }
+    Ok(())
 }
 
 /// [0011-041] publish and consume are permitted per subject and stream; a
