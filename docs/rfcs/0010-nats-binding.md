@@ -66,7 +66,7 @@ authorization {
 }
 ```
 
-No `http` key is present (0010-003). Seeds are never in this file (0010-010).
+No `http` key is present (0010-003). Verified by spike `nats` (stub): with no `http` key and no `-m`, nothing listens on 8222. Seeds are never in this file (0010-010).
 
 ### 4.2 Identities and authentication
 
@@ -79,7 +79,7 @@ No `http` key is present (0010-003). Seeds are never in this file (0010-010).
 ### 4.3 Limits
 
 - [0010-014] Broker `max_payload` MUST be 1048576 bytes (1 MiB).
-- [0010-015] Before publishing, a sender MUST reject a message whose body exceeds 524288 bytes (512 KiB) or whose headers plus body exceed 1048576 bytes. This budget keeps the message within `max_payload` whether or not the server counts headers toward it (`[UNVERIFIED]`, section 9).
+- [0010-015] Before publishing, a sender MUST reject a message whose body exceeds 524288 bytes (512 KiB) or whose headers plus body exceed 1048576 bytes. This budget keeps the message within `max_payload` whether or not the server counts headers toward it. Verified by spike `nats` (stub, partial): async-nats 0.50.0 counts headers toward `max_payload` (client-side rejection: body 1048000 bytes plus about 621 bytes of headers rejected at 1048621 bytes; body 1046000 bytes plus about 1621 bytes of headers accepted). Server-side header counting `[UNOBSERVED]` (section 9).
 - [0010-016] A `Part.raw` value MUST be inline only if its decoded size is at most 262144 bytes (256 KiB). Larger content MUST be sent as `Part.url` (section 4.7).
 
 ### 4.4 Subjects
@@ -87,7 +87,7 @@ No `http` key is present (0010-003). Seeds are never in this file (0010-010).
 - [0010-017] Message bodies MUST be ProtoJSON with `Content-Type: application/a2a+json` (per RFC-0002 and the spec REST rule). Binary protobuf for A2A bodies is post-M1. The one binary payload in M1 is the audit record `a2abus.v1.AuditEvent` (schema RFC-0013), identified by header `A2AB-Payload-Type: a2abus.v1.AuditEvent` (RFC-0001 L1, widened).
 - [0010-018] Subjects MUST follow `a2a.v1.<tenant>.<class>...` with `<class>` one of `rpc`, `ev`, `audit`. The M1 tenant is `local`.
 - [0010-019] Tokens MUST match: tenant `[a-z0-9][a-z0-9-]{0,31}`; agent id `[a-z0-9][a-z0-9-]{0,47}`; task id: lowercase canonical UUIDv7 (36 characters); op token: `[a-z][a-z0-9]{0,31}` (operation names owned by RFC-0002). A subject MUST be built only from tokens that pass validation; any token containing `.`, `*`, `>`, whitespace or a control character MUST be rejected before the subject is built.
-- [0010-020] A subject MUST NOT exceed 255 bytes. The longest event subject (tenant 32, agent 48, task 36) is about 130 bytes. The 255-byte cap is this RFC's own rule (`[UNVERIFIED]` server limit).
+- [0010-020] A subject MUST NOT exceed 255 bytes. The longest event subject (tenant 32, agent 48, task 36) is about 130 bytes. The 255-byte cap is this RFC's own rule; the server accepted 1000-byte subjects in spike `nats` (stub), so the server does not impose the cap.
 - [0010-021] The subject mapping is:
 
 | Purpose | Subject or store | Transport | Notes |
@@ -97,7 +97,7 @@ No `http` key is present (0010-003). Seeds are never in this file (0010-010).
 | Audit records | `a2a.v1.<tenant>.audit.<identity>` | JetStream publish into `A2A_AUDIT_<tenant>` | RFC-0001 L17; schema RFC-0013. |
 | Agent cards | `$KV.a2ab-<tenant>-cards.<agent>` | KV | Section 4.6. |
 | Presence | `$KV.a2ab-<tenant>-presence.<agent>` | KV | Section 4.6. |
-| Submission claims | `$KV.a2ab-<tenant>-claims.<agent>.<msg_id>` | KV | Section 4.8. |
+| Submission claims | `$KV.a2ab-<tenant>-claims.<agent>.<msg_id>` | KV | Section 4.8. `<agent>` is the claiming worker, which is the rpc target. |
 | Artifacts | object store `a2ab-<tenant>-artifacts` | object store | Section 4.7. |
 
 - [0010-022] Agent ids and KV keys in section 4.6 are the same tokens as in subjects. Logical store names used by RFC-0004 map as: `cards/<tenant>/<agentId>` to bucket `a2ab-<tenant>-cards`, key `<agentId>`; `presence/<tenant>/<agentId>` to bucket `a2ab-<tenant>-presence`, key `<agentId>`.
@@ -115,11 +115,11 @@ No `http` key is present (0010-003). Seeds are never in this file (0010-010).
 
 - [0010-029] Buckets are per tenant and MUST be named `a2ab-<tenant>-cards`, `a2ab-<tenant>-presence` and `a2ab-<tenant>-claims`. Their backing streams are `KV_<bucket>`.
 - [0010-030] Cards bucket: `history` 1; no TTL; `max_value_size` 262144; `allow_direct` true. Key: agent id. Value: ProtoJSON `AgentCard` (contents owned by RFC-0004; signatures by RFC-0007). Only the owning worker MAY write its key. A delete marker means decommission; it is written by the owner or by the supervisor on operator request.
-- [0010-031] Presence bucket: `history` 1; `limit_marker_ttl` on (per-key TTL, `[UNVERIFIED]` exact option name, `docs/interop/nats.md`); `max_value_size` 4096; `allow_direct` true. Key: agent id. Value: a small JSON record (schema owned by RFC-0004). Each put MUST carry header `Nats-TTL: 30s`. The owning worker refreshes every 10 s (RFC-0004 values). Only the owner MAY write its key.
-- [0010-032] Presence is a single-instance lease. A starting worker MUST create its key with `Nats-Expected-Last-Subject-Sequence: 0`. If the create fails, another live instance holds the lease; the worker MUST NOT serve and MUST exit with an error. The supervisor restarts it after the lease expires.
-- [0010-033] A refresh MUST carry `Nats-Expected-Last-Subject-Sequence` equal to the sequence of the instance's previous put. A conflict, or a missed refresh past the TTL, means the lease was lost: the instance MUST stop serving and exit (fencing).
-- [0010-034] Watchers of the cards and presence buckets MUST surface the end of the initial snapshot to the application, so a late joiner knows when its view is complete (KV watch initial-values marker, `[UNVERIFIED]` client API).
-- [0010-035] Claims bucket: `history` 1; `max_age` 48 h; `max_value_size` 1024; `allow_direct` true. Key: `<target agent>.<msg_id>`. Value: the task id as ASCII. `max_age` MUST be at least T_task + 24 h (M1: 48 h, consistent with RFC-0005 default T_task = 24 h and admission window W = 2 h). A deployment raising T_task above 24 h MUST raise this value at the same time.
+- [0010-031] Presence bucket: `history` 1; `limit_markers` on (async-nats `kv::Config` option `limit_markers`; Go `LimitMarkerTTL`; server effect `allow_msg_ttl: true` and `subject_delete_marker_ttl`); `max_value_size` 4096; `allow_direct` true. Key: agent id. Value: a small JSON record (schema owned by RFC-0004). Each put MUST carry header `Nats-TTL: 30s`, including the put that re-creates a key after expiry or purge. The owning worker refreshes every 10 s (RFC-0004 values). Only the owner MAY write its key. Writers MUST NOT rely on `create_with_ttl` for a re-created key: async-nats 0.50.0 drops the TTL when the last entry is a Purge or Delete marker (`kv/mod.rs` `create_maybe_ttl` falls back to `update()`). A re-create after expiry or purge MUST set `Nats-TTL` explicitly and be fenced with `Nats-Expected-Last-Subject-Sequence` equal to the revision of the marker. Verified by spike `nats` (stub): fresh-key TTL honoured (marker op Purge at expiry); purged-key re-create with explicit `Nats-TTL` accepted with purge-revision fence. Bucket creation command `[UNOBSERVED]`.
+- [0010-032] Presence is a single-instance lease. A starting worker MUST create its key with `Nats-Expected-Last-Subject-Sequence: 0` only when the key has never had an entry. If the key has a live entry, the create fails and another live instance holds the lease: the worker MUST NOT serve and MUST exit with an error. The supervisor restarts it after the lease expires. If the key exists only as an expiry or purge marker, the worker MUST re-create it with `Nats-TTL` set and `Nats-Expected-Last-Subject-Sequence` equal to the marker revision (0010-031). Verified by spike `nats` (stub): `key already exists` on a live key (fence PASS). The expected-sequence-0 create over an expiry marker is `[INFERENCE]` (JetStream checks the last sequence of the subject); the re-create with the marker revision is verified.
+- [0010-033] A refresh MUST carry `Nats-Expected-Last-Subject-Sequence` equal to the sequence of the instance's previous put. A conflict, or a missed refresh past the TTL, means the lease was lost: the instance MUST stop serving and exit (fencing). Verified by spike `nats` (stub): stale expected sequence returns `wrong last sequence` (error code 10071).
+- [0010-034] Watchers of the cards and presence buckets MUST surface the end of the initial snapshot to the application, so a late joiner knows when its view is complete. Watchers MUST use an explicit push consumer (`DeliverPolicy::LastPerSubject`, filter `$KV.<bucket>.>`); the message whose ACK reply has `pending == 0` marks the end of the snapshot. An empty bucket delivers no such message, so the watcher MUST check the consumer's `num_pending == 0` at creation and emit the end marker immediately. Verified by spike `nats` (stub, 1-entry bucket): explicit push consumer PASS; async-nats `watch_all()` delivered 0 entries (root cause `[INFERENCE]`, in `push.rs` and `kv/mod.rs` `Watch::poll_next`); the empty-bucket path is `[UNOBSERVED]`.
+- [0010-035] Claims bucket: `history` 1; `max_age` 48 h; `max_value_size` 1024; `allow_direct` true. Key: `<agent>.<msg_id>`, where `<agent>` is the claiming worker (the rpc target; the same token as in 0010-041). Value: the task id as ASCII. `max_age` MUST be at least T_task + 24 h (M1: 48 h, consistent with RFC-0005 default T_task = 24 h and admission window W = 2 h). A deployment raising T_task above 24 h MUST raise this value at the same time.
 
 ### 4.7 Object store (artifacts)
 
@@ -280,13 +280,13 @@ The requester sent `A2AB-After-Seq: 4` in its request, so events with `seq` 1 to
 }
 ```
 
-The consumer handles max-delivery exhaustion through the advisory subject `$JS.EVENT.ADVISORY.>` (exact subject `[UNVERIFIED]`).
+The consumer handles max-delivery exhaustion through the advisory subject `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>` (observed in spike `nats` (stub), payload 198 bytes; example `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.A2AB_SPIKE_ADV.adv`).
 
 ### 4.11 Permissions
 
 - [0010-057] Every identity MUST have an explicit NATS user entry with `publish.allow`, `subscribe.allow` and, for responders, `allow_responses`. Allow lists are the access model. Deny lists MAY be added only where an explicit exclusion is needed.
 - [0010-058] Wildcards MUST be whole tokens only (`>` and `*` as the last or a full token). Stream and bucket names MUST be enumerated. Partial wildcards such as `A2AB_*` or `KV_a2ab-*` are forbidden.
-- [0010-059] The read bundle for each stream S behind a bucket or audit/event stream is: `$JS.API.STREAM.INFO.S`, `$JS.API.CONSUMER.CREATE.S`, `$JS.API.CONSUMER.CREATE.S.>`, `$JS.API.CONSUMER.INFO.S.>`, `$JS.API.CONSUMER.DELETE.S.>`, `$JS.API.DIRECT.GET.S`, `$JS.API.DIRECT.GET.S.>`, `$JS.API.STREAM.MSG.GET.S`. The client libraries' exact subjects are `[UNVERIFIED]`; the spike (section 9) fixes the final minimal list from permission-violation logs.
+- [0010-059] The read bundle for each stream S behind a bucket or audit/event stream is: `$JS.API.STREAM.INFO.S`, `$JS.API.CONSUMER.CREATE.S`, `$JS.API.CONSUMER.CREATE.S.>`, `$JS.API.CONSUMER.INFO.S.>`, `$JS.API.CONSUMER.DELETE.S.>`, `$JS.API.DIRECT.GET.S`, `$JS.API.DIRECT.GET.S.>`, `$JS.API.STREAM.MSG.GET.S`. Spike `nats` (stub) confirmed that permission-violation logs yield a working read bundle; the minimal subject set is `[UNOBSERVED]` and is fixed from those logs (section 9).
 - [0010-060] Role `agent` (identities `omp`, `claude`, `hermes`; `<self>` is the identity):
   - publish: `a2a.v1.local.rpc.*.*` (send to any agent); `a2a.v1.local.ev.<self>.>`; `a2a.v1.local.audit.<self>` (own audit records only); `$KV.a2ab-local-cards.<self>`; `$KV.a2ab-local-presence.<self>`; `$KV.a2ab-local-claims.<self>.*`; `$O.a2ab-local-artifacts.C.>` and `$O.a2ab-local-artifacts.M.>` (writer only; see 0010-039). Read bundle for `A2AB_EV_local`, `KV_a2ab-local-cards`, `KV_a2ab-local-presence`, `KV_a2ab-local-claims` and `OBJ_a2ab-local-artifacts`. No read access to `A2A_AUDIT_local`.
   - subscribe: `_INBOX.<self>.>`; `a2a.v1.local.rpc.<self>.*` (serving). No identity holds a core subscribe on `a2a.v1.local.ev.>`; stored event reads go through consumers, which is the accepted gap below.
@@ -307,7 +307,7 @@ Example expansion for `omp` (publish and subscribe excerpts; the full list is ge
                           "$KV.a2ab-local-presence.omp", "$KV.a2ab-local-claims.omp.*",
                           "$JS.API.STREAM.INFO.A2AB_EV_local", "..." ] },
     subscribe: { allow: [ "_INBOX.omp.>", "a2a.v1.local.rpc.omp.*" ] },
-    allow_responses: { max: 1, expires: "2m" }   # syntax [UNVERIFIED]
+    allow_responses: { max: 1, expires: "2m" }   # syntax accepted by nats-server v2.15.2 (spike `nats` (stub))
   } }
 ```
 
@@ -324,9 +324,9 @@ Accepted M1 gaps (stated, not hidden):
 
 ### 4.13 Operations
 
-- [0010-068] Backup MUST be taken with the broker stopped (after drain), by copying the JetStream store directory and the state directory together. A stream snapshot via the server API is an alternative `[UNVERIFIED]`.
+- [0010-068] Backup MUST be taken with the broker stopped (after drain), by copying the JetStream store directory and the state directory together. A stream snapshot via the server API is an alternative `[UNOBSERVED]`. Verified by spike `nats` (stub): offline copy restore and online `stream backup` / `stream restore` for `A2AB_EV_local` and the presence stream; KV online backup `[UNOBSERVED]`.
 - [0010-069] Upgrade MUST pin the nats-server version. a2ad MUST verify the binary's SHA-256 against the release manifest before start. Upgrade drains all clients, stops the broker, replaces the binary, and starts it again. Downgrade is forbidden because JetStream on-disk state is not guaranteed to be readable by an older server.
-- [0010-070] Graceful stop MUST drain clients first (agents and gateway stop accepting work and finish turns), then stop the process. The Windows signal mechanism for a graceful server stop is `[UNVERIFIED]`; the default is process termination after drain.
+- [0010-070] Graceful stop MUST drain clients first (agents and gateway stop accepting work and finish turns), then stop the process. The Windows graceful server stop is `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` sent to a process group created with `CREATE_NEW_PROCESS_GROUP`, which exits 0 (verified by spike `nats` (stub)). The Windows service stop (`sc.exe`) is `[UNOBSERVED]`. Process termination after drain is the fallback; a job object with `KILL_ON_JOB_CLOSE` exits 0 (verified).
 - [0010-071] Broker stdout and stderr MUST be captured by a2ad into `<state>/logs/`, rotated by a2ad (RFC-0012). Seeds and payload bodies MUST NOT be logged by the broker or by a2ad.
 - [0010-072] M1 does not enable encryption at rest. The state directory ACL (0010-010 for seeds, RFC-0012 for the rest) is the only at-rest protection in M1.
 
@@ -334,7 +334,7 @@ Accepted M1 gaps (stated, not hidden):
 
 These requirements apply only when the post-M1 federation work is accepted. They are stated now so M1 choices do not block them.
 
-- [0010-073] (post-M1) Each site runs its own broker as a leafnode with its own JetStream domain. Events are stored in the producer's domain. Cross-site live delivery uses forwarded core subjects; cross-site replay uses the domain-qualified API (`[UNVERIFIED]`).
+- [0010-073] (post-M1) Each site runs its own broker as a leafnode with its own JetStream domain. Events are stored in the producer's domain. Cross-site live delivery uses forwarded core subjects; cross-site replay uses the domain-qualified API (`[UNOBSERVED]`).
 - [0010-074] (post-M1) Leafnode connections MUST use TLS.
 - [0010-075] (post-M1) rpc submissions MUST fail fast when the target site is partitioned. They MUST NOT be stored and forwarded, because a delayed submission could act on a stale authority (threat T11). Events and audit records MAY be stored and forwarded within their domain.
 - [0010-076] (post-M1) Presence is not replicated across sites; presence is site-local.
@@ -395,7 +395,7 @@ These requirements apply only when the post-M1 federation work is accepted. They
 | 0010-012 | Non-loopback listener with no TLS is refused | M1 |
 | 0010-013 | Broker-accepted identity cannot publish outside its role | M1 |
 | 0010-014 | Config max_payload equals 1048576 | M1 |
-| 0010-015 | Sender rejects body over 512 KiB and total over 1 MiB before publish | M1 |
+| 0010-015 | Sender rejects body over 512 KiB and headers plus body over 1 MiB before publish; header bytes counted | M1 |
 | 0010-016 | Part.raw over 256 KiB is sent as Part.url | M1 |
 | 0010-017 | Bodies carry application/a2a+json; other content types rejected | M1 |
 | 0010-018 | Subjects match grammar for all classes | M1 |
@@ -411,10 +411,10 @@ These requirements apply only when the post-M1 federation work is accepted. They
 | 0010-028 | Stream names with a dot or wildcard rejected | M1 |
 | 0010-029 | Bucket names match the three names per tenant | M1 |
 | 0010-030 | Cards bucket config; non-owner write denied; decommission delete marker | M1 |
-| 0010-031 | Presence put carries Nats-TTL 30s; key expires without refresh | M1 |
-| 0010-032 | Second instance Create fails; it exits without serving | M1 |
+| 0010-031 | Presence put carries Nats-TTL 30s; key expires without refresh; re-create after expiry fenced by marker revision | M1 |
+| 0010-032 | Second instance Create fails on a live key; re-create over expiry marker fenced by marker revision; it exits without serving | M1 |
 | 0010-033 | Refresh with stale expected sequence causes exit | M1 |
-| 0010-034 | Watcher delivers initial-snapshot end marker to late joiner | M1 |
+| 0010-034 | Explicit push-consumer watch delivers snapshot end (pending 0) to a late joiner; empty bucket emits end immediately | M1 |
 | 0010-035 | Claims max_age is 48 h; deployment raising T_task fails validation without claims raise | M1 |
 | 0010-036 | Artifact bucket config matches | M1 |
 | 0010-037 | Object written by sha256 name; corrupted chunk is detected and not retried | M1 |
@@ -440,18 +440,18 @@ These requirements apply only when the post-M1 federation work is accepted. They
 | 0010-056 | Archiver config JSON matches section 4.10 | M1 |
 | 0010-057 | Every identity has explicit allow-list entry | M1 |
 | 0010-058 | Config contains no partial wildcard; stream names enumerated | M1 |
-| 0010-059 | Permission-violation logs yield the final read bundle; no extra subject needed | M1 |
+| 0010-059 | Permission-violation logs yield the read bundle; minimal subject set derived from those logs | M1 |
 | 0010-060 | Agent role: writes only to own ev, audit, cards, presence, claims; serves only own rpc | M1 |
-| 0010-061 | Second reply on a request is denied | M1 |
+| 0010-061 | Second reply on a request is denied; late reply after expiry is denied | M1 |
 | 0010-062 | Gateway role publishes rpc and own records only | M1 |
 | 0010-063 | Operator role cannot write cards, presence or claims | M1 |
 | 0010-064 | Supervisor role limited to listed streams and archiver consumer | M1 |
 | 0010-065 | Violation logged and audited as FORBIDDEN | M1 |
 | 0010-066 | Client inbox prefix is `_INBOX.<identity>.`; other inboxes not received | M1 |
 | 0010-067 | Fallback inbox mode recorded as known gap | M1 |
-| 0010-068 | Backup with broker stopped restores store and state; ACL on backup | M1 |
+| 0010-068 | Backup with broker stopped restores store and state; ACL on backup; stream backup and restore of the event stream | M1 |
 | 0010-069 | Upgrade with wrong SHA-256 refused; downgrade refused | M1 |
-| 0010-070 | Drain before stop; in-flight turns complete or fail with bus-outage | M1 |
+| 0010-070 | Drain before stop; CTRL_BREAK graceful stop exits 0; in-flight turns complete or fail with bus-outage | M1 |
 | 0010-071 | Logs captured to state dir; no seed or body in logs | M1 |
 | 0010-072 | No encryption-at-rest setting present in M1 config | M1 |
 | 0010-073 | Two sites, domain per site, events stored in producer domain | post-M1 |
@@ -463,15 +463,15 @@ These requirements apply only when the post-M1 federation work is accepted. They
 
 Each entry has a default that applies unless the integrator decides otherwise.
 
-1. **Windows graceful stop.** Mechanism for stopping nats-server gracefully on Windows is `[UNVERIFIED]`. Default: process termination after client drain (0010-070).
-2. **Windows long paths.** Store directory length under deep profile paths may exceed limits. Default: spike checks `LongPathsEnabled`; if unavailable, the store path is shortened within the state directory (RFC-0012).
-3. **Seed ACL on Windows.** Default: owner-only DACL set and verified by a2ad; the icacls-equivalent check is part of the spike.
-4. **Client library on Windows (MSVC).** Default: the spike must show the chosen client builds and passes the permission and inbox tests. Failure is escalated to the integrator; no alternate client is chosen silently.
-5. **Read bundle subjects.** The exact JetStream API subjects needed by clients are `[UNVERIFIED]`. Default: start from section 4.11 and derive the minimal set from permission-violation logs (0010-059).
-6. **Inbox prefix support.** Default: use the prefix (0010-066); fallback (0010-067) only if the spike shows the client cannot set it.
-7. **Max-delivery advisory subject.** Exact subject `[UNVERIFIED]`. Default: `$JS.EVENT.ADVISORY.>` subscription; the archiver's DLQ handling is RFC-0013's.
-8. **allow_responses syntax.** `[UNVERIFIED]` config form. Default: `max` 1, `expires` 2 minutes; RFC-0002 may request more replies only through an erratum (0010-061).
-9. **Header counting toward max_payload.** `[UNVERIFIED]`. Default: the 512 KiB body and 1 MiB total sender rule (0010-015) holds in both cases.
+1. **Windows graceful stop.** Closed for the process path by spike `nats` (stub): `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` to a `CREATE_NEW_PROCESS_GROUP` group exits 0; a `KILL_ON_JOB_CLOSE` job object exits 0. `[UNOBSERVED]`: `sc.exe` service stop (no service in M1, section 7). Default: drain, then graceful stop (0010-070); process termination only as fallback.
+2. **Windows long paths.** Verified by spike `nats` (stub): a 357-character store path works with `LongPathsEnabled=1`. `[UNOBSERVED]`: behaviour with `LongPathsEnabled=0`. Default: a2ad reads `LongPathsEnabled` at start; if it is 0 and the store path exceeds 260 characters, the store path is shortened within the state directory (RFC-0012) and the condition is logged.
+3. **Seed ACL on Windows.** Mechanism verified by spike `nats` (stub): `icacls <file> /inheritance:r /grant:r "<user>:F"` leaves only the owner, on a dummy file. `[UNOBSERVED]`: real seed files. Default: owner-only DACL set and verified by a2ad at every start (0010-010).
+4. **Client library on Windows (MSVC).** Closed: async-nats 0.50.0 builds and runs on MSVC (spike `nats`, stub). No alternate client is needed.
+5. **Read bundle subjects.** Partial: permission violations produce a working read bundle (spike `nats`, stub). `[UNOBSERVED]`: the minimal subject set. Default: start from section 4.11 and derive the minimal set from permission-violation logs (0010-059).
+6. **Inbox prefix support.** Closed: `_INBOX.<id>.` works and the default `_INBOX.<nuid>` is denied (spike `nats`, stub). Fallback 0010-067 is not needed.
+7. **Max-delivery advisory subject.** Closed: `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>` observed (payload 198 bytes, spike `nats`, stub). Default: archiver DLQ handling is RFC-0013's.
+8. **allow_responses syntax.** Closed for syntax and expiry (spike `nats`, stub): `max: 1, expires: "2m"` accepted; a second reply and a late reply are denied; a request with no responder returns `no responders`. RFC-0002 may request more replies only through an erratum (0010-061).
+9. **Header counting toward max_payload.** Partial: async-nats 0.50.0 counts headers (client-side, spike `nats`, stub). `[UNOBSERVED]`: server-side counting. Default: the 512 KiB body and 1 MiB total sender rule (0010-015) holds in both cases.
 10. **Long-running tasks beyond events max_age.** Events older than the event max age are gone (0010-027, M1: 7 days). Default: requesters use GetTask after the window; the worker store holds the authoritative history. RFC-0002 [0002-046] states this: non-terminal events are not guaranteed to remain, and GetTask is authoritative once they age out. Closed against RFC-0002; RFC-0005 open issue 2 states the same figure.
 11. **Store loss.** Claims with no store record are not re-run (0010-044). Default: backup (0010-068) is the recovery path; automatic reconciliation is not in M1.
 12. **Payload format.** ProtoJSON for A2A bodies (0010-017). Audit records are binary protobuf `a2abus.v1.AuditEvent`. Default: binary protobuf for A2A bodies is a post-M1 option.
@@ -480,7 +480,8 @@ Each entry has a default that applies unless the integrator decides otherwise.
 15. **T_task above 24 h.** Default: any deployment raising it MUST raise claims max_age and events and artifact max_age together (0010-027, 0010-035, 0010-036).
 16. **Integrator requests.** Resolved: RFC-0001 now lists the reserved identities `gateway`, `tui`, `cli` and `supervisor`, and this RFC's identity table (0010-011) matches it. No request from this RFC remains open.
 17. **Event id for SUBMITTED.** Default: the SUBMITTED event has its own `A2AB-Msg-Id` (0010-046), so no change to RFC-0002 or RFC-0005 envelopes is needed. RFC-0005 must confirm that its admission record stores the event id before publish.
+18. **KV snapshot marker and TTL re-create.** Closed for the explicit push-consumer path (0010-034) and the purge-revision fenced re-create (0010-031, 0010-032), spike `nats` (stub). async-nats `watch_all()` delivered 0 entries on a 1-entry bucket; root cause `[INFERENCE]` (`push.rs`, `kv/mod.rs` `Watch::poll_next`); it is not used. `[UNOBSERVED]`: the empty-bucket path and the expected-sequence-0 create over an expiry marker.
 
-**Spike checklist (M1 gate, Windows and Linux):** store directory long path and `LongPathsEnabled`; graceful stop; seed DACL checks; port 4222 conflict and exclusion ranges; Defender prompt on first start of nats-server; chosen client builds on MSVC; ordered consumer heartbeat behaviour; KV initial-snapshot marker; per-key TTL on presence; permission violations producing the read bundle (0010-059).
+**Spike checklist (M1 gate, Windows and Linux), status after spike `nats` (stub).** Closed: long store path with `LongPathsEnabled=1`; graceful stop by CTRL_BREAK; seed ACL mechanism; MSVC client build; KV snapshot marker via push consumer; per-key TTL on presence (fresh key and marker re-create); heartbeat 2 s; read bundle from permission violations (works). Residual `[UNOBSERVED]`: `sc.exe` service stop; `LongPathsEnabled=0`; server-side header budget; real seed-file ACL; read-bundle minimal set; KV online backup and `stream snapshot` API; empty-bucket snapshot; port 4222 conflict and exclusion ranges; Defender prompt on first start of nats-server.
 
-**Verification items marked `[UNVERIFIED]` in this RFC** must be resolved by the spike before the RFC moves to Proposed: section 4.1 (`http` key and monitoring), 4.3 (header budget), 4.4 (subject length limit), 4.6 (per-key TTL option name, watch marker), 4.7 (object-store subject encoding), 4.10 (advisory subject), 4.11 (allow_responses syntax, read bundle), 4.13 (stream snapshot, Windows stop), 4.14 (domain-qualified replay). Source: `docs/interop/nats.md`.
+**Verification items marked `[UNVERIFIED]` in this RFC.** Resolved by spike `nats` (stub): section 4.1 (`http` key, monitoring), 4.3 (header budget, client side), 4.4 (subject length), 4.6 (TTL option name, watch marker), 4.10 (advisory subject), 4.11 (allow_responses syntax), 4.13 (stream backup and restore, Windows stop). Still open: 4.7 (object-store subject encoding, not run), 4.13 (`stream snapshot` API), 4.14 (domain-qualified replay, post-M1).

@@ -73,7 +73,7 @@ Terms below are not defined in RFC-0001.
 
 [0011-015] `Consumer::next() -> Delivery`: each delivery exposes headers, payload, the stream sequence and a delivery attempt counter. The consumer then calls exactly one of `ack()`, `nak(delay)`, or `term()`. A delivery left unacknowledged for longer than the consumer's `ack_wait` MUST be redelivered (at-least-once, D3).
 
-[0011-016] `kv_put(bucket, key, value, ttl) -> Revision`, `kv_get(bucket, key) -> Entry | Absent`, `kv_create(bucket, key, value, ttl) -> Revision | Conflict` (only if absent), `kv_update(bucket, key, value, expected_revision, ttl) -> Revision | Conflict` (compare-and-set), `kv_delete(bucket, key, expected_revision?)`, `kv_watch(bucket, prefix, start) -> Watch`. A key with a `ttl` MUST disappear from `kv_get` and `kv_watch` after that interval without a delete being issued by the writer.
+[0011-016] `kv_put(bucket, key, value, ttl) -> Revision`, `kv_get(bucket, key) -> Entry | Absent`, `kv_create(bucket, key, value, ttl) -> Revision | Conflict` (only if absent), `kv_update(bucket, key, value, expected_revision, ttl) -> Revision | Conflict` (compare-and-set), `kv_delete(bucket, key, expected_revision?)`, `kv_watch(bucket, prefix, start) -> Watch`. A key with a `ttl` MUST disappear from `kv_get` and `kv_watch` after that interval without a delete being issued by the writer. A write that re-creates a key whose previous entry expired, was deleted or was purged MUST apply its `ttl` on that same write, and MUST be fenced by the revision of the marker that the expiry or delete left behind. A binding MUST NOT silently drop the `ttl` on such a re-create (RFC-0010 [0010-031] documents the NATS case).
 
 [0011-017] `blob_put(tenant, bytes) -> Digest` and `blob_get(tenant, digest) -> bytes | Absent`. The digest is the SHA-256 of the bytes. `blob_get` MUST NOT return bytes whose digest differs from the requested one; a binding that detects corruption MUST return `Corrupt` (section 4.6), not the bytes.
 
@@ -95,6 +95,8 @@ Terms below are not defined in RFC-0001.
 
 [0011-025] The contract makes no guarantee about ordering across subjects, across streams, or between a request reply and events on other subjects. RFC-0002 MUST NOT depend on any such ordering.
 
+[0011-026] `kv_watch` MUST deliver the current entry of every key matching the prefix as an initial snapshot, then exactly one end-of-snapshot marker, then changes. The marker MUST be delivered when the snapshot is empty. A `Watch` therefore yields `Entry` events and one `SnapshotEnd` event before the first live change. This rule applies to every binding, including the in-memory test binding `bus-mem`. A binding that cannot deliver the marker MUST NOT declare `kv_snapshot_end` (0011-030).
+
 ### 4.4 Capabilities and profiles
 
 #### 4.4.1 Capability set
@@ -113,6 +115,7 @@ Terms below are not defined in RFC-0001.
 | `max_message_size` | bytes | largest payload accepted in one message |
 | `kv` | bool | key-value operations are available |
 | `kv_ttl` | bool | per-key TTL on `kv_put`, `kv_create`, `kv_update` |
+| `kv_snapshot_end` | bool | `kv_watch` delivers one end-of-snapshot marker after the initial snapshot, also when it is empty ([0011-026]) |
 | `blob_store` | bool | `blob_put`, `blob_get` are available |
 | `partition_tolerant` | bool | the binding continues to operate with some peers partitioned and reconciles on heal, without duplicate stored messages beyond the dedupe rule |
 
@@ -124,7 +127,7 @@ Terms below are not defined in RFC-0001.
 
 #### 4.4.2 Profiles
 
-[0011-034] The M1 profile `a2a-bus-m1` requires: `headers`, `request_reply`, `no_responder_signal`, `durable_streams`, `dedupe_window >= 3630 s`, `replay_from_seq`, `ordered_per_subject`, `max_message_size >= 262144`, `kv`, `kv_ttl`, `blob_store`. `partition_tolerant` is recommended, not required, in M1 (section 9 O-2).
+[0011-034] The M1 profile `a2a-bus-m1` requires: `headers`, `request_reply`, `no_responder_signal`, `durable_streams`, `dedupe_window >= 3630 s`, `replay_from_seq`, `ordered_per_subject`, `max_message_size >= 262144`, `kv`, `kv_ttl`, `kv_snapshot_end`, `blob_store`. `partition_tolerant` is recommended, not required, in M1 (section 9 O-2).
 
 [0011-035] A process MUST evaluate its declared profile against the binding's capabilities at start. If a required capability is absent, or a declared value is below the profile minimum, the process MUST refuse to start and MUST log the missing capability by name. It MUST NOT start in a degraded mode that skips the missing feature (T11, fail closed).
 
@@ -270,7 +273,7 @@ The suite is organized in levels. Each requirement belongs to exactly one level.
 | [0011-013] | Second append with the same msg_id inside window returns `Duplicate`; one stored message | D |
 | [0011-014] | Consumer from seq n sees all retained messages from n in order | D |
 | [0011-015] | Unacked delivery redelivered after ack_wait; nak delays; term stops | D |
-| [0011-016] | CAS conflict returns `Conflict`; TTL key absent after interval without delete | K |
+| [0011-016] | CAS conflict returns `Conflict`; TTL key absent after interval without delete; re-create after expiry or purge carries the TTL and is fenced by the marker revision | K |
 | [0011-017] | Digest mismatch from storage returns `Corrupt`, bytes never returned | B |
 | [0011-018] | Capabilities stable across calls | C |
 | [0011-019] | close leaves unacked deliveries pending for redelivery | D |
@@ -280,6 +283,7 @@ The suite is organized in levels. Each requirement belongs to exactly one level.
 | [0011-023] | Dedupe holds for the declared window; after the window duplicates may be stored | D |
 | [0011-024] | Start from a sequence beyond retention returns `Unavailable` `RETENTION_EXCEEDED` | D |
 | [0011-025] | No test depends on cross-subject order | O |
+| [0011-026] | Watch yields snapshot entries then exactly one `SnapshotEnd`; empty bucket yields `SnapshotEnd` alone; same for `bus-mem` | K |
 | [0011-030] | Capability table complete and typed | C |
 | [0011-031] | `dedupe_window` at least 3630 s for the M1 profile | D |
 | [0011-032] | `max_message_size` at least 262144 bytes after framing; 262145 rejected with `PayloadTooLarge` | C |

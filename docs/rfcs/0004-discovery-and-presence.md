@@ -89,9 +89,9 @@ A publisher that fails validation MUST NOT write, and MUST log a local error.
 
 ### 4.3 Presence lifecycle and states
 
-[0004-011] Presence MUST have a time-to-live of 30 seconds, enforced by the storage layer (the bus or its store), not by clients. Presence MUST be refreshed by the owning instance every 10 seconds while the instance is alive.
+[0004-011] Presence MUST have a time-to-live of 30 seconds, enforced by the storage layer (the bus or its store), not by clients. Presence MUST be refreshed by the owning instance every 10 seconds while the instance is alive. The NATS binding enforces this with a per-key TTL and an explicit `Nats-TTL` on every put (RFC-0010 [0010-031]); a put that re-creates an expired key carries the TTL on the same write (verified by spike `nats`, stub).
 
-[0004-012] An instance MUST claim its presence record with create-if-absent semantics. If the claim fails because a live record exists with a different `instanceId`, the new instance MUST NOT start serving and MUST report a duplicate-agent error (sec 4.6).
+[0004-012] An instance MUST claim its presence record with create-if-absent semantics. If the claim fails because a live record exists with a different `instanceId`, the new instance MUST NOT start serving and MUST report a duplicate-agent error (sec 4.6). A record that has expired is not live: the claim then succeeds and is fenced by the expiry marker's revision (RFC-0010 [0010-032]).
 
 [0004-013] Presence states and transitions:
 
@@ -119,7 +119,7 @@ stateDiagram-v2
 
 ### 4.4 Retrieval, listing and watch
 
-[0004-019] The bus binding MUST support, for each tenant: get a card record by agent id, list all card records, and watch card and presence changes. A watch MUST deliver an initial snapshot followed by one explicit end-of-initial-snapshot signal, so that a late joiner knows when the snapshot is complete. RFC-0010 maps this to the chosen storage primitives.
+[0004-019] The bus binding MUST support, for each tenant: get a card record by agent id, list all card records, and watch card and presence changes. A watch MUST deliver an initial snapshot followed by one explicit end-of-initial-snapshot signal, so that a late joiner knows when the snapshot is complete. The signal MUST also be delivered when the snapshot is empty (RFC-0011 [0011-026]). RFC-0010 maps this to the chosen storage primitives (explicit push consumer, [0010-034]).
 
 [0004-020] Clients MUST cache card records keyed by (agent id, `version`). A cached card is replaced when a newer `version` arrives. A client MUST NOT present a cached card as current if its watch has been disconnected for more than 60 seconds; it MUST re-read the card store on reconnect.
 
@@ -250,14 +250,14 @@ Attack classes are described, not demonstrated.
 | 0004-009 | Presence record size check (1 KiB). | MUST |
 | 0004-010 | Publish READY with unstored `cardVersion`; assert rejection in test harness. | MUST |
 | 0004-011 | Presence TTL is 30 s and refresh is 10 s; no client clock used for expiry. | MUST |
-| 0004-012 | Second claim with live record fails; no serving. | MUST |
+| 0004-012 | Second claim with live record fails, no serving; claim over an expired record succeeds, fenced by the marker revision. | MUST |
 | 0004-013 | State machine test: all transitions in the diagram; no others. | MUST |
 | 0004-014 | Route test: no new task to STARTING or DRAINING. | MUST |
 | 0004-015 | Health failure moves to STARTING; 2 min without recovery stops refresh; record expires. | MUST |
 | 0004-016 | Shutdown: DRAINING published; in-flight tasks finish or drain timeout; presence deleted; card kept. | MUST |
 | 0004-017 | Kill process; presence absent within 30 s plus bus delay. | MUST |
 | 0004-018 | Changed instance id is detected and per-instance cache cleared. | MUST |
-| 0004-019 | Watch delivers snapshot then end-of-snapshot marker; late joiner sees all cards. | MUST |
+| 0004-019 | Watch delivers snapshot then end-of-snapshot marker; empty store and late joiner both see the marker; late joiner sees all cards. | MUST |
 | 0004-020 | Disconnect watch 61 s; cache not used as current until revalidated. | MUST |
 | 0004-021 | Card without presence is listed as offline and not routed. | MUST |
 | 0004-022 | Query tests for each of the five forms. | MUST |
@@ -285,7 +285,7 @@ Attack classes are described, not demonstrated.
 
 ## 9. Open issues
 
-1. **Per-key TTL on NATS.** The chosen mechanism needs bucket config (`LimitMarkerTTL`, `docs/interop/nats.md` sec 4.1) and watch behavior for expirations is `[UNVERIFIED]` in the fetched notes. Default: RFC-0010 requires the setting and a live test. If per-key TTL does not expire presence as expected, the fallback is a bucket-level TTL with a periodic re-claim, which RFC-0010 must document.
+1. **Per-key TTL on NATS.** Closed by spike `nats` (stub): per-key TTL is set with `limit_markers` (RFC-0010 [0010-031]) and explicit `Nats-TTL` on every put. Watch snapshot end uses an explicit push consumer (RFC-0010 [0010-034]). The fallback (bucket-level TTL with periodic re-claim) is not needed. `[UNOBSERVED]`: presence expiry in a live multi-process test under the M1 interop run (RFC-0014).
 2. **Presence for multi-instance agents.** Default: not supported in M1 (sec 4.6). Revisit with L4 instance pinning if one agent id needs several workers.
 3. **503 handling by stock clients.** Default: 503 with `Retry-After: 5`. Stock client behavior is `[UNVERIFIED]`; Hermes behavior is `[UNVERIFIED]`. Confirm in the M1 interop test (RFC-0014).
 4. **Include-offline query.** Default: the option exists but is off by default (sec 4.5 [0004-023]).
