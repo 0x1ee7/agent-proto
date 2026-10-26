@@ -17,6 +17,11 @@ Supersedes v0 and the gRPC handoff schema (see section 1).
 | D8 | Strictly "A2A over bus"; no bus-native features outside A2A semantics | Keeps R-I3 (stock A2A client works) true for every feature. |
 | D9 | Local TUI as M1 control surface | Approvals and task view in one terminal UI; Rust TUI crate. |
 | D10 | Rust implementation | One workspace: supervisor, ACP/A2A drivers, HTTP gateway, TUI, in-memory + NATS bindings. |
+| D11 | omp driver ACP-only in M1 | Same driver as Claude Code; RPC later. |
+| D12 | Worktree isolation configurable, default per agent session | Per-task opt-in. |
+| D13 | Metering from agent usage events, self-report fallback | Hard caps are the backstop. |
+| D14 | Hermes via A2A HTTP only | No kanban coupling. |
+| D15 | Ed25519 per-agent keys + local allowlist for cross-host | Broker-independent; manual rotation. |
 
 ## 1. What the interop research changed
 
@@ -218,11 +223,11 @@ Non-goals for M1: cross-machine federation, cross-org trust, encrypted payloads 
 1. ~~Q1~~ **Decided (D8):** strictly A2A over bus. No bus-native semantics outside A2A; broadcast/fan-out only via A2A-expressible operations (e.g. `a2a_orchestrate`-style capability fan-out).
 2. ~~Q2~~ **Decided (D9):** local TUI control surface for M1 (approvals + task view).
 3. ~~Q3~~ **Decided (D10):** Rust for drivers, supervisor, gateway and TUI (`async-nats`; Windows-first packaging as static binaries).
-4. Q4 omp driver: ACP only, or also RPC mode for features ACP lacks (host tools, subagent events)?
-5. Q5 Worktree isolation (M1-5): create per task automatically, or per agent per session?
-6. Q6 Token metering: self-reported only, or read usage from each agent's events (omp/Claude emit usage)? Latter is verifiable per hop.
-7. Q7 Hermes at M1: use A2A HTTP only, or additionally its kanban/delegation features? (Assumed A2A only.)
-8. Q8 Identity and key distribution for cross-host (post-M1): needs a decision before federation work.
+4. ~~Q4~~ **Decided (D11):** omp driver is ACP-only in M1. RPC driver deferred until a concrete gap (host tools, subagent events) is identified.
+5. ~~Q5~~ **Decided (D12):** worktree isolation is configurable; default one git worktree per agent per session, opt-in per task.
+6. ~~Q6~~ **Decided (D13):** drivers meter from the agent's own usage events and fall back to self-reported counts. Turn, hop and wall-time caps are the hard backstop since token counts may be absent or unverifiable.
+7. ~~Q7~~ **Decided (D14):** Hermes via A2A HTTP only in M1; no kanban or delegation integration.
+8. ~~Q8~~ **Decided (D15):** post-M1 cross-host identity is per-agent Ed25519 keys signing envelopes and cards, with an operator-maintained public-key allowlist (no CA). Rotation manual; revocation by removing from the allowlist. M1 stays on broker auth.
 
 ## 8. Threat model
 
