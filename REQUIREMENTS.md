@@ -1,143 +1,260 @@
 # Bus-Based Agent-to-Agent Protocol: Requirements & Threat Model
 
-Status: draft v0. Scope: requirements only. No wire format, no code.
-Origin: gRPC/HTTP2 A2A handoff, re-targeted at a message bus.
+Status: draft v1. Requirements only; no wire format, no code.
+Supersedes v0 and the gRPC handoff schema (see section 1).
 
-## 1. Decisions taken
+## 0. Decisions
 
 | ID | Decision | Consequence |
 |----|----------|-------------|
-| D1 | Bus-agnostic | Protocol specifies semantics and a minimal transport-binding contract; NATS/MQTT/Kafka/etc. are bindings. Guarantees are the floor that every binding MUST meet or emulate. |
-| D2 | Edge-to-cloud federation | Multiple brokers, intermittent links, store-and-forward. Peers cannot assume a shared broker or low latency. |
-| D3 | At-least-once delivery, idempotent handlers | Every message carries a unique ID; receivers dedupe; effects keyed on IDs. |
-| D4 | Deliverable includes a threat model | See section 6. |
+| D1 | Bus-agnostic core; thin binding contract | Semantics are bus-independent. A binding adapts a concrete bus. |
+| D2 | Edge-to-cloud federation | Multiple brokers, intermittent links, store-and-forward. |
+| D3 | At-least-once delivery, idempotent handlers | Unique message ids, dedupe, per-task sequence numbers. |
+| D4 | Threat model is a deliverable | Section 8. |
+| D5 | **Interoperate with A2A v1.0 (Linux Foundation) by being a new A2A protocol binding, not a new data model** | Section 2. Reuses Task/Message/Part/Artifact/AgentCard. |
+| D6 | **Milestone 1 = Hermes, Claude Code and omp collaborating on one Windows/Linux machine** | Section 5. |
+| D7 | **Reference bus: NATS with JetStream** (adapters keep it replaceable) | Section 4. |
+| D8 | Strictly "A2A over bus"; no bus-native features outside A2A semantics | Keeps R-I3 (stock A2A client works) true for every feature. |
+| D9 | Local TUI as M1 control surface | Approvals and task view in one terminal UI; Rust TUI crate. |
+| D10 | Rust implementation | One workspace: supervisor, ACP/A2A drivers, HTTP gateway, TUI, in-memory + NATS bindings. |
 
-Carried over from the handoff: ACP-style lifecycle, human permission gates, MCP handoff, protobuf as the schema language (assumption, confirm in Q1), lightweight footprint.
+## 1. What the interop research changed
 
-## 2. Goals and non-goals
+The "A2A" in the handoff was a custom gRPC schema (`agent.a2a.v1`). The actual open A2A protocol, which Hermes implements, is already specified (`lf.a2a.v1`, normative protobuf at a2a-protocol.org). It already covers most of what the handoff proposed:
 
-Goals
-- G1 Agents discover each other and their capabilities over the bus.
-- G2 Submit a task, observe progress, receive a terminal result; survive disconnects.
-- G3 Explicit lifecycle with human-approval suspension.
-- G4 Safe composition: injection isolation, loop bounds, scoped credential delegation.
-- G5 Small footprint: implementable on an edge device with a minimal bus client and a protobuf runtime.
+| Handoff concept | A2A v1.0 equivalent |
+|---|---|
+| `GetAgentManifest` / `ManifestResponse` | `AgentCard` (skills, capabilities, security schemes, signed via JWS `signatures`) |
+| `OpenSession` bidirectional stream | `SendStreamingMessage`, `SubscribeToTask`, `contextId` for multi-turn |
+| `TaskPrompt` / `TaskResult` | `Message` + `Part` (text, raw, url, data) / `Artifact` |
+| `ExecutionState` | `TaskState` |
+| `PermissionRequest` / `Grant` | **No equivalent.** `INPUT_REQUIRED` / `AUTH_REQUIRED` interrupted states only. |
+| Heartbeat `Ping` | None (HTTP keep-alive). Bus presence replaces it. |
+| Circuit breakers | None in spec. Hermes implements its own per-context turn cap. |
+| MCP bridging | None in spec. |
 
-Non-goals (proposed)
-- N1 Not a broker. Does not define routing, clustering or persistence of the bus.
-- N2 Not an LLM runtime API or an MCP replacement; MCP is bridged, not re-specified.
-- N3 No synchronous-RPC emulation as the primary model (request/reply is a convenience layered on async).
-- N4 No REST/JSON gateway in core (may be a separate profile).
+Consequence: do not invent a parallel schema. Our value-add is (a) a bus binding, (b) approval gating, (c) loop/budget control, (d) scoped delegation, (e) local multi-agent supervision. (b) to (d) ship as A2A extensions (`AgentExtension` with URI, `required` flag), so a stock A2A peer still works and merely ignores them.
 
-## 3. Actors
+## 2. Hermes A2A comparison
 
-- Requester: agent or orchestrator that submits tasks.
-- Worker: agent that executes tasks.
-- Operator: human who approves gated actions via a control UI. Also an agent-like peer on the bus.
-- Bus: opaque, untrusted-for-confidentiality transport (see T-assumptions).
-- Registry (optional): discovery aid; the protocol must work without one.
+Hermes (Nous Research, v0.20.0+) ships an A2A plugin implementing A2A v1.0 over HTTP, in both directions. Source: Hermes docs, "A2A (Agent-to-Agent)".
 
-## 4. Functional requirements
+| Aspect | Hermes A2A (HTTP) | This protocol (bus) | Interop impact |
+|---|---|---|---|
+| Data model | A2A v1.0 Task/Message/Part/Artifact | Same | Lossless mapping. |
+| Transport | JSON-RPC 2.0 over HTTP `POST /`, SSE streaming, webhook push | Pub/sub + request/reply + durable streams on a bus | Needs a gateway (bus to HTTP). |
+| Discovery | `GET /.well-known/agent-card.json` (legacy `agent.json`) | Cards published on bus (retained key-value), presence | Gateway serves bus cards at the well-known path and ingests Hermes's card. |
+| Methods | `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, push-config CRUD, plus pre-1.0 aliases (`message/send`) | Same operation set mapped to subjects | Operation parity is a requirement (R-I2). |
+| Sync model | `SendMessage` blocks until terminal or interrupted unless `return_immediately` | Async-first | Gateway must emulate blocking; Hermes `A2A_REPLY_TIMEOUT` default 300 s bounds it. |
+| Auth | Bearer, per-peer tokens `A2A_PEER_TOKENS`; no token means localhost-only bind | NKey/JWT or equivalent per agent + signed envelopes | Gateway maps authenticated bus identity to a Hermes peer token. Identity is per peer name (rate limit 60/min is keyed on it). |
+| Session model | Inbound task injected into a live gateway session keyed by `contextId` | `contextId` preserved end to end | Never rewrite `contextId`; Hermes ownership binding includes peer, tenant and context id. Reusing ids across peers collides. |
+| Injection defense | Filters and frames inbound text as untrusted; strips operator slash commands | Capability scope plus structural untrusted marking | Avoid double filtering that corrupts content; mark provenance in `metadata`, do not pre-wrap text. |
+| Loop control | `A2A_MAX_PINGPONG_TURNS` (default 5, max 20) per context | Budgets in envelope (depth, hops, tokens, time) | Bus budgets must be at least as strict; pass Hermes caps through. Hermes enforces locally regardless. |
+| Audit | `~/.hermes/a2a_audit.jsonl` | Bus audit stream | Both exist; bus stream is the cross-agent source of truth. |
+| Approval gating | None at A2A layer | First-class extension | Map to `INPUT_REQUIRED` with extension metadata; Hermes sees a normal interrupted task. |
+| Same-host guidance | Hermes docs prefer in-process delegation or kanban locally; A2A for crossing process/framework boundaries | This is exactly the cross-framework case | Hermes's own advice does not cover mixed frameworks on one host. |
+| Redaction | Outbound credential-shaped strings scrubbed | Required of any binding (R-S5) | Compatible. |
 
-Discovery
-- F1 An agent publishes a signed manifest: id, version, role, capabilities, accepted input types, supported MCP bridges, limits (max depth, max concurrent tasks), protocol versions.
-- F2 Manifests are retained or re-announced so late joiners and edge nodes returning from offline can discover peers. Includes TTL and liveness (presence).
-- F3 Capability matching by name plus version range. Free-text role is informational only.
+Unverified: exact `INPUT_REQUIRED` handling in Hermes inbound (its docs describe only final-reply results), and whether Hermes emits intermediate status events on `SendStreamingMessage`. Check in the M1 spike.
 
-Task lifecycle
-- F4 States: QUEUED, PROCESSING, PENDING_APPROVAL, SUCCEEDED, FAILED. Proposed additions to evaluate: CANCELED, REJECTED (policy/validation), EXPIRED (deadline), INPUT_REQUIRED (non-permission clarification). The handoff conflates these into FAILED, which loses information.
-- F5 Legal transition table is normative. SUCCEEDED, FAILED, CANCELED, REJECTED, EXPIRED are terminal and immutable.
-- F6 State changes are events with a monotonic per-task sequence number. Duplicate or reordered events are tolerated; the highest sequence wins.
-- F7 Requester can cancel; worker acknowledges. Cancel is best-effort, with final state reported.
-- F8 Every task has a deadline or TTL. Abandoned tasks must reach a terminal state.
+### Strategy
 
-Streaming and results
-- F9 Worker emits ordered, resumable progress/delta chunks (per-task sequence, requester can request replay from sequence N).
-- F10 Large payloads (artifacts) go by reference (content-addressed pointer plus hash) when exceeding a bus message limit; inline otherwise. Binding declares max message size.
-- F11 Result carries structured error (code taxonomy, retryable flag), not just int and string.
+Define a **bus protocol binding** for A2A:
+- `AgentInterface.protocol_binding` is an "open form string" in the spec, so a binding such as `NATS` can be advertised on the card alongside `JSONRPC`, `GRPC`, `HTTP+JSON`.
+- Every bus-native agent publishes an A2A `AgentCard` whose `supported_interfaces` lists the bus binding first and, when a gateway exists, an HTTP JSON-RPC fallback.
+- Non-bus agents (Hermes) are joined by **bridges**, never by modifying them.
 
-Human-in-the-loop
-- F12 Worker emits a permission request: capability, scope, human-readable reason, expiry. Task enters PENDING_APPROVAL.
-- F13 Grants are signed by an operator identity, bound to task id + request id + scope, single use, expiring. Default on timeout is deny.
-- F14 Approval routing is decoupled: the request can go to the requester's operator, not necessarily the worker's.
+Interop in both directions without touching Hermes:
 
-Delegation and MCP
-- F15 A requester can delegate a narrowly scoped capability to a worker for one task (see T5). Delegation never transmits raw long-lived secrets in the clear.
-- F16 Delegated MCP access is by reference to a mediated endpoint or a short-lived attenuated token, with task-bound scope and expiry.
+1. **Hermes calls bus agents.** Gateway exposes an A2A v1.0 HTTP endpoint per bus agent. Add it to Hermes `a2a_agents` config. `a2a_call` / `a2a_orchestrate` then reach omp and Claude Code.
+2. **Bus agents call Hermes.** Bridge is an A2A HTTP client against Hermes's `:9900`, republishing Hermes as a bus agent.
+3. **External A2A peers** (LangChain, CrewAI, ADK, official `a2a-sdk`) reach bus agents through the same gateway.
 
-Multi-hop
-- F17 A worker can sub-delegate. Each message carries a correlation chain: root task id, parent id, depth, hop budget.
+To verify: whether the A2A spec has normative requirements for custom bindings (functional equivalence across bindings, error mapping). Treat as a conformance constraint until read.
 
-Loop and budget control
-- F18 Every task carries budgets: max depth, max hops, max tokens, max wall time, max cost units. Budgets are monotonically non-increasing when delegating and enforced by each hop.
-- F19 Cycle detection via chain of agent ids plus task fingerprint; violation yields FAILED with a distinct error code.
+## 3. Agent integration surfaces
 
-## 5. Non-functional requirements
+| Agent | Native surface | Bridge |
+|---|---|---|
+| Hermes | A2A v1.0 HTTP server and outbound `a2a_*` tools | A2A HTTP client driver plus gateway for the reverse direction |
+| omp | `omp --mode acp` (Agent Client Protocol over stdio); `--mode rpc` (custom JSONL, not JSON-RPC); `--mode json`; SDK | ACP driver (preferred: standard, has permission requests); RPC driver as fallback for omp-specific features |
+| Claude Code | Headless `-p --output-format stream-json`; Agent SDK; ACP via `@agentclientprotocol/claude-agent-acp` | ACP driver through that adapter |
 
-Delivery and consistency (from D3)
-- R1 Every message has a globally unique id (and a causation id). Handlers are idempotent on it.
-- R2 Receivers keep a bounded dedupe window; window size vs. max redelivery horizon is a stated invariant.
-- R3 Ordering guaranteed only per task (sequence number), never globally. Binding must preserve per-key order or the protocol reorders using seq.
-- R4 Redelivery of a task submission to a busy or restarted worker must not execute it twice (dedupe by task id; recorded state survives restart).
+Notes:
+- ACP is client-to-agent (editor drives agent), not peer-to-peer. The driver plays the ACP *client* and re-presents the agent as an A2A peer. One ACP driver implementation covers omp and Claude Code.
+- ACP permission requests map to our approval extension (`INPUT_REQUIRED`). omp under `--no-ui` fails closed on tools needing approval, which is the right default for an unattended worker.
+- Unverified: how much of the ACP client surface (filesystem, terminal) the driver must implement versus declare unsupported; behavior of `claude-agent-acp` on Windows. Spike item.
 
-Federation and edge
-- R5 Operates across partitions: sender queues locally, delivers on reconnect. Message TTL honors the task deadline.
-- R6 Addressing is logical (agent id), not broker-specific; routing across brokers is the binding's job, but addresses must survive a leaf-to-hub hop.
-- R7 Clock skew tolerant: no hard dependence on synchronized wall clocks. Expiry uses relative durations plus an issuer-stamped time with a skew allowance.
+## 4. Bus selection
 
-Footprint
-- R8 Core library fits constrained targets: no mandatory registry, no mandatory persistent store beyond a small state file/KV, bounded memory per task.
-- R9 Binding contract is small: publish, subscribe, optional durable consumer, max message size, per-key ordering flag. Reference bindings: in-memory (tests) plus one real bus.
+Requirements for the bus: runs on Windows and Linux without WSL, small footprint, request/reply, persistence with replay, per-subject authorization, federation across broker hops, mature clients for Rust/Go/TypeScript/Python.
 
-Evolvability
-- R10 Schema versioning with forward/backward compatibility rules; unknown fields are ignored, unknown critical extensions are rejected (explicit "critical" marker).
-- R11 Protocol version negotiated via manifest.
+| Bus | Windows | Persistence | Request/reply | Federation / edge | Verdict |
+|---|---|---|---|---|---|
+| **NATS + JetStream** | Native binary, runs as service | JetStream streams, durable consumers, de-dup by message id, KV, object store | Built in | Leaf nodes, clusters, accounts | **Recommended reference binding** |
+| Zenoh | Native (Rust) | Optional storages | Queryables | Peer mesh and routers; very edge-friendly | Strong alternative; smaller ecosystem and tooling. Candidate second binding |
+| MQTT 5 (Mosquitto, NanoMQ, EMQX) | Yes | Retained messages, sessions; weak replay | Response-topic convention | Bridges | Fits constrained devices; poor for large payloads and streaming replay |
+| ZeroMQ / nanomsg | Yes (library) | None | Patterns, hand-built | Brokerless | Too much must be rebuilt (durability, auth) |
+| Kafka / Pulsar / RabbitMQ | Possible | Strong | Awkward | Heavy | Too heavy for edge M1 |
+| D-Bus | Not a native Windows citizen | None | Yes | Local only | Rejected |
+| Redis Streams | No official Windows build | Yes | Hand-built | Limited | Rejected |
+| Named pipes / Unix sockets | Both differ | None | Point-to-point | Local only | Not a bus; maybe a local transport for drivers |
 
-Observability
-- R12 Trace context (W3C traceparent) in every envelope. Task event stream is auditable.
+Why NATS for M1 (single static server, loopback, one process the supervisor starts):
+- Its delivery model is at-least-once with publisher-side de-duplication on a message-id header, matching D3.
+- Subject-level permissions give broker-side authorization as defense in depth (A1).
+- Leaf nodes give the edge-to-cloud path (D2) without changing the protocol.
+- JetStream KV can hold retained agent cards; object store can hold large artifacts (default payload limit is about 1 MB, so artifacts need by-reference).
 
-Security (summary; detail in section 6)
-- R13 End-to-end message authenticity and integrity independent of the broker (signed envelopes). Confidentiality end-to-end for sensitive payloads (encrypted to recipient).
-- R14 Authorization at three layers: broker ACL (coarse, defense in depth), protocol-level (who may request what), per-task capability.
+Risk: JetStream and NATS server behavior on Windows (service install, file-store paths, permissions). Spike item. Mitigation: the in-memory reference binding (R-B3) keeps development unblocked.
 
-## 6. Threat model
+Binding contract (must stay this small):
+- publish(subject, headers, bytes), subscribe(subject-pattern), request(subject, bytes, timeout)
+- durable stream: append with message-id de-dup, consume from sequence N with ack
+- key-value with TTL and watch (cards, presence)
+- declared `max_message_size`, per-key ordering flag
+
+## 5. Milestone 1: local multi-agent collaboration
+
+Goal: Hermes, Claude Code and omp run on one machine (Windows primary, Linux required), discover each other, and exchange tasks over the bus, with a human approving gated actions from one place.
+
+### 5.1 Components
+
+```mermaid
+flowchart LR
+  subgraph host[Local host]
+    bus[(NATS + JetStream\nloopback)]
+    sup[Supervisor CLI\nstart/stop/status]
+    ctl[Control surface\napprovals + task view]
+    omp[omp --mode acp]
+    cc[claude-agent-acp]
+    hm[Hermes :9900]
+    d1[ACP driver] --- omp
+    d2[ACP driver] --- cc
+    d3[A2A HTTP driver] --- hm
+    gw[HTTP gateway\nA2A v1.0]
+  end
+  d1 & d2 & d3 & gw & ctl --> bus
+  sup -. spawns .-> bus & d1 & d2 & d3 & gw
+  hm -. a2a_call .-> gw
+  ext[External A2A peer] -.-> gw
+```
+
+### 5.2 M1 requirements
+
+- M1-1 One command starts the bus, drivers and gateway; one command stops them and leaves no orphan processes (Windows job objects / Linux process groups).
+- M1-2 Each agent appears on the bus with an A2A `AgentCard` generated by its driver (skills derived from what the agent can do; for Hermes, ingest its card; for omp and Claude Code, static config plus ACP-reported capabilities).
+- M1-3 Any agent can discover and send a task to any other; results return as A2A `Task` with `Artifact`s.
+- M1-4 Hermes can call omp and Claude Code via its stock `a2a_call` pointed at the gateway. No Hermes patch.
+- M1-5 Each worker runs in an isolated working directory (git worktree or copy). Two coding agents must never edit the same checkout concurrently; the default is an error, not a lock. (Gap in everything surveyed; this is the biggest practical hazard.)
+- M1-6 Permission requests from any agent surface in the control surface with: requesting agent, task chain, tool, arguments summary, working directory. Approve or deny returns to the originating agent. Default on timeout is deny.
+- M1-7 Loop and budget limits are enforced (section 6, R-L). Hermes's own cap still applies.
+- M1-8 Cancel from requester or operator terminates the underlying agent turn and reports `CANCELED`.
+- M1-9 Driver or agent crash mid-task yields a terminal `FAILED` with cause within a bounded time; restarting the supervisor does not re-run completed tasks (idempotency).
+- M1-10 Credentials: the bus uses per-agent credentials generated at first start, stored with OS-user-only permissions. Provider API keys stay in each agent's own config; nothing in this system reads or forwards them.
+- M1-11 Everything is logged to one append-only audit stream: who asked whom, state transitions, approvals, budgets tripped.
+
+### 5.3 M1 acceptance scenarios
+
+1. omp asks Claude Code to review a file; reply arrives with an artifact.
+2. Hermes (via `a2a_call` to the gateway) asks omp to run a task; streaming status is visible.
+3. Claude Code asks Hermes a research question; answer returns over the HTTP driver.
+4. A worker needs approval for a write; task shows `INPUT_REQUIRED`; operator approves; task completes. Repeat with deny and with timeout.
+5. Two agents are configured to delegate back and forth; the breaker trips with a distinct error code; both tasks end terminal.
+6. Kill the bus mid-task and restart it; no duplicate execution, task reaches a terminal state or a clearly reported failure.
+7. Duplicate delivery injected for a task submission; handler executes once.
+8. Cancel a long task; underlying agent turn stops.
+9. An external stock `a2a-sdk` client fetches the card and sends a message to omp through the gateway.
+
+Non-goals for M1: cross-machine federation, cross-org trust, encrypted payloads end to end, registry service, REST/JSON beyond the A2A gateway, MCP token delegation.
+
+## 6. Requirements (cumulative)
+
+### Interop
+- R-I1 Data model is A2A v1.0 protobuf. Bus payloads are A2A messages; protocol additions are A2A extensions declared on the card.
+- R-I2 Operation parity: SendMessage, SendStreamingMessage, GetTask, ListTasks, CancelTask, SubscribeToTask, extended card, push config (push may map to bus subscription).
+- R-I3 A stock A2A client must work through the gateway with no knowledge of the bus.
+- R-I4 Unknown extensions are ignored unless declared `required`; required-but-unsupported fails with a clear error.
+- R-I5 Error mapping table between bus errors, A2A error codes and JSON-RPC errors is normative.
+- R-I6 Pin and track an A2A spec version; Hermes also accepts pre-1.0 method aliases, gateway should do the same on ingress only.
+
+### Lifecycle
+- R-L1 States are A2A `TaskState`: SUBMITTED, WORKING, INPUT_REQUIRED, AUTH_REQUIRED, COMPLETED, FAILED, CANCELED, REJECTED. Handoff names map as: QUEUED to SUBMITTED, PROCESSING to WORKING, PENDING_APPROVAL to INPUT_REQUIRED plus approval extension data, SUCCEEDED to COMPLETED.
+- R-L2 Spec has no EXPIRED; deadline expiry is FAILED with a machine-readable reason.
+- R-L3 Status events carry a per-task monotonic sequence. Terminal states are immutable. Duplicates and reordering are tolerated.
+- R-L4 Every task has a deadline; abandoned tasks reach a terminal state.
+- R-B1 Budgets (depth, hops, tokens, wall time) travel in message metadata; a delegate may only lower them; every hop enforces locally.
+- R-B2 Cycle detection via chain of agent ids plus task fingerprint.
+- R-B3 Trip yields FAILED with distinct code.
+
+### Delivery
+- R-D1 Unique message id on every message; idempotent handlers; bounded dedupe window with a stated relation to maximum redelivery horizon.
+- R-D2 Ordering only per task via sequence numbers.
+- R-D3 Task submission redelivered to a restarted worker does not execute twice.
+- R-D4 Large artifacts by reference (`Part.url` with content hash) beyond binding `max_message_size`.
+
+### Binding / federation
+- R-F1 Logical addressing by agent id and tenant; survives leaf-to-hub hop.
+- R-F2 Cards carry TTL and are re-announced; presence via TTL keys.
+- R-F3 No dependence on synchronized clocks; relative durations with issuer timestamp and skew allowance.
+- R-F4 In-memory reference binding for tests plus NATS binding for M1.
+
+### Security
+- R-S1 Per-agent identity key; messages signed independently of the broker. (M1 may rely on broker auth plus audit; signing is required before cross-host.)
+- R-S2 Agent Cards signed (A2A supports JWS signatures on cards).
+- R-S3 Grants: bound to task id, request id and scope; single use; expiring; default deny.
+- R-S4 Delegated capabilities attenuated per task. No raw long-lived secrets in envelopes.
+- R-S5 Redaction of credential-shaped strings in logs, traces, and outbound content.
+- R-S6 Rate limits and queue quotas per peer; overload returns REJECTED, never silent drop.
+- R-S7 Task content is untrusted data. Provenance is marked in metadata, text is not rewritten; the enforced boundary is capability scope and approval, not delimiters.
+
+### Footprint and operations
+- R-O1 Core runs without registry or external database; bounded memory per task.
+- R-O2 W3C trace context in every envelope.
+- R-O3 Windows and Linux are both first-class: path handling, process lifecycle, file permissions, no POSIX-only assumptions.
+
+## 7. Open questions
+
+1. ~~Q1~~ **Decided (D8):** strictly A2A over bus. No bus-native semantics outside A2A; broadcast/fan-out only via A2A-expressible operations (e.g. `a2a_orchestrate`-style capability fan-out).
+2. ~~Q2~~ **Decided (D9):** local TUI control surface for M1 (approvals + task view).
+3. ~~Q3~~ **Decided (D10):** Rust for drivers, supervisor, gateway and TUI (`async-nats`; Windows-first packaging as static binaries).
+4. Q4 omp driver: ACP only, or also RPC mode for features ACP lacks (host tools, subagent events)?
+5. Q5 Worktree isolation (M1-5): create per task automatically, or per agent per session?
+6. Q6 Token metering: self-reported only, or read usage from each agent's events (omp/Claude emit usage)? Latter is verifiable per hop.
+7. Q7 Hermes at M1: use A2A HTTP only, or additionally its kanban/delegation features? (Assumed A2A only.)
+8. Q8 Identity and key distribution for cross-host (post-M1): needs a decision before federation work.
+
+## 8. Threat model
 
 Trust assumptions
-- A1 The broker is not trusted for confidentiality or integrity; it is assumed available best-effort. Broker ACLs are defense in depth only.
-- A2 Peer agents are semi-trusted: authenticated, but a compromised or prompt-injected peer is in scope.
-- A3 Task content (instructions, tool results, artifacts) is untrusted data regardless of sender.
-- A4 Operators are trusted; their control channel is a high-value target.
+- A1 Broker is not trusted for confidentiality or integrity; broker ACLs are defense in depth.
+- A2 Peers are authenticated but may be compromised or prompt-injected.
+- A3 All task content, tool output and artifacts are untrusted data.
+- A4 Operators are trusted; their channel is high-value.
+- A5 (M1) Local host is a single trust domain, but processes of other OS users are not trusted: bus must bind loopback or a named pipe/socket with user-only permissions.
 
-| # | Threat | Vector | Required mitigation |
-|---|--------|--------|---------------------|
-| T1 | Prompt injection via task payload or results | Instruction text from peer or tool output steers the worker LLM | Structural separation: envelope distinguishes instruction (from authenticated requester, still policy-bounded) from data (untrusted). Runtime framework wraps untrusted fields and never lets data fields grant authority. Delimiter wrapping is hygiene only, not a security boundary. Real boundary is capability limits: injected text can only invoke what the task's granted scope allows, and sensitive actions hit F12 gates. |
-| T2 | Confused deputy / privilege escalation through delegation | Worker uses requester's authority for something else | Capabilities attenuated per task, bound to task id and audience; no ambient authority. |
-| T3 | Infinite ping-pong and cost exhaustion | Cyclic delegation or runaway multi-turn | F18/F19: hop, depth, token, time budgets carried in envelope and enforced locally by every hop. Budgets cannot be raised by downstream. A tripped breaker emits FAILED with a distinct code. Honest note: token counts reported by peers are self-reported; each hop meters its own use. |
-| T4 | Message replay, duplication (also inherent in at-least-once) | Broker or attacker re-injects old messages, esp. permission grants | Unique ids, nonce, expiry, dedupe; grants single use and bound to request id. |
-| T5 | Credential/MCP token leakage | Secrets in metadata, logs, or broker storage | No raw secrets in envelopes. Use reference + short-lived attenuated token encrypted to the recipient, or a mediated proxy. Redaction in logs and traces required. |
-| T6 | Impersonation / forged peer | Attacker publishes to another agent's subject or topic | Per-message signatures, key identity tied to agent id; manifest signed; key rotation and revocation story required (open Q6). |
-| T7 | Forged or stolen human approval | Spoofed grant, UI phishing, approval fatigue | Grants signed by operator key; display shows the actual action, scope and requesting chain; rate-limit and batch-guard prompts; default deny. |
-| T8 | Poisoned discovery | Fake manifest advertises a capability to attract tasks and data | Signed manifests, allowlists or trust anchors per deployment; requester pins expected agent identity before sending sensitive data. |
-| T9 | Broker-level DoS and queue flooding | Spam of task submissions | Per-peer rate limits and queue quotas at worker; admission control returns REJECTED rather than silent drop. |
-| T10 | Metadata leakage | Subjects, ids, sizes visible to broker | Document leakage; minimize sensitive data in routing keys. Encrypted payload, plaintext routing header minimum. |
-| T11 | Partition-time stale authority | Offline edge node acts on expired grant or revoked key | Hard expiries, short-lived credentials, fail closed when freshness cannot be shown. |
+| # | Threat | Required mitigation |
+|---|--------|---------------------|
+| T1 | Prompt injection through task text or results | Capability scope per task, approval gates for sensitive tools, provenance marking. Delimiter wrapping is hygiene only. Hermes filtering is an extra layer, not relied on. |
+| T2 | Confused deputy via delegation | Attenuated per-task capabilities; no ambient authority; chain shown in approval UI. |
+| T3 | Ping-pong and cost runaway | R-B1..R-B3; each hop meters its own usage; Hermes turn cap respected. |
+| T4 | Replay and duplication (inherent to at-least-once) | Ids, nonces, expiry, dedupe, single-use grants. |
+| T5 | Credential leakage (provider keys, MCP tokens, bus creds) | Never in envelopes or logs; bridges never read agent provider config; redaction; bus credentials file permissions. |
+| T6 | Impersonation on the bus | Per-agent broker credentials with subject permissions limited to own subjects; signatures before cross-host. |
+| T7 | Forged or fatigue-driven human approval | Signed grants; UI shows actual action, scope, chain; rate-limit prompts; default deny. |
+| T8 | Poisoned discovery (fake cards) | Signed cards; local allowlist of agent ids; pin expected identity before sending sensitive data. |
+| T9 | Flooding | Per-peer rate limits and quotas; REJECTED on overload. |
+| T10 | Metadata leakage on bus | Document; avoid sensitive data in subjects. |
+| T11 | Stale authority in partitions | Hard expiries; fail closed. |
+| T12 | **Gateway as new attack surface** (HTTP exposure of bus agents) | Loopback bind by default; bearer required to widen (mirrors Hermes); identity mapped to bus identity; gateway cannot grant itself approvals. |
+| T13 | **Concurrent writes by multiple coding agents** (data loss, corrupt repo) | Worktree isolation (M1-5); refuse shared cwd. |
+| T14 | **Driver as privileged confused deputy** (drivers hold every agent's session) | Driver runs as the same OS user as its agent, one driver per agent, no shared state between drivers. |
+| T15 | **Approval bypass via agent-native modes** (e.g. an agent started with permissions skipped) | Supervisor starts agents with approval-requiring configuration and records it on the card; flags dangerous modes. |
 
-## 7. Open questions (need your decision)
+## 9. Next steps
 
-1. Q1 Schema language: keep protobuf (compact, good for edge) or something else (CBOR/JSON for bus-ecosystem friendliness)?
-2. Q2 Identity and signing: key scheme (Ed25519 per agent?), who is the trust root, and how are keys distributed and revoked across federated brokers?
-3. Q3 Is the supported topology request/reply per task (reply subject), or pub/sub event stream per task id with replay? Affects binding requirements (durable consumers).
-4. Q4 Task ownership: can a task be handed off or resumed by a different worker instance (competing consumers / work queue), or is it pinned to one agent id?
-5. Q5 How far is end-to-end encryption in scope for v1 versus signed-only?
-6. Q6 Is a registry a first-class component or purely emergent from presence announcements?
-7. Q7 Token metering: trusted self-report only, or is there a verifiable metering mechanism?
-8. Q8 Is MCP delegation mediated (proxy) only, or can short-lived tokens be passed directly?
-9. Q9 Which real bus is the first reference binding, and which are explicit non-targets?
-10. Q10 Extra lifecycle states (CANCELED, REJECTED, EXPIRED, INPUT_REQUIRED): accept?
-
-## 8. Suggested next steps
-
-1. Resolve Q1, Q2, Q3 (they shape everything).
-2. Write the normative state machine and envelope field list (no encoding yet).
-3. Define the binding contract and an in-memory reference binding for conformance tests.
-4. Pick a reference bus and write failure-scenario tests: duplicate delivery, partition and reconnect, restart mid-task, cycle trip.
+1. Spike (1-2 days): NATS + JetStream on Windows; `omp --mode acp` and `claude-agent-acp` driven from a minimal ACP client; one Hermes `SendMessage` round trip. Resolve the "unverified" items above.
+2. Read A2A spec sections on custom bindings and extensions; fix R-I5.
+3. Decide Q1, Q3.
+4. Write the normative subject taxonomy and envelope/extension definitions for the NATS binding.
+5. Implement in-memory binding + conformance tests, then M1 scenarios 1-9 in order.
