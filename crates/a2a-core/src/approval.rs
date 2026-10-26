@@ -113,6 +113,10 @@ pub struct NewRequest {
     pub nonce: Vec<u8>,
     /// Expiry after creation in milliseconds; `None` selects [`DEFAULT_EXPIRY_MS`].
     pub expiry_ms: Option<u64>,
+    /// Canonical working directory of the gated call (0006-006). Must be non-empty.
+    pub working_directory: String,
+    /// Owner workspace mode: `per-session` or `per-task` (0006-006, RFC-0012).
+    pub workspace_mode: String,
 }
 
 /// Result of opening a request.
@@ -163,6 +167,10 @@ pub enum OpenError {
     Expiry,
     #[error("request id already exists")]
     Duplicate,
+    #[error(
+        "working directory must be non-empty and workspace mode per-session or per-task (0006-006)"
+    )]
+    Context,
 }
 
 /// Refused decision. Each refusal changes no state (0006-013, 0006-023).
@@ -199,6 +207,8 @@ struct Record {
     summary: String,
     requester: String,
     chain: Vec<String>,
+    working_directory: String,
+    workspace_mode: String,
     nonce: String,
     created_ms: u64,
     expires_ms: u64,
@@ -263,11 +273,18 @@ impl ApprovalBook {
         if !(MIN_EXPIRY_MS..=MAX_EXPIRY_MS).contains(&expiry_ms) {
             return Err(OpenError::Expiry);
         }
+        if spec.working_directory.is_empty()
+            || !matches!(spec.workspace_mode.as_str(), "per-session" | "per-task")
+        {
+            return Err(OpenError::Context);
+        }
         let summary = bound_summary(&spec.summary);
         let joinable = self.records.values().find(|r| {
             r.state == RequestState::Open
                 && r.task_id == spec.task_id
                 && r.tool == spec.tool
+                && r.working_directory == spec.working_directory
+                && r.workspace_mode == spec.workspace_mode
                 && r.tier == spec.tier
                 && r.summary == summary
                 && now_ms.saturating_sub(r.created_ms) < COALESCE_MS
@@ -291,6 +308,8 @@ impl ApprovalBook {
             summary,
             requester: spec.requester,
             chain: spec.chain,
+            working_directory: spec.working_directory,
+            workspace_mode: spec.workspace_mode,
             nonce: to_hex(&spec.nonce),
             created_ms: now_ms,
             expires_ms: now_ms.saturating_add(expiry_ms),
@@ -414,6 +433,15 @@ impl ApprovalBook {
             .count()
     }
 
+    /// Whether a request of a task has expired (0006-017). The expired record
+    /// stays in the book, so the marker holds until the owner commits the timeout.
+    #[must_use]
+    pub fn expired_for_task(&self, task_id: &str) -> bool {
+        self.records
+            .values()
+            .any(|r| r.state == RequestState::Expired && r.task_id == task_id)
+    }
+
     /// Current state of a request.
     #[must_use]
     pub fn state(&self, request_id: &str) -> Option<RequestState> {
@@ -480,6 +508,8 @@ fn build_request(r: &Record) -> ApprovalRequest {
         summary: r.summary.clone(),
         requester: r.requester.clone(),
         chain: r.chain.clone(),
+        working_directory: r.working_directory.clone(),
+        workspace_mode: r.workspace_mode.clone(),
         options: vec![
             ApprovalOption {
                 option_id: ALLOW_ONCE_ID.to_owned(),
@@ -537,6 +567,8 @@ mod tests {
             chain: vec!["omp".to_owned(), "claude".to_owned()],
             nonce: id.bytes().cycle().take(NONCE_MIN_BYTES).collect(),
             expiry_ms: None,
+            working_directory: "/work/project".to_owned(),
+            workspace_mode: "per-task".to_owned(),
         }
     }
 
@@ -611,6 +643,26 @@ mod tests {
             let mut s = spec(id);
             s.expiry_ms = Some(expiry);
             assert_eq!(book.open(s, T0).is_ok(), ok, "expiry {expiry}");
+        }
+    }
+    #[test]
+    fn req_0006_006_request_carries_working_directory_and_mode() {
+        let mut book = ApprovalBook::default();
+        let (req, _) = open_one(&mut book, "wd1", T0);
+        assert_eq!(req.working_directory, "/work/project");
+        assert_eq!(req.workspace_mode, "per-task");
+        for (id, dir, mode) in [
+            ("wd2", "", "per-task"),
+            ("wd3", "/w", "per-run"),
+            ("wd4", "/w", ""),
+        ] {
+            let mut s = spec(id);
+            s.working_directory = dir.to_owned();
+            s.workspace_mode = mode.to_owned();
+            assert!(
+                matches!(book.open(s, T0), Err(OpenError::Context)),
+                "{dir} {mode}"
+            );
         }
     }
 

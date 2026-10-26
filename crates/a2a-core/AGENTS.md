@@ -44,6 +44,7 @@ Uses: `a2a-types` (ids, `proto::a2a` and `proto::rpc` messages, extension activa
 Test names carry the requirement ID (`req_0002_NNN_*`).
 
 - 0002-001, 0002-002: `subject` (`req_0002_001_*`, `req_0002_002_foreign_subjects_are_dropped`).
+- 0002-061: `envelope` surfaces `A2AB-After-Seq` as `RequestHead::after_seq` and refuses a malformed value (`req_0002_061_*`).
 - 0002-010, 0002-011, 0002-013, 0002-014: `envelope` receive pipeline.
 - 0002-020, 0002-021, 0002-023: `subject` op table, `envelope` body matching.
 - 0002-030, 0002-031, 0002-032, 0002-033, 0002-034: `headers`.

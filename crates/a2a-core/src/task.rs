@@ -8,11 +8,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use a2a_types::failure::FailureCode;
+use a2a_types::failure::{FailureCode, WorkspaceToken};
 use a2a_types::ids::{ContextId, MessageId, TaskId};
 use a2a_types::lifecycle::{LifecycleError, check_transition};
 use a2a_types::proto::a2a::TaskState;
-use a2a_types::proto::a2abus::{ApprovalDecision, BudgetUsage, Hop};
+use a2a_types::proto::a2abus::{ApprovalDecision, Budget, BudgetUsage, Hop};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -21,7 +21,7 @@ use crate::approval::{
 };
 use crate::budget::{
     Allowance, BreakerStatus, Breakers, BudgetError, BudgetTrip, DelegationRefused, Ledger,
-    Metering, chain_has_loop,
+    Metering, Usage, chain_has_loop,
 };
 
 /// Retention after a terminal state: T_task = 24 h (0005-026, 0005-043).
@@ -155,6 +155,9 @@ pub enum StopReason {
     Crashed,
     /// Any other stop reason.
     Unknown,
+    /// A backend failure carrying a registry code (0009-055..074). Only BACKEND_UNAVAILABLE,
+    /// BACKEND_ERROR, BACKEND_TIMEOUT and BACKEND_LOST_TASK are accepted.
+    Backend(FailureCode),
 }
 
 /// Answer sent to a backend for an open approval request (0006-027).
@@ -270,6 +273,16 @@ impl Event {
     }
 }
 
+/// Owner identity of a task, for the owning worker's outbox only. Not a visibility path:
+/// 0005-004 still applies to every read through [`Tasks::task`] and [`Tasks::subscribe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOwner {
+    /// Origin agent that submitted the task.
+    pub origin: String,
+    /// Context id of the task.
+    pub context_id: String,
+}
+
 /// Snapshot of a task for reads (0005-021).
 #[derive(Debug, Clone)]
 pub struct TaskView {
@@ -343,6 +356,34 @@ struct TaskRecord {
     cancel_due_ms: Option<u64>,
     denied: bool,
     children: Vec<Child>,
+    chain: Vec<StoredHop>,
+}
+
+/// Hop of the inbound chain in serializable form (the proto `Hop` has no serde).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredHop {
+    agent_id: String,
+    fingerprint: String,
+}
+
+impl From<&Hop> for StoredHop {
+    fn from(hop: &Hop) -> Self {
+        Self {
+            agent_id: hop.agent_id.clone(),
+            fingerprint: hop.fingerprint.clone(),
+        }
+    }
+}
+
+/// Terminal outcome of a child that lives on another worker (RFC-0015, 0006-049).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildEnd {
+    /// Terminal state the child ended in.
+    pub state: TaskState,
+    /// Failure code of a FAILED or REJECTED child. A non-completed child without one reads as CANCELED.
+    pub code: Option<String>,
+    /// The child's final usage (0006-034).
+    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -677,7 +718,7 @@ impl<S: TaskStore> Tasks<S> {
             .filter(|c| {
                 self.tasks
                     .get(&c.task_id)
-                    .is_some_and(|t| !state_of(t.state).is_terminal())
+                    .is_none_or(|t| !state_of(t.state).is_terminal())
             })
             .map(|c| c.task_id.clone())
             .collect();
@@ -907,6 +948,10 @@ impl<S: TaskStore> Tasks<S> {
             cancel_due_ms: None,
             denied: false,
             children: Vec::new(),
+            chain: s
+                .incoming
+                .as_ref()
+                .map_or_else(Vec::new, |i| i.chain.iter().map(StoredHop::from).collect()),
         };
         let mut plan = self.plan_with(rec);
         match refusal {
@@ -972,6 +1017,21 @@ impl<S: TaskStore> Tasks<S> {
         reason: StopReason,
         now: u64,
     ) -> Result<Vec<Effect>, TaskError> {
+        let accepted = match reason {
+            StopReason::Backend(code) => matches!(
+                code,
+                FailureCode::BackendUnavailable
+                    | FailureCode::BackendError
+                    | FailureCode::BackendTimeout
+                    | FailureCode::BackendLostTask
+            ),
+            _ => true,
+        };
+        if !accepted {
+            return Err(TaskError::Invalid(
+                "backend stop code outside the backend registry",
+            ));
+        }
         let mut plan = self.plan(task_id)?;
         let state = plan.state();
         if state.is_terminal() {
@@ -998,6 +1058,7 @@ impl<S: TaskStore> Tasks<S> {
                     Ending::Failed(FailureCode::AgentLimit)
                 }
                 StopReason::Unknown => Ending::Failed(FailureCode::BackendError),
+                StopReason::Backend(code) => Ending::Failed(code),
             }
         };
         match ending {
@@ -1007,6 +1068,85 @@ impl<S: TaskStore> Tasks<S> {
             Ending::Canceled => plan.move_to(Some(state), TaskState::Canceled, None, None, now)?,
             Ending::Failed(code) => plan.fail(Some(state), code, None, now)?,
         }
+        self.commit(plan)
+    }
+
+    /// Records that a peer backend interrupted a Working turn for input
+    /// (0005-008, 0009-047). The peer closes the session, so no kill is needed:
+    /// the task commits INPUT_REQUIRED with no approval id, stream end, or
+    /// failure. A pending cancel commits CANCELED instead (0005-036). Terminal
+    /// tasks are left unchanged and audited as late output.
+    pub fn backend_input_required(
+        &mut self,
+        task_id: &str,
+        now: u64,
+    ) -> Result<Vec<Effect>, TaskError> {
+        let mut plan = self.plan(task_id)?;
+        let state = plan.state();
+        if state.is_terminal() {
+            plan.effects.push(Effect::Audit {
+                task_id: Some(task_id.to_owned()),
+                reason: "LATE_BACKEND_OUTPUT".to_owned(),
+            });
+            return Ok(plan.effects);
+        }
+        if state != TaskState::Working {
+            return Err(active_error(state));
+        }
+        plan.rec.session_alive = false;
+        let to = if plan.rec.cancel_requested {
+            TaskState::Canceled
+        } else {
+            TaskState::InputRequired
+        };
+        plan.move_to(Some(state), to, None, None, now)?;
+        self.commit(plan)
+    }
+
+    /// Fails a task whose workspace was refused, lost or busy (RFC-0012, 0005-053).
+    /// The token must be an RFC-0012 token; the detail is `{"token":"<token>"}`.
+    /// The backend session is cleared without a stop effect, so the caller stops
+    /// it itself. Terminal tasks are left unchanged.
+    pub fn workspace_failed(
+        &mut self,
+        task_id: &str,
+        token: &str,
+        now: u64,
+    ) -> Result<Vec<Effect>, TaskError> {
+        let token = WorkspaceToken::parse(token)
+            .map_err(|_| TaskError::Invalid("unknown workspace token"))?;
+        let mut plan = self.plan(task_id)?;
+        if plan.state().is_terminal() {
+            return Ok(Vec::new());
+        }
+        let state = plan.state();
+        plan.rec.session_alive = false;
+        let detail = format!("{{\"token\":\"{}\"}}", token.as_str());
+        plan.fail(Some(state), FailureCode::WorkspaceFailed, Some(detail), now)?;
+        self.commit(plan)
+    }
+
+    /// Fails a WORKING task from the sender side when a peer-call send is refused with
+    /// LOOP_DETECTED (RFC-0015 [0015-057]). Only LOOP_DETECTED is accepted. The commit
+    /// cancels open children, including unsettled remote ones (0015-068), and emits
+    /// `CancelBackend` for a live session; the worker stops the backend. Tasks not
+    /// WORKING return `NotActive` or `Terminal`.
+    pub fn fail_parent(
+        &mut self,
+        task_id: &str,
+        code: FailureCode,
+        detail: Option<String>,
+        now: u64,
+    ) -> Result<Vec<Effect>, TaskError> {
+        if code != FailureCode::LoopDetected {
+            return Err(TaskError::Invalid("fail_parent accepts LOOP_DETECTED only"));
+        }
+        let mut plan = self.plan(task_id)?;
+        let state = plan.state();
+        if state != TaskState::Working {
+            return Err(active_error(state));
+        }
+        plan.fail(Some(state), code, detail, now)?;
         self.commit(plan)
     }
 
@@ -1184,8 +1324,34 @@ impl<S: TaskStore> Tasks<S> {
         child_id: &str,
         now: u64,
     ) -> Result<Vec<Effect>, TaskError> {
-        let child = self.tasks.get(child_id).ok_or(TaskError::NotFound)?.clone();
-        let child_state = state_of(child.state);
+        let child = self.tasks.get(child_id).ok_or(TaskError::NotFound)?;
+        let state = state_of(child.state);
+        let code = child.failure.as_ref().map(|f| f.code.clone());
+        let usage = *child.ledger.usage();
+        self.settle_with(parent_id, child_id, state, code, &usage, now)
+    }
+
+    /// Settles a child that lives on another worker (RFC-0015, 0006-049). The
+    /// caller supplies the child's terminal outcome; no local record is read.
+    pub fn settle_remote_child(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+        end: ChildEnd,
+        now: u64,
+    ) -> Result<Vec<Effect>, TaskError> {
+        self.settle_with(parent_id, child_id, end.state, end.code, &end.usage, now)
+    }
+
+    fn settle_with(
+        &mut self,
+        parent_id: &str,
+        child_id: &str,
+        child_state: TaskState,
+        code: Option<String>,
+        usage: &Usage,
+        now: u64,
+    ) -> Result<Vec<Effect>, TaskError> {
         if !child_state.is_terminal() {
             return Err(TaskError::Invalid("child task is not terminal"));
         }
@@ -1201,13 +1367,10 @@ impl<S: TaskStore> Tasks<S> {
         }
         entry.settled = true;
         let grant = entry.grant;
-        plan.rec.ledger.settle_child(&grant, child.ledger.usage());
+        plan.rec.ledger.settle_child(&grant, usage);
         let parent_state = plan.state();
         if child_state != TaskState::Completed && !parent_state.is_terminal() {
-            let code = child
-                .failure
-                .as_ref()
-                .map_or_else(|| "CANCELED".to_owned(), |f| f.code.clone());
+            let code = code.unwrap_or_else(|| "CANCELED".to_owned());
             let detail =
                 serde_json::json!({"child_task_id": child_id, "child_code": code}).to_string();
             plan.fail(
@@ -1220,8 +1383,12 @@ impl<S: TaskStore> Tasks<S> {
         self.commit(plan)
     }
 
-    /// Expires approvals and deadlines, and kills backends past their cancel
-    /// grace (0005-037, 0005-041, 0006-017).
+    /// Expires approvals and deadlines (0006-017, 0005-041). Returns
+    /// `AnswerApproval` (Cancelled) for requests that just expired, and
+    /// `KillBackend` for each live task past its deadline, past its Working
+    /// cancel grace, or with an expired approval. Tasks without a live session
+    /// are committed here. The caller stops the backend on `KillBackend`, then
+    /// calls `commit_expired`.
     pub fn expire_due(&mut self, now: u64) -> Result<Vec<Effect>, TaskError> {
         let mut book = self.approvals.clone();
         let ended = book.expire_due(now);
@@ -1231,77 +1398,72 @@ impl<S: TaskStore> Tasks<S> {
                 ..Delta::default()
             })?;
         }
-        let mut expired: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for request in ended {
-            if matches!(request.state, RequestState::Expired) {
-                expired
-                    .entry(request.task_id)
-                    .or_default()
-                    .push(request.request_id);
-            }
-        }
         let mut effects = Vec::new();
-        for (task_id, request_ids) in expired {
-            let Some(rec) = self.tasks.get(&task_id).cloned() else {
-                continue;
-            };
-            let state = state_of(rec.state);
-            if state != TaskState::InputRequired {
+        for request in ended {
+            if !matches!(request.state, RequestState::Expired) {
                 continue;
             }
-            let mut plan = self.plan_with(rec);
-            if plan.rec.session_alive {
-                for request_id in request_ids {
-                    plan.effects.push(Effect::AnswerApproval {
-                        task_id: task_id.clone(),
-                        request_id,
-                        answer: ApprovalAnswer::Cancelled,
-                    });
-                }
+            let answerable = self.tasks.get(&request.task_id).is_some_and(|rec| {
+                rec.session_alive && state_of(rec.state) == TaskState::InputRequired
+            });
+            if answerable {
+                effects.push(Effect::AnswerApproval {
+                    task_id: request.task_id,
+                    request_id: request.request_id,
+                    answer: ApprovalAnswer::Cancelled,
+                });
             }
-            plan.fail(Some(state), FailureCode::ApprovalTimeout, None, now)?;
-            effects.extend(self.commit(plan)?);
         }
 
         let due: Vec<String> = self
             .tasks
             .values()
-            .filter(|t| !state_of(t.state).is_terminal() && t.deadline_ms <= now)
-            .map(|t| t.task_id.clone())
-            .collect();
-        for task_id in due {
-            let mut plan = self.plan(&task_id)?;
-            let state = plan.state();
-            plan.fail(Some(state), FailureCode::DeadlineExceeded, None, now)?;
-            effects.extend(self.commit(plan)?);
-        }
-
-        let kill: Vec<String> = self
-            .tasks
-            .values()
             .filter(|t| {
-                state_of(t.state) == TaskState::Working
-                    && t.cancel_due_ms.is_some_and(|due| due <= now)
+                let state = state_of(t.state);
+                !state.is_terminal()
+                    && (t.deadline_ms <= now
+                        || (state == TaskState::Working
+                            && t.cancel_due_ms.is_some_and(|due| due <= now))
+                        || (state == TaskState::InputRequired
+                            && self.approvals.expired_for_task(&t.task_id)))
             })
             .map(|t| t.task_id.clone())
             .collect();
-        for task_id in kill {
-            let mut plan = self.plan(&task_id)?;
-            if std::mem::replace(&mut plan.rec.session_alive, false) {
-                plan.effects.push(Effect::KillBackend {
-                    task_id: task_id.clone(),
-                });
+        for task_id in due {
+            let plan = self.plan(&task_id)?;
+            if plan.rec.session_alive {
+                effects.push(Effect::KillBackend { task_id });
+            } else {
+                effects.extend(self.commit_expired(&task_id, now)?);
             }
-            plan.move_to(
-                Some(TaskState::Working),
-                TaskState::Canceled,
-                None,
-                None,
-                now,
-            )?;
-            effects.extend(self.commit(plan)?);
         }
         Ok(effects)
+    }
+
+    /// Commits the terminal state of a task whose backend the caller has killed
+    /// (0005-037, 0005-041, 0006-017). A Working task past its cancel grace is
+    /// CANCELED; an InputRequired task with an expired approval fails with
+    /// APPROVAL_TIMEOUT; otherwise a passed deadline fails with
+    /// DEADLINE_EXCEEDED. Terminal tasks are left unchanged; a task that is none
+    /// of these is refused.
+    pub fn commit_expired(&mut self, task_id: &str, now: u64) -> Result<Vec<Effect>, TaskError> {
+        let mut plan = self.plan(task_id)?;
+        let state = plan.state();
+        if state.is_terminal() {
+            return Ok(Vec::new());
+        }
+        // Cleared first so `terminate` does not request a second stop.
+        plan.rec.session_alive = false;
+        if state == TaskState::Working && plan.rec.cancel_due_ms.is_some_and(|due| due <= now) {
+            plan.move_to(Some(state), TaskState::Canceled, None, None, now)?;
+        } else if state == TaskState::InputRequired && self.approvals.expired_for_task(task_id) {
+            plan.fail(Some(state), FailureCode::ApprovalTimeout, None, now)?;
+        } else if plan.rec.deadline_ms <= now {
+            plan.fail(Some(state), FailureCode::DeadlineExceeded, None, now)?;
+        } else {
+            return Err(TaskError::Invalid("kill window has not expired"));
+        }
+        self.commit(plan)
     }
 
     /// Cancels a task for its origin (0005-036..038, 0005-051).
@@ -1358,6 +1520,81 @@ impl<S: TaskStore> Tasks<S> {
     /// Reads one task for its origin (0005-004, 0005-021).
     pub fn task(&self, origin: &str, task_id: &str) -> Result<TaskView, TaskError> {
         Ok(view(self.visible(origin, task_id)?))
+    }
+
+    /// Breaker status of an origin (RFC-0006 [0006-048]) for the RFC-0015 send path
+    /// (0015-054(b)). It reads the state admission consults, so a worker refusal matches the
+    /// core `RATE_LIMITED` with `{"breaker":"open"}`. Pass the delegating task's origin.
+    #[must_use]
+    pub fn breaker_status(&self, origin: &str, now: u64) -> BreakerStatus {
+        self.breakers.status(origin, now)
+    }
+
+    /// Unfiltered owner lookup for the owning worker's outbox (not a visibility path).
+    #[must_use]
+    pub fn task_owner(&self, task_id: &str) -> Option<TaskOwner> {
+        self.tasks.get(task_id).map(|rec| TaskOwner {
+            origin: rec.origin.clone(),
+            context_id: rec.context_id.clone(),
+        })
+    }
+
+    fn proto_chain(rec: &TaskRecord) -> Vec<Hop> {
+        rec.chain
+            .iter()
+            .map(|h| Hop {
+                agent_id: h.agent_id.clone(),
+                fingerprint: h.fingerprint.clone(),
+            })
+            .collect()
+    }
+
+    /// Inbound delegation chain of a task, owner-side like [`Tasks::task_owner`]
+    /// (RFC-0007 [0007-129], RFC-0015 [0015-065]). `None` for an unknown task.
+    #[must_use]
+    pub fn chain(&self, task_id: &str) -> Option<Vec<Hop>> {
+        self.tasks.get(task_id).map(Self::proto_chain)
+    }
+
+    /// Grant and consumption of a task for the RFC-0015 pre-check (0015-055). The
+    /// usage counts reserved amounts of live children, the shape
+    /// `a2a_client::budget::child` expects. `None` for an unknown task.
+    #[must_use]
+    pub fn budget_view(&self, task_id: &str) -> Option<(Budget, BudgetUsage)> {
+        self.tasks.get(task_id).map(|rec| {
+            let ledger = &rec.ledger;
+            let used = ledger.usage();
+            let reserved = ledger.reserved();
+            let budget = ledger.grant().to_proto(Self::proto_chain(rec));
+            let usage = BudgetUsage {
+                tokens_used: used.tokens.saturating_add(reserved.tokens),
+                cost_units_used: used.cost_units.saturating_add(reserved.cost_units),
+                wall_ms_used: used.wall_ms.saturating_add(reserved.wall_ms),
+                hops_used: used.hops,
+                children_used: used.children,
+                depth: ledger.depth(),
+            };
+            (budget, usage)
+        })
+    }
+
+    /// Number of non-terminal tasks, for overload pressure.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.tasks
+            .values()
+            .filter(|t| !state_of(t.state).is_terminal())
+            .count()
+    }
+
+    /// Full RFC-0006 approval request body for the owning worker's status metadata
+    /// (0006-006). Unfiltered, like [`Tasks::task_owner`]: not a visibility path.
+    #[must_use]
+    pub fn approval_request(
+        &self,
+        request_id: &str,
+    ) -> Option<a2a_types::proto::a2abus::ApprovalRequest> {
+        self.approvals.request(request_id)
     }
 
     /// Events after `after_seq` for a live task (0005-019). Terminal tasks
@@ -1657,6 +1894,8 @@ mod tests {
             chain: vec!["omp".to_owned(), "claude".to_owned()],
             nonce: request_id.bytes().cycle().take(NONCE_MIN_BYTES).collect(),
             expiry_ms: None,
+            working_directory: "/work/project".to_owned(),
+            workspace_mode: "per-task".to_owned(),
         };
         tasks
             .request_approval(id, request, now)
@@ -1912,6 +2151,31 @@ mod tests {
             .backend_stopped(&id, StopReason::Cancelled, T0 + 1)
             .expect("stop");
         assert_eq!(failure_code(&tasks, &id), Some(FailureCode::BackendCrashed));
+    }
+
+    #[test]
+    fn req_0005_012_backend_registry_codes_map_and_other_codes_are_refused() {
+        for code in [
+            FailureCode::BackendUnavailable,
+            FailureCode::BackendError,
+            FailureCode::BackendTimeout,
+            FailureCode::BackendLostTask,
+        ] {
+            let mut tasks = fresh();
+            let id = start(&mut tasks, "m1", T0);
+            tasks
+                .backend_stopped(&id, StopReason::Backend(code), T0 + 1)
+                .expect("stop");
+            assert_eq!(state(&tasks, &id), TaskState::Failed);
+            assert_eq!(failure_code(&tasks, &id), Some(code));
+        }
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m2", T0);
+        assert!(matches!(
+            tasks.backend_stopped(&id, StopReason::Backend(FailureCode::RateLimited), T0 + 1),
+            Err(TaskError::Invalid(_))
+        ));
+        assert_eq!(state(&tasks, &id), TaskState::Working);
     }
 
     #[test]
@@ -2184,7 +2448,21 @@ mod tests {
         let id = start(&mut tasks, "m1", T0);
         let (opened, _) = ask(&mut tasks, &id, "r1", "bash", T0);
         let digest = digest_of(&opened);
-        tasks.expire_due(T0 + DEFAULT_EXPIRY_MS).expect("expire");
+        let effects = tasks.expire_due(T0 + DEFAULT_EXPIRY_MS).expect("expire");
+        assert_eq!(
+            effects,
+            vec![
+                Effect::AnswerApproval {
+                    task_id: id.clone(),
+                    request_id: "r1".to_owned(),
+                    answer: ApprovalAnswer::Cancelled,
+                },
+                Effect::KillBackend {
+                    task_id: id.clone()
+                },
+            ]
+        );
+        assert_eq!(state(&tasks, &id), TaskState::InputRequired);
         let late = decision(&id, "r1", ALLOW_ONCE_ID, &digest);
         assert!(
             tasks
@@ -2197,6 +2475,9 @@ mod tests {
                 )
                 .is_err()
         );
+        tasks
+            .commit_expired(&id, T0 + DEFAULT_EXPIRY_MS + 1)
+            .expect("commit");
         assert_eq!(state(&tasks, &id), TaskState::Failed);
         assert_eq!(
             failure_code(&tasks, &id),
@@ -2244,7 +2525,21 @@ mod tests {
         assert!(effects.contains(&Effect::KillBackend {
             task_id: id.clone()
         }));
+        assert_eq!(state(&tasks, &id), TaskState::Working);
+        assert!(matches!(
+            tasks.commit_expired(&id, T0 + CANCEL_GRACE_MS),
+            Err(TaskError::Invalid(_))
+        ));
+        tasks
+            .commit_expired(&id, T0 + 1 + CANCEL_GRACE_MS)
+            .expect("commit");
         assert_eq!(state(&tasks, &id), TaskState::Canceled);
+        assert!(
+            tasks
+                .commit_expired(&id, T0 + 2 + CANCEL_GRACE_MS)
+                .expect("again")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2269,12 +2564,269 @@ mod tests {
     }
 
     #[test]
+    fn req_0015_054_breaker_status_matches_admission_refusal() {
+        let mut tasks = fresh();
+        assert_eq!(tasks.breaker_status(ORIGIN, T0), BreakerStatus::Closed);
+        let tight = Allowance {
+            max_tokens: 10,
+            ..budget()
+        };
+        for i in 0..crate::budget::BREAKER_THRESHOLD {
+            let mut s = sub(&format!("w{i}"), T0);
+            s.budget = Some(tight);
+            let id = id_of(tasks.submit(s, T0).expect("submit").0);
+            tasks.start_backend(&id, T0).expect("start");
+            tasks.charge(&id, 100, None, T0 + 1).expect("charge");
+        }
+        assert!(matches!(
+            tasks.breaker_status(ORIGIN, T0 + 2),
+            BreakerStatus::Open { .. }
+        ));
+        assert_eq!(tasks.breaker_status(OTHER, T0 + 2), BreakerStatus::Closed);
+        let refused = id_of(
+            tasks
+                .submit(sub("refused", T0 + 2), T0 + 2)
+                .expect("refused")
+                .0,
+        );
+        assert_eq!(
+            failure_code(&tasks, &refused),
+            Some(FailureCode::RateLimited)
+        );
+    }
+
+    #[test]
+    fn req_0015_057_fail_parent_commits_loop_detected() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        let effects = tasks
+            .fail_parent(
+                &parent,
+                FailureCode::LoopDetected,
+                Some("{\"reason\":\"peer call\"}".to_owned()),
+                T0 + 1,
+            )
+            .expect("fail");
+        assert_eq!(state(&tasks, &parent), TaskState::Failed);
+        assert_eq!(
+            failure_code(&tasks, &parent),
+            Some(FailureCode::LoopDetected)
+        );
+        assert!(effects.contains(&Effect::CancelBackend {
+            task_id: parent.clone(),
+            grace_ms: 0,
+        }));
+    }
+
+    #[test]
+    fn req_0015_057_fail_parent_refuses_other_codes_and_inactive_tasks() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        assert!(matches!(
+            tasks.fail_parent(&parent, FailureCode::BackendError, None, T0 + 1),
+            Err(TaskError::Invalid(_))
+        ));
+        assert_eq!(state(&tasks, &parent), TaskState::Working);
+
+        let paused = start(&mut tasks, "q", T0 + 2);
+        tasks
+            .backend_input_required(&paused, T0 + 3)
+            .expect("input required");
+        assert!(matches!(
+            tasks.fail_parent(&paused, FailureCode::LoopDetected, None, T0 + 4),
+            Err(TaskError::NotActive)
+        ));
+
+        let done = start(&mut tasks, "r", T0 + 5);
+        tasks
+            .backend_stopped(&done, StopReason::EndTurn, T0 + 6)
+            .expect("stop");
+        assert!(matches!(
+            tasks.fail_parent(&done, FailureCode::LoopDetected, None, T0 + 7),
+            Err(TaskError::Terminal)
+        ));
+    }
+
+    #[test]
+    fn req_0015_068_fail_parent_cancels_open_remote_child() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        let (child, _grant) = tasks.delegate(&parent).expect("delegate");
+        let effects = tasks
+            .fail_parent(&parent, FailureCode::LoopDetected, None, T0 + 1)
+            .expect("fail");
+        assert!(effects.contains(&Effect::CancelChild {
+            task_id: parent.clone(),
+            child_id: child,
+        }));
+        assert_eq!(state(&tasks, &parent), TaskState::Failed);
+    }
+
+    #[test]
+    fn req_0015_068_unsettled_remote_child_is_cancelled_with_parent() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        let (child, _grant) = tasks.delegate(&parent).expect("delegate");
+        tasks.cancel(ORIGIN, &parent, T0 + 1).expect("cancel");
+        tasks.expire_due(T0 + 1 + CANCEL_GRACE_MS).expect("kill");
+        let effects = tasks
+            .commit_expired(&parent, T0 + 1 + CANCEL_GRACE_MS)
+            .expect("commit");
+        assert!(effects.contains(&Effect::CancelChild {
+            task_id: parent.clone(),
+            child_id: child,
+        }));
+        assert_eq!(state(&tasks, &parent), TaskState::Canceled);
+    }
+
+    #[test]
+    fn req_0015_068_settled_remote_child_is_not_open() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        let (child, _grant) = tasks.delegate(&parent).expect("delegate");
+        tasks
+            .settle_remote_child(
+                &parent,
+                &child,
+                ChildEnd {
+                    state: TaskState::Completed,
+                    code: None,
+                    usage: Usage::default(),
+                },
+                T0 + 1,
+            )
+            .expect("settle");
+        tasks.cancel(ORIGIN, &parent, T0 + 2).expect("cancel");
+        tasks.expire_due(T0 + 2 + CANCEL_GRACE_MS).expect("kill");
+        let effects = tasks
+            .commit_expired(&parent, T0 + 2 + CANCEL_GRACE_MS)
+            .expect("commit");
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CancelChild { .. }))
+        );
+    }
+
+    #[test]
+    fn req_0006_049_remote_child_failure_fails_parent_with_child_failed() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        let (child, _grant) = tasks.delegate(&parent).expect("delegate");
+        tasks
+            .settle_remote_child(
+                &parent,
+                &child,
+                ChildEnd {
+                    state: TaskState::Failed,
+                    code: Some("BACKEND_ERROR".to_owned()),
+                    usage: Usage::default(),
+                },
+                T0 + 1,
+            )
+            .expect("settle");
+        assert_eq!(state(&tasks, &parent), TaskState::Failed);
+        assert_eq!(
+            failure_code(&tasks, &parent),
+            Some(FailureCode::ChildFailed)
+        );
+    }
+
+    #[test]
+    fn req_0015_068_remote_settle_refuses_non_terminal_and_unknown_children() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        let (child, _grant) = tasks.delegate(&parent).expect("delegate");
+        assert!(matches!(
+            tasks.settle_remote_child(
+                &parent,
+                &child,
+                ChildEnd {
+                    state: TaskState::Working,
+                    code: None,
+                    usage: Usage::default(),
+                },
+                T0 + 1,
+            ),
+            Err(TaskError::Invalid(_))
+        ));
+        assert!(matches!(
+            tasks.settle_remote_child(
+                &parent,
+                "unknown-child",
+                ChildEnd {
+                    state: TaskState::Completed,
+                    code: None,
+                    usage: Usage::default(),
+                },
+                T0 + 1,
+            ),
+            Err(TaskError::NotFound)
+        ));
+        assert_eq!(state(&tasks, &parent), TaskState::Working);
+    }
+
+    #[test]
+    fn req_0015_055_budget_view_counts_reserved_amounts_of_children() {
+        let mut tasks = fresh();
+        let root = start(&mut tasks, "p", T0);
+        let (_, before) = tasks.budget_view(&root).expect("view");
+        let (_child, grant) = tasks.delegate(&root).expect("delegate");
+        let (budget, after) = tasks.budget_view(&root).expect("view");
+        assert_eq!(budget.max_depth, grant.max_depth + 1);
+        assert_eq!(budget.max_children, grant.max_children + 1);
+        assert_eq!(after.children_used, before.children_used + 1);
+        assert_eq!(after.wall_ms_used, before.wall_ms_used + grant.max_wall_ms);
+        assert_eq!(after.depth, 0);
+        assert!(tasks.budget_view("missing").is_none());
+    }
+
+    #[test]
+    fn req_0015_055_delegate_refusal_creates_no_child() {
+        let mut tasks = fresh();
+        let root = start(&mut tasks, "p", T0);
+        let (budget, _) = tasks.budget_view(&root).expect("view");
+        for _ in 0..budget.max_children {
+            tasks.delegate(&root).expect("within budget");
+        }
+        assert!(matches!(
+            tasks.delegate(&root),
+            Err(TaskError::Delegation(_))
+        ));
+        let (_, usage) = tasks.budget_view(&root).expect("view");
+        assert_eq!(usage.children_used, budget.max_children);
+    }
+
+    #[test]
+    fn req_0015_065_chain_reports_inbound_hops_of_a_child() {
+        let mut tasks = fresh();
+        let root = start(&mut tasks, "p", T0);
+        assert_eq!(tasks.chain(&root), Some(Vec::new()));
+        let child = delegate_child(&mut tasks, &root, "c1", T0);
+        assert_eq!(
+            tasks.chain(&child),
+            Some(vec![Hop {
+                agent_id: "omp".to_owned(),
+                fingerprint: String::new(),
+            }])
+        );
+        assert_eq!(tasks.chain("missing"), None);
+    }
+
+    #[test]
     fn req_0005_039_cancel_cascades_to_open_children() {
         let mut tasks = fresh();
         let parent = start(&mut tasks, "p", T0);
         let child = delegate_child(&mut tasks, &parent, "c1", T0);
         tasks.cancel(ORIGIN, &parent, T0 + 1).expect("cancel");
         let effects = tasks.expire_due(T0 + 1 + CANCEL_GRACE_MS).expect("kill");
+        assert!(effects.contains(&Effect::KillBackend {
+            task_id: parent.clone()
+        }));
+        assert_eq!(state(&tasks, &parent), TaskState::Working);
+        let effects = tasks
+            .commit_expired(&parent, T0 + 1 + CANCEL_GRACE_MS)
+            .expect("commit");
         assert!(effects.contains(&Effect::CancelChild {
             task_id: parent.clone(),
             child_id: child.clone()
@@ -2303,7 +2855,7 @@ mod tests {
     }
 
     #[test]
-    fn req_0005_041_deadline_fails_without_grace_period() {
+    fn req_0005_041_deadline_kills_then_commits_failed_without_grace() {
         let mut tasks = fresh();
         let id = start(&mut tasks, "m1", T0);
         assert!(
@@ -2312,15 +2864,31 @@ mod tests {
                 .expect("early")
                 .is_empty()
         );
+        assert!(tasks.commit_expired(&id, T0 + DEADLINE - 1).is_err());
         let effects = tasks.expire_due(T0 + DEADLINE).expect("deadline");
-        assert!(effects.contains(&Effect::CancelBackend {
-            task_id: id.clone(),
-            grace_ms: 0
-        }));
+        assert_eq!(
+            effects,
+            vec![Effect::KillBackend {
+                task_id: id.clone()
+            }]
+        );
+        assert_eq!(state(&tasks, &id), TaskState::Working);
+        let effects = tasks.commit_expired(&id, T0 + DEADLINE).expect("commit");
+        assert!(
+            effects
+                .iter()
+                .all(|e| !matches!(e, Effect::CancelBackend { .. }))
+        );
         assert_eq!(state(&tasks, &id), TaskState::Failed);
         assert_eq!(
             failure_code(&tasks, &id),
             Some(FailureCode::DeadlineExceeded)
+        );
+        assert!(
+            tasks
+                .commit_expired(&id, T0 + DEADLINE)
+                .expect("terminal")
+                .is_empty()
         );
     }
 
@@ -2398,6 +2966,25 @@ mod tests {
     }
 
     #[test]
+    fn req_0005_004_task_owner_is_unfiltered_and_active_count_skips_terminal() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        let owner = tasks.task_owner(&id).expect("owner");
+        assert_eq!(owner.origin, ORIGIN);
+        assert_eq!(
+            owner.context_id,
+            tasks.task(ORIGIN, &id).expect("view").context_id
+        );
+        assert!(tasks.task_owner("missing").is_none());
+        assert_eq!(tasks.active_count(), 1);
+        tasks
+            .backend_stopped(&id, StopReason::EndTurn, T0 + 1)
+            .expect("complete");
+        assert_eq!(tasks.active_count(), 0);
+        assert!(matches!(tasks.task(OTHER, &id), Err(TaskError::NotFound)));
+    }
+
+    #[test]
     fn req_0005_051_cross_origin_cancel_is_not_found_even_when_terminal() {
         let mut tasks = fresh();
         let id = start(&mut tasks, "m1", T0);
@@ -2408,6 +2995,18 @@ mod tests {
             tasks.cancel(OTHER, &id, T0 + 2),
             Err(TaskError::NotFound)
         ));
+    }
+
+    #[test]
+    fn req_0006_006_approval_request_accessor_returns_the_emitted_body() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        let _ = ask(&mut tasks, &id, "r1", "bash", T0);
+        let body = tasks.approval_request("r1").expect("open request");
+        assert_eq!(body.request_id, "r1");
+        assert_eq!(body.task_id, id);
+        assert_eq!(body.tool, "bash");
+        assert!(tasks.approval_request("missing").is_none());
     }
 
     #[test]
@@ -2435,6 +3034,13 @@ mod tests {
             request_id: "r1".to_owned(),
             answer: ApprovalAnswer::Cancelled
         }));
+        assert!(effects.contains(&Effect::KillBackend {
+            task_id: id.clone()
+        }));
+        assert_eq!(state(&tasks, &id), TaskState::InputRequired);
+        tasks
+            .commit_expired(&id, T0 + DEFAULT_EXPIRY_MS)
+            .expect("commit");
         assert_eq!(state(&tasks, &id), TaskState::Failed);
         assert_eq!(
             failure_code(&tasks, &id),
@@ -2517,7 +3123,116 @@ mod tests {
                 )
                 .is_err()
         );
+        assert_eq!(state(&tasks, &id), TaskState::InputRequired);
+        tasks
+            .commit_expired(&id, T0 + DEFAULT_EXPIRY_MS + 1)
+            .expect("commit");
         assert_eq!(state(&tasks, &id), TaskState::Failed);
+    }
+
+    #[test]
+    fn req_0005_008_peer_input_required_is_not_an_approval() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        let effects = tasks
+            .backend_input_required(&id, T0 + 1)
+            .expect("interrupt");
+        assert!(effects.iter().all(|e| !matches!(
+            e,
+            Effect::KillBackend { .. }
+                | Effect::CancelBackend { .. }
+                | Effect::AnswerApproval { .. }
+        )));
+        assert_eq!(state(&tasks, &id), TaskState::InputRequired);
+        assert_eq!(tasks.approvals.open_for_task(&id), 0);
+        assert_eq!(failure_code(&tasks, &id), None);
+        let last = tasks.events[&id].last().expect("event").clone();
+        assert!(last.stream_ends());
+        assert!(matches!(
+            &last.body,
+            EventBody::Status { approval: None, .. }
+        ));
+        // The peer closed the session, so the deadline commits without a kill.
+        let effects = tasks.expire_due(T0 + DEADLINE).expect("deadline");
+        assert_eq!(effects, vec![]);
+        assert_eq!(state(&tasks, &id), TaskState::Failed);
+        assert_eq!(
+            failure_code(&tasks, &id),
+            Some(FailureCode::DeadlineExceeded)
+        );
+    }
+
+    #[test]
+    fn req_0005_036_peer_interrupt_during_cancel_commits_canceled() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks.cancel(ORIGIN, &id, T0 + 1).expect("cancel");
+        tasks
+            .backend_input_required(&id, T0 + 2)
+            .expect("interrupt");
+        assert_eq!(state(&tasks, &id), TaskState::Canceled);
+    }
+
+    #[test]
+    fn req_0005_008_interrupt_on_terminal_task_is_audited_not_applied() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks
+            .backend_stopped(&id, StopReason::EndTurn, T0 + 1)
+            .expect("complete");
+        let effects = tasks
+            .backend_input_required(&id, T0 + 2)
+            .expect("late interrupt");
+        assert!(effects.iter().any(|e| matches!(e, Effect::Audit { .. })));
+        assert_eq!(state(&tasks, &id), TaskState::Completed);
+    }
+
+    #[test]
+    fn req_0005_053_workspace_failed_commits_failed_with_token_detail() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        let effects = tasks
+            .workspace_failed(&id, "lease_lost", T0 + 1)
+            .expect("workspace");
+        assert!(
+            effects
+                .iter()
+                .all(|e| !matches!(e, Effect::CancelBackend { .. } | Effect::KillBackend { .. }))
+        );
+        assert_eq!(state(&tasks, &id), TaskState::Failed);
+        assert_eq!(
+            failure_code(&tasks, &id),
+            Some(FailureCode::WorkspaceFailed)
+        );
+        let last = tasks.events[&id].last().expect("event").clone();
+        assert!(matches!(
+            &last.body,
+            EventBody::Status { failure: Some(f), .. }
+                if f.detail.as_deref() == Some("{\"token\":\"lease_lost\"}")
+        ));
+    }
+
+    #[test]
+    fn req_0005_053_workspace_failed_refuses_unknown_token() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        assert!(matches!(
+            tasks.workspace_failed(&id, "bogus", T0 + 1),
+            Err(TaskError::Invalid(_))
+        ));
+        assert_eq!(state(&tasks, &id), TaskState::Working);
+    }
+
+    #[test]
+    fn req_0005_053_workspace_failed_on_terminal_task_is_noop() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks
+            .backend_stopped(&id, StopReason::EndTurn, T0 + 1)
+            .expect("complete");
+        let effects = tasks.workspace_failed(&id, "io", T0 + 2).expect("noop");
+        assert!(effects.is_empty());
+        assert_eq!(state(&tasks, &id), TaskState::Completed);
     }
 
     #[test]

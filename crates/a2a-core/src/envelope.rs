@@ -290,6 +290,9 @@ pub struct RequestHead {
     pub blob_refs: Vec<BlobRef>,
     /// True when the payload is proto-JSON; replies use the same encoding.
     pub json: bool,
+    /// Replay position of a `subscribe`: events through this seq are already processed
+    /// ([0002-061]). `None` when `A2AB-After-Seq` is absent.
+    pub after_seq: Option<u64>,
 }
 
 /// An accepted request: its head, its body, and the one right to reply ([0002-040]).
@@ -571,6 +574,10 @@ fn validate(
 
     let service_params = hdr::service_params(headers)?;
 
+    let after_seq = hdr::optional(headers, hdr::AFTER_SEQ)
+        .map(|value| hdr::parse_u64(hdr::AFTER_SEQ, value))
+        .transpose()?;
+
     if payload.len() > config.max_inline {
         return Err(WireError::PayloadTooLarge.into());
     }
@@ -621,6 +628,7 @@ fn validate(
         service_params,
         blob_refs,
         json,
+        after_seq,
     };
     Ok((head, body))
 }
@@ -1503,6 +1511,45 @@ mod tests {
             rejected(&Config::default(), Some(NOW), anonymous)?,
             WireError::PermissionDenied
         );
+        Ok(())
+    }
+
+    #[test]
+    fn req_0002_061_after_seq_is_surfaced_and_validated() -> TestResult {
+        let subscribe = || {
+            RequestBody::SubscribeToTask(pb::SubscribeToTaskRequest {
+                tenant: "acme".to_owned(),
+                ..Default::default()
+            })
+        };
+        let (request, _rx) = to_request(encode(request_parts(Op::Subscribe, subscribe())?)?);
+        let inbound = accept(&Config::default(), NOW, request)?;
+        assert_eq!(inbound.head.after_seq, None);
+
+        let mut out = encode(request_parts(Op::Subscribe, subscribe())?)?;
+        out.headers.insert(hdr::AFTER_SEQ, "0").must()?;
+        let (request, _rx) = to_request(out);
+        let inbound = accept(&Config::default(), NOW, request)?;
+        assert_eq!(inbound.head.after_seq, Some(0));
+
+        let mut out = encode(request_parts(Op::Subscribe, subscribe())?)?;
+        out.headers
+            .insert(hdr::AFTER_SEQ, "18446744073709551615")
+            .must()?;
+        let (request, _rx) = to_request(out);
+        let inbound = accept(&Config::default(), NOW, request)?;
+        assert_eq!(inbound.head.after_seq, Some(u64::MAX));
+
+        for value in ["-1", " 2", "0x2", "18446744073709551616"] {
+            let mut out = encode(request_parts(Op::Subscribe, subscribe())?)?;
+            out.headers.insert(hdr::AFTER_SEQ, value).must()?;
+            let (request, _rx) = to_request(out);
+            assert_eq!(
+                rejected(&Config::default(), Some(NOW), request)?,
+                WireError::MalformedMessage,
+                "A2AB-After-Seq {value:?}"
+            );
+        }
         Ok(())
     }
 
