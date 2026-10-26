@@ -89,6 +89,7 @@ repo = 'C:\Users\op\dev\agent-proto'
 workspace = { mode = "per-session", base_ref = "HEAD", non_git = "refuse" }
 approval_mode = "ask-all"  # RFC-0006 mode; driver sets omp always-ask (0006-025); dangerous modes refused (4.10)
 env_require = ["OMP_API_KEY"] # presence check by name only (4.7)
+env_allow = []             # provider key names this agent may receive (0012-062); empty by default
 readiness = { kind = "bus-presence", timeout_ms = 30000 }
 restart = "on-failure"
 
@@ -101,13 +102,14 @@ repo = 'C:\Users\op\dev\agent-proto'
 workspace = { mode = "per-task", base_ref = "HEAD", non_git = "refuse" }
 approval_mode = "ask-all"   # RFC-0006 mode; driver sets Claude permission mode `default` (0006-026); dangerous modes refused (4.10)
 env_require = ["ANTHROPIC_API_KEY"]
+env_allow = ["ANTHROPIC_API_KEY"]  # explicit operator allow (0012-062); an inherited key otherwise changes claude's auth kind
 readiness = { kind = "bus-presence", timeout_ms = 30000 }
 restart = "on-failure"
 
 [[agent]]                   # Hermes process (hermes.md sec 9.3); serves HTTP only, not a bus agent
 id = "hermes-peer"
 kind = "external"
-command = ["hermes", "gateway"]
+command = ["hermes", "gateway"]  # the profile MUST have gateway.standalone true (0008-100); default profile exits 78
 depends_on = ["bus"]
 env = { A2A_PORT = "9900", A2A_HOST = "127.0.0.1" }  # non-secret only
 readiness = { kind = "http", url = "http://127.0.0.1:9900/health", timeout_ms = 60000 }
@@ -176,7 +178,7 @@ Shutdown is triggered by `a2a stop`, by the supervisor's console control events,
 - [0012-014] MUST run the phases in this order: (1) Draining: the worker stops accepting new `SendMessage`, refuses each with the bus-level `UNAVAILABLE` status (RFC-0002 error table) and creates no task; (2) wait up to `drain_ms` for in-flight tasks to reach a terminal state; (3) cancel remaining tasks through RFC-0005 cancel; (4) graceful stop signal, then wait up to `grace_ms`; (5) forced kill.
 - [0012-015] MUST default `drain_ms` to 15000 and `grace_ms` to 10000. Both MUST be configurable per supervisor.
 - [0012-016] MUST use the forced kill only after the grace deadline passes. The final state is Stopped with reason `graceful`, `forced` or `exited_during_drain`, and the reason is recorded in the audit event.
-- [0012-017] MUST treat a graceful signal as: Linux `SIGTERM` to the process group; Windows `CTRL_BREAK_EVENT` to the child's process group (child created with `CREATE_NEW_PROCESS_GROUP`). Forced kill is `SIGKILL` to the process group on Linux and `TerminateJobObject` on Windows. Behavior of Node-based `claude-agent-acp` on `CTRL_BREAK_EVENT` is `[UNVERIFIED]`; the supervisor falls back to forced kill at `grace_ms` (acp-omp-claude.md sec 4.5 records exit 143 on SIGTERM).
+- [0012-017] MUST treat a graceful signal as: Linux `SIGTERM` to the process group; Windows `CTRL_BREAK_EVENT` to the child's process group (child created with `CREATE_NEW_PROCESS_GROUP`), which exits 0 for `nats-server` (0012-064). For ACP children, the stdin-close step of 0012-061 runs before any signal. Forced kill is `SIGKILL` to the process group on Linux and `TerminateJobObject` on Windows. CTRL_BREAK on `claude-agent-acp` exits 0xC000013A and is therefore not a graceful stop (0012-064). Stop-signal behavior of the ACP children on Windows beyond the stub is `[UNVERIFIED]`; the supervisor falls back to forced kill at `grace_ms`.
 
 ### 4.6 Process containment (M1-1)
 
@@ -184,8 +186,14 @@ Shutdown is triggered by `a2a stop`, by the supervisor's console control events,
 - [0012-019] MUST place every child on Linux in its own process group (std `CommandExt::process_group(0)`). Stop signals (017) MUST be sent to the group, not only the leader.
 - [0012-020] MUST, on Linux, give each worker a lifeline: a pipe whose write end the supervisor holds. When the read end sees EOF, the worker MUST send `SIGTERM` to its own process group (which holds its backend child) and exit. This covers supervisor crash on Linux.
 - [0012-021] MUST, at supervisor start and before starting any child, read `run/*.json` records and terminate any recorded tree whose pid still exists and whose process start time matches the record. A recorded tree whose start time differs MUST be treated as reused and skipped. Run records are written before the child is resumed.
-- [0012-022] MUST build child environments by inheriting the supervisor's environment unchanged and adding only `A2AB_*` variables (for example `A2AB_AGENT_ID`, `A2AB_STATE_DIR`, `A2AB_CREDS_FILE`, `A2AB_WORKSPACE`, `A2AB_LIFELINE_FD` on Linux). The `env` table of 4.1 may add or override non-secret names.
+- [0012-022] MUST build child environments from the supervisor's environment with the provider key names removed as 0012-062 requires, and add only `A2AB_*` variables (for example `A2AB_AGENT_ID`, `A2AB_STATE_DIR`, `A2AB_CREDS_FILE`, `A2AB_WORKSPACE`, `A2AB_LIFELINE_FD` on Linux). The `env` table of 4.1 may add or override non-secret names. The environment is passed untouched only when the operator sets `env_passthrough = "all"` (0012-062).
 - [0012-060] MUST keep `forbid(unsafe_code)` as the default for every crate. The `a2ad` crate MAY use `unsafe` only inside a module named `platform`, and only for the Windows Job Objects FFI of 018; every other module of `a2ad` MUST compile with `deny(unsafe_code)`. Linux containment (019, 020) uses only safe std APIs.
+- [0012-061] MUST, for ACP children (`acp-omp` and `acp-claude`), begin graceful stop by closing the child's stdin, wait up to `grace_ms` for exit, and send a graceful signal only if the child has not exited. Observed on the stub: omp exits 0 within 0.1 s of stdin EOF; claude exits 0 on stdin close (`docs/spikes/omp-acp.md`, `docs/spikes/claude-acp.md`). Real-model cleanup is `[UNVERIFIED]`.
+- [0012-062] MUST strip provider key environment variables from child environments by name (at least `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OMP_API_KEY`, and any name in `env_require` that the agent does not allow) unless the agent's `env_allow` names it. `env_require` is a presence check only (0012-026) and never allows a name. The operator may set `[supervisor] env_passthrough = "all"`; when set, the supervisor MUST pass the environment untouched and MUST write an audit event at start. The supervisor MUST NOT read or log key values. Reason: an inherited `ANTHROPIC_API_KEY` changed claude's reported auth kind (claude-acp spike).
+- [0012-063] MUST give each ACP worker a supervisor-owned configuration directory under `<state_dir>/run/<agent>/`. For claude, `CLAUDE_CONFIG_DIR` holds a supervisor-written `settings.json` whose `permissions.defaultMode` follows 0006-026; `_meta.claudeCode.options.settings` MUST NOT be relied on (ignored by adapter 0.97.0). For omp, `PI_CODING_AGENT_DIR` names the directory. The supervisor MUST treat the first `_auth/status_update` of a child as non-authoritative.
+- [0012-064] MUST, on Windows, start `nats-server` with `CREATE_NEW_PROCESS_GROUP` and stop it with `CTRL_BREAK_EVENT`, which exits 0. `TerminateProcess` exits 1 and is a forced stop. `claude-agent-acp` exits 0xC000013A on CTRL_BREAK and MUST NOT be treated as graceful (0012-061 applies to it). Verified by spike nats and claude-acp (stub); `sc.exe` stop is UNOBSERVED.
+- [0012-065] MUST, on Windows, set a seed file DACL with `icacls <file> /inheritance:r /grant:r "<user>:F"` (0012-025). Verified on a dummy file only by spike nats; seeds in a real state directory are UNOBSERVED.
+- [0012-066] MUST, at supervisor start on Windows, read `LongPathsEnabled` (`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`). If it is 0 and any managed store path exceeds 260 characters, the supervisor MUST refuse to start with `path_too_long`. Observed: a 357-character path passed with `LongPathsEnabled` 1 (spike nats). Behavior with `LongPathsEnabled` 0 is UNOBSERVED.
 
 Windows and Linux are both first-class. Neither platform's containment mechanism is assumed to exist on the other. Remaining Linux gap (abrupt supervisor death before the next start reaps stale trees) is listed in sec 9.
 
@@ -193,7 +201,7 @@ Windows and Linux are both first-class. Neither platform's containment mechanism
 
 - [0012-023] MUST generate, at the first start of each agent, a NATS user NKey pair (`docs/interop/nats.md` sec 5, user prefix `U`). The seed MUST be stored at `creds/<agent>.nk` and MUST NOT leave the state directory. The public key MUST be registered through the RFC-0010 permission mechanism before the agent's first bus connection.
 - [0012-024] MUST, on Linux, create seed files with mode `0600` and verify the mode before every start; the supervisor MUST refuse to start the agent if the mode is broader or the owner is another user.
-- [0012-025] MUST, on Windows, set the seed file DACL to grant access only to the current user, remove inherited ACEs, and verify the DACL before every start; the supervisor MUST refuse to start the agent if verification fails. Reason code: `credential_acl`.
+- [0012-025] MUST, on Windows, set the seed file DACL to grant access only to the current user, remove inherited ACEs (mechanism of 0012-065), and verify the DACL before every start; the supervisor MUST refuse to start the agent if verification fails. Reason code: `credential_acl`.
 - [0012-026] MUST NOT open, parse, copy into any file, log, audit, or envelope the value of any provider API key (for example `OMP_API_KEY`, `ANTHROPIC_API_KEY`). The supervisor MAY check that a name listed in `env_require` is set; a presence check reads the name, not the value. Values are passed to children only through the inherited environment (022). This implements M1-10 and L12.
 - [0012-027] MUST NOT place any credential material on a command line, in an environment variable written by the supervisor, or in an `A2AB_*` value. Children receive a path (`A2AB_CREDS_FILE`), never seed content.
 
@@ -352,15 +360,15 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 | 0012-014 | Shutdown trace shows phases in order: drain, cancel, graceful, forced | Integration |
 | 0012-015 | Defaults are 15000 and 10000; overrides applied | Unit |
 | 0012-016 | Process ignoring graceful signal is killed exactly at grace deadline; reasons recorded | Integration |
-| 0012-017 | Linux: SIGTERM reaches group; Windows: CTRL_BREAK reaches group; forced kill works on both | Integration (Windows and Linux) |
+| 0012-017 | Linux: SIGTERM reaches group; Windows: CTRL_BREAK reaches group (nats-server exits 0); forced kill works on both; ACP children exit on stdin close first (061) | Integration (Windows and Linux) |
 | 0012-018 | Windows: child grandchild dies when the supervisor is killed with TerminateProcess | Integration (Windows) |
 | 0012-019 | Linux: grandchild dies on group kill | Integration (Linux) |
 | 0012-020 | Linux: killing the supervisor with SIGKILL makes the worker kill its backend child | Integration (Linux) |
 | 0012-021 | Stale run record with live matching pid is reaped; reused pid with different start time is skipped | Integration (Windows and Linux) |
-| 0012-022 | Child environment equals parent plus only `A2AB_*`; supervisor logs contain no env values | Unit |
+| 0012-022 | Child environment equals parent minus stripped provider keys (062) plus only `A2AB_*`; supervisor logs contain no env values | Unit |
 | 0012-023 | First start creates a seed and registers the public key; seed absent from logs | Integration |
 | 0012-024 | Linux: seed mode 0644 blocks start | Integration (Linux) |
-| 0012-025 | Windows: seed with an added ACE for another SID blocks start with `credential_acl` | Integration (Windows) |
+| 0012-025 | Windows: seed with an added ACE for another SID blocks start with `credential_acl`; grant applied with icacls (065) | Integration (Windows) |
 | 0012-026 | Grep of supervisor source and audit output for provider key names reads no values; presence check passes with name set | Unit |
 | 0012-027 | Child argv and environment written by supervisor contain no seed bytes | Unit |
 | 0012-028 | Worker config without workspace gets per-session default; gateway has none | Unit |
@@ -396,6 +404,12 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 | 0012-058 | CLI source and binary contain no reads of provider key names | Unit |
 | 0012-059 | `--no-color` removes all ANSI sequences; VT detection path tested | Unit (Windows and Linux) |
 | 0012-060 | `a2ad` builds with `deny(unsafe_code)` outside `platform`; `unsafe` appears only in that module (grep and compile check) | Integration (Windows and Linux) |
+| 0012-061 | ACP child fixture (omp and claude stubs) exits 0 on stdin close before any signal | Integration (Windows and Linux) |
+| 0012-062 | Child env of `acp-claude` lacks `ANTHROPIC_API_KEY` unless `env_allow` names it; `env_passthrough = "all"` writes an audit event | Unit |
+| 0012-063 | `CLAUDE_CONFIG_DIR/settings.json` has `permissions.defaultMode`; `PI_CODING_AGENT_DIR` set for omp | Integration (Windows and Linux) |
+| 0012-064 | nats-server exits 0 on CTRL_BREAK in its own process group; TerminateProcess leaves exit 1; claude CTRL_BREAK exit 0xC000013A is not graceful | Integration (Windows) |
+| 0012-065 | icacls grant on a fixture file leaves only the user ACE | Integration (Windows) |
+| 0012-066 | `LongPathsEnabled` 0 with a 300-character store path refuses with `path_too_long` | Unit (Windows) |
 
 ## 9. Open issues
 
@@ -403,8 +417,8 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 2. **Cross-host diff delivery**: default is summary only across hosts; patches stay local (042). Revisit with RFC-0010 transfer design.
 3. **Credential rotation and revocation**: default manual (delete seed, remove public key via RFC-0010, restart). A `a2a creds rotate` command is deferred.
 4. **Gateway binary name and config path**: `a2a-gateway` in the example is a placeholder for RFC-0008's binary name. Default: RFC-0008 name wins; integrator aligns the example.
-5. **Hermes Windows command**: `hermes gateway` is `[UNVERIFIED]` for A2A on Windows (hermes.md sec 9.3, 11.2). Default: supervisor runs the configured command verbatim and the readiness probe decides success.
-6. **Node `claude-agent-acp` and `CTRL_BREAK_EVENT`**: default is forced kill at `grace_ms`. Verify on Windows.
+5. **Hermes Windows command.** `hermes gateway` runs as a standalone profile (0008-100): the default profile exits 78 (spike hermes-a2a, stub). Default: supervisor runs the configured command verbatim and the readiness probe decides success; the command MUST name a profile with `gateway.standalone` true.
+6. **Node `claude-agent-acp` and `CTRL_BREAK_EVENT`.** CTRL_BREAK exits 0xC000013A, so it is not graceful (0012-064). Default: stdin close (0012-061), then forced kill at `grace_ms`. Stub observed (spike claude-acp); real-model shutdown remains UNVERIFIED.
 7. **Retention numbers** (14 days, 20 GiB) and **copy-mode limits** (2 GiB, 100000 files): defaults chosen for M1 developer hosts; configurable under `[paths]` in a later revision.
 8. **Non-git default**: `refuse`. Alternative `copy` is opt-in per agent.
 9. **Approval field names**: closed. Table 4.10.1 uses the `ApprovalRequest` field names of RFC-0006 (`approval.proto`, [0006-006]); a rename there requires a change here.
