@@ -72,7 +72,7 @@ Table 4.2: Transitions
 | WORKING | FAILED | backend or agent failure; deadline; budget or loop trip; child failure; workspace failure | any code in 4.9 whose final state is FAILED | [0005-012], [0005-032], [0005-041], [0005-039], [0005-053] |
 | WORKING | CANCELED | cancel acknowledged, or grace expired | - | [0005-037] |
 | INPUT_REQUIRED | WORKING | decision received for the open request | - | RFC-0006, [0005-008] |
-| INPUT_REQUIRED | FAILED | approval expired; deadline; backend gone | APPROVAL_TIMEOUT, DEADLINE_EXCEEDED, BACKEND_CRASHED | [0005-041], [0005-031], [0005-035] |
+| INPUT_REQUIRED | FAILED | approval expired; deadline; backend gone; workspace lost | APPROVAL_TIMEOUT, DEADLINE_EXCEEDED, BACKEND_CRASHED, WORKSPACE_FAILED | [0005-041], [0005-031], [0005-035], [0005-053] |
 | INPUT_REQUIRED | CANCELED | CancelTask | - | [0005-036] |
 
 
