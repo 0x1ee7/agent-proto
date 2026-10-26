@@ -1,0 +1,17 @@
+[package]
+name = "driver-acp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+a2a-worker = { version = "0.1.0", path = "../a2a-worker" }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+a2a-worker = { version = "0.1.0", path = "../a2a-worker", features = ["testkit"] }

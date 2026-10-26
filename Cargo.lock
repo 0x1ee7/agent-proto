@@ -106,7 +106,9 @@ dependencies = [
 name = "a2a-worker"
 version = "0.1.0"
 dependencies = [
+ "a2a-audit",
  "a2a-core",
+ "a2a-security",
  "a2a-types",
  "bus-api",
  "bus-mem",
