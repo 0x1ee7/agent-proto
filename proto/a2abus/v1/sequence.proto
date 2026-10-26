@@ -1,0 +1,18 @@
+// Owning RFC: RFC-0005 (task lifecycle and delivery).
+// Carried in event metadata under the key "urn:a2abus:ext:sequence:1"
+// on TaskStatusUpdateEvent and TaskArtifactUpdateEvent (decision L8).
+// Canonical JSON form: proto3 JSON mapping. uint64 serializes as a JSON
+// string (e.g. "42"); parsers MUST also accept a JSON number.
+syntax = "proto3";
+
+package a2abus.v1;
+
+// SequenceInfo is the per-task event sequence number.
+// seq starts at 1 for the first event of a task (the Task snapshot is not
+// an event and carries no seq) and increases by exactly 1 for every
+// status or artifact event emitted for that task. Gaps never occur on the
+// producer side; a consumer that observes a gap MUST treat it as loss and
+// resume (RFC-0005 sequence rules).
+message SequenceInfo {
+  uint64 seq = 1;
+}

@@ -1,0 +1,84 @@
+// Owning RFC: RFC-0006 (approval, budgets and loop control).
+// ApprovalRequest travels in TaskStatus.message.metadata under the key
+// "urn:a2abus:ext:approval:1" on a status with state
+// TASK_STATE_INPUT_REQUIRED (decisions L7, L10).
+// ApprovalDecision travels as Part.data of a user Message that resumes the
+// task (decision L10). A Part is an approval decision if and only if its
+// metadata contains the key "urn:a2abus:ext:approval:1".
+// Canonical JSON form: proto3 JSON mapping. Timestamps use RFC 3339.
+syntax = "proto3";
+
+package a2abus.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Kinds mirror the ACP permission option kinds so that the ACP driver maps
+// them 1:1 (RFC-0006 ACP mapping).
+enum ApprovalOptionKind {
+  APPROVAL_OPTION_KIND_UNSPECIFIED = 0;
+  APPROVAL_OPTION_KIND_ALLOW_ONCE = 1;
+  APPROVAL_OPTION_KIND_ALLOW_ALWAYS = 2;
+  APPROVAL_OPTION_KIND_REJECT_ONCE = 3;
+  APPROVAL_OPTION_KIND_REJECT_ALWAYS = 4;
+}
+
+// Coarse risk tier of the requested capability (RFC-0006 tier mapping).
+enum ApprovalTier {
+  APPROVAL_TIER_UNSPECIFIED = 0;
+  APPROVAL_TIER_READ = 1;
+  APPROVAL_TIER_WRITE = 2;
+  APPROVAL_TIER_EXEC = 3;
+  APPROVAL_TIER_DELETE_OR_MOVE = 4;
+}
+
+message ApprovalOption {
+  // Unique within one ApprovalRequest. Matches the decision's option_id.
+  string option_id = 1;
+  // Human-readable label, redacted like summary.
+  string name = 2;
+  ApprovalOptionKind kind = 3;
+}
+
+message ApprovalRequest {
+  // UUIDv7 string, unique per request. Single-use: a decision is accepted
+  // for this request_id at most once.
+  string request_id = 1;
+  // Task that is INPUT_REQUIRED. A decision for another task is rejected.
+  string task_id = 2;
+  // Capability name, for example "bash" or "fs.write". Opaque to the bus.
+  string tool = 3;
+  ApprovalTier tier = 4;
+  // Redacted, bounded summary of the action (RFC-0006 redaction rules).
+  // Raw command lines and file contents MUST NOT appear here.
+  string summary = 5;
+  // Agent id that issued the tool call (for example "claude").
+  string requester = 6;
+  // Agent ids of the delegation chain (Budget.chain, RFC-0006 0006-011) in
+  // order; the first is the root owner, the last equals requester.
+  repeated string chain = 7;
+  repeated ApprovalOption options = 8;
+  // After this instant the request is expired and the task fails with
+  // reason APPROVAL_TIMEOUT (RFC-0005 failure codes).
+  google.protobuf.Timestamp expires_at = 9;
+  // Random nonce bound to this request. The decision MUST echo it.
+  string nonce = 10;
+}
+
+message ApprovalDecision {
+  // Must equal the request_id of the open ApprovalRequest.
+  string request_id = 1;
+  // Must equal the task_id of the open ApprovalRequest.
+  string task_id = 2;
+  // Must equal one ApprovalOption.option_id of that request.
+  string option_id = 3;
+  // Must equal the nonce of that request.
+  string nonce = 4;
+  // Operator identity that made the decision (identity model owned by
+  // RFC-0007). Empty is invalid.
+  string decided_by = 5;
+  google.protobuf.Timestamp decided_at = 6;
+  // Lowercase hex SHA-256 of the protobuf binary encoding of the
+  // ApprovalRequest this decision answers, as stored by the owner Worker
+  // (RFC-0006 [0006-051]). Missing or different digest is refused.
+  string request_sha256 = 7;
+}

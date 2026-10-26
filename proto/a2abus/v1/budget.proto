@@ -1,0 +1,62 @@
+// Owning RFC: RFC-0006 (approval, budgets and loop control).
+// Budget (the remaining allowance granted to one hop, plus its lineage)
+// travels in Message.metadata under the key "urn:a2abus:ext:budget:1" on
+// every message that starts or continues work (decision L9).
+// BudgetUsage (the consumption a hop reports back) travels in
+// TaskStatusUpdateEvent.metadata under the same key.
+// Canonical JSON form: proto3 JSON mapping. uint64 serializes as a JSON
+// string; parsers MUST also accept a JSON number.
+syntax = "proto3";
+
+package a2abus.v1;
+
+// Budget is the remaining allowance granted to the receiving hop. The
+// sender computes it from its own remaining allowance minus its own
+// reserve, so values along a delegation chain only decrease (RFC-0006
+// monotonic rule). No field is a wall-clock instant: durations are relative
+// and each hop measures them with its own monotonic clock.
+//
+// Zero means "none remaining" (the hop may not spend that resource).
+// UNLIMITED_U64 (18446744073709551615) means "not limited" and is only
+// valid for max_tokens, max_cost_units and max_wall_ms at the root.
+message Budget {
+  // Token budget for this hop and its descendants.
+  uint64 max_tokens = 1;
+  // Cost budget in integer cost units. The unit is a deployment constant
+  // (RFC-0006 metering).
+  uint64 max_cost_units = 2;
+  // Remaining wall-clock duration in milliseconds.
+  uint64 max_wall_ms = 3;
+  // Remaining delegation hops, including this hop's own dispatches.
+  uint32 max_hops = 4;
+  // Remaining delegation depth below this hop (a root with max_depth 2 may
+  // create a child and a grandchild).
+  uint32 max_depth = 5;
+  // Remaining number of direct child tasks this hop may create.
+  uint32 max_children = 6;
+  // Lineage: every hop from the root to this hop, oldest first. The first
+  // entry is always the root owner (the root hop's own Hop); each
+  // delegation appends one entry. Not an allowance; never decreases.
+  repeated Hop chain = 7;
+}
+
+// Hop identifies one link of a delegation chain for loop detection.
+message Hop {
+  // Agent id of the Worker that ran the hop (RFC-0001 agent ids).
+  string agent_id = 1;
+  // Task fingerprint of the message that started the hop (RFC-0006
+  // fingerprint rule, lowercase hex of the first 16 bytes of SHA-256).
+  string fingerprint = 2;
+}
+
+// BudgetUsage is consumption observed by one hop, reported to its parent
+// and to the audit subject. Counters are cumulative for the task.
+message BudgetUsage {
+  uint64 tokens_used = 1;
+  uint64 cost_units_used = 2;
+  uint64 wall_ms_used = 3;
+  uint32 hops_used = 4;
+  uint32 children_used = 5;
+  // Delegation depth of the reporting hop (root = 0).
+  uint32 depth = 6;
+}
