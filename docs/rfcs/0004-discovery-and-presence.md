@@ -185,6 +185,8 @@ Hermes is not on the bus. Its driver (RFC-0009) represents it: the driver fetche
 
 [0004-039] Signatures on card records are verified before routing (RFC-0003 [0003-042]). For cross-host trust, the verifier MUST pin the expected (agent id, key id) pair from the local allowlist (RFC-0007, D15). A card whose signing key is not pinned for its agent id MUST NOT be used for routing.
 
+[0004-044] The expected agent id of a card is the card record key under which the caller read it (sec 4.1); an AgentCard carries no agent id field. The caller MUST check that the agent id recorded for each signing key it verifies equals that expected agent id (RFC-0007 [0007-053]). A card whose only valid signatures belong to another agent id MUST NOT be used for routing, and the mismatch is reported as SIGNATURE_IDENTITY_MISMATCH (RFC-0007 [0007-140]).
+
 [0004-040] Card content is discovery input and MAY be read by any tenant identity (A5). Card `description` and `skills` text are untrusted for instruction purposes: they MUST NOT be inserted into a prompt as instructions (T1, RFC-0007 provenance).
 
 ### 4.11 Partitions and returning nodes
@@ -278,6 +280,7 @@ Attack classes are described, not demonstrated.
 | 0004-037 | Card `url` outside configured host is not used for routing. | MUST |
 | 0004-038 | Non-owner card write rejected; not visible in discovery. | MUST |
 | 0004-039 | Unpinned signing key: card not routed. | MUST |
+| 0004-044 | Card signed for agent B read under record key A: not routed; SIGNATURE_IDENTITY_MISMATCH reported. | MUST |
 | 0004-040 | Prompt-assembly test: card text is passed as data, not instructions. | MUST |
 | 0004-041 | Partition test: presence expires; reclaim succeeds after heal. | MUST |
 | 0004-042 | Returning node publishes STARTING before READY. | MUST |

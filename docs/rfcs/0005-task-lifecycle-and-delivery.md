@@ -65,11 +65,11 @@ Table 4.2: Transitions
 | (create) | REJECTED | admission refused (overload, quota) | RATE_LIMITED, QUEUE_FULL | [0005-028] |
 | (create) | FAILED | delegated task whose (agent, fingerprint) pair is already in the lineage; no backend start | LOOP_DETECTED | RFC-0006 [0006-045] |
 | SUBMITTED | WORKING | backend session started | - | [0005-025] |
-| SUBMITTED | FAILED | backend could not start; deadline reached | BACKEND_UNAVAILABLE, DEADLINE_EXCEEDED | [0005-041] |
+| SUBMITTED | FAILED | backend could not start; workspace refused or lost; deadline reached | BACKEND_UNAVAILABLE, WORKSPACE_FAILED, DEADLINE_EXCEEDED | [0005-041], [0005-053] |
 | SUBMITTED | CANCELED | CancelTask | - | [0005-036] |
 | WORKING | INPUT_REQUIRED | backend permission request | - | RFC-0006 |
 | WORKING | COMPLETED | backend stop reason end_turn | - | [0005-012] |
-| WORKING | FAILED | backend or agent failure; deadline; budget or loop trip; child failure | see 4.9 | [0005-012], [0005-032], [0005-041], [0005-039] |
+| WORKING | FAILED | backend or agent failure; deadline; budget or loop trip; child failure; workspace failure | any code in 4.9 whose final state is FAILED | [0005-012], [0005-032], [0005-041], [0005-039], [0005-053] |
 | WORKING | CANCELED | cancel acknowledged, or grace expired | - | [0005-037] |
 | INPUT_REQUIRED | WORKING | decision received for the open request | - | RFC-0006, [0005-008] |
 | INPUT_REQUIRED | FAILED | approval expired; deadline; backend gone | APPROVAL_TIMEOUT, DEADLINE_EXCEEDED, BACKEND_CRASHED | [0005-041], [0005-031], [0005-035] |
@@ -117,7 +117,7 @@ stateDiagram-v2
 - [0005-024] Admission is atomic: the task record, both admission keys, the SUBMITTED event and its outbox entry are committed in one transaction before the reply is sent or any backend is started.
 - [0005-025] The Worker MUST record that the backend session started (store write) before invoking the backend. Restart recovery (section 4.5) depends on this record.
 - [0005-026] Admission records MUST be retained for at least W = 2 x H (defaults: H = 1 hour, W = 2 hours), and for at least as long as the task they created: expiry = max(created + W, terminal + T_task). The NATS duplicate window (default 2 minutes, `nats.md` section 2.2) is a first line of defence only; correctness rests on the store, not on the bus window (decision for RFC-0010).
-- [0005-027] A submission whose receipt is past its Ttl plus the 30-second staleness allowance (RFC-0002 [0002-072]) MUST NOT be admitted. It is dropped and audited without creating a task (R-F3). The check is made by the receiver against the envelope Ttl; no cross-host clock comparison is made beyond that allowance.
+- [0005-027] The owner Worker MUST NOT admit a submission whose receipt is past its Ttl plus the 30-second staleness allowance (RFC-0002 [0002-072]). As the receiver it answers `REQUEST_EXPIRED` ([0002-072]), creates no task and audits the refusal (R-F3). The check uses the envelope Ttl and the local clock only; no cross-host clock comparison is made beyond that allowance.
 - [0005-028] Overload: when a per-peer rate limit or queue quota is exceeded (R-S6), the Worker MUST create a task in REJECTED with code RATE_LIMITED or QUEUE_FULL, commit it, publish its single event with seq 1 and `A2AB-Stream-End: true`, and reply with that Task. No backend is started. A silent drop is not permitted.
 
 ### 4.5 Delivery, redelivery and crash recovery
@@ -161,8 +161,8 @@ stateDiagram-v2
 
 ### 4.9 Failure code registry
 
-- [0005-048] A FAILED or REJECTED status MUST use one of the codes below. Adding a code requires a new RFC revision.
-- [0005-049] The code is stored as `status.message.metadata["a2abus.failure"] = {"code": "<CODE>", "detail": {...optional, redacted}}`. The status message also carries a human-readable text part, for example `task failed: deadline exceeded`, so that stock peers see a readable reason.
+- [0005-048] A FAILED or REJECTED status MUST use one of the codes below, and only in the state given in its Final state column. Adding a code requires a new RFC revision.
+- [0005-049] The code is stored as `status.message.metadata["a2abus.failure"] = {"code": "<CODE>", "detail": {...optional, redacted}}`. The status message also carries a human-readable text part, for example `task failed: deadline exceeded`, so that stock peers see a readable reason. The text is informational only; bus peers read the code from the key, never from the text.
 
 | Code | Final state | Meaning | Defined by |
 |---|---|---|---|
@@ -179,10 +179,13 @@ stateDiagram-v2
 | BACKEND_LOST_TASK | FAILED | Peer reports the task unknown on poll or resubscribe (`-32001`) | 0009 |
 | AGENT_REFUSED | FAILED | Backend stop reason refusal | 0005 (mapping) |
 | AGENT_LIMIT | FAILED | Backend stop reason max_tokens or max_turn_requests | 0005 (mapping) |
+| WORKSPACE_FAILED | FAILED | Task workspace refused, lost or busy (RFC-0012); the token is in detail | 0005 (mapping), 0012 (tokens) |
 | RATE_LIMITED | REJECTED | Per-peer rate limit exceeded | 0005 |
 | QUEUE_FULL | REJECTED | Queue quota exceeded | 0005 |
 
 - [0005-050] A Worker whose presence state is `DRAINING` (RFC-0004 [0004-016]) MUST refuse each new `send` or `stream` that would create a task with a bus-level error: status code `UNAVAILABLE` (14), ErrorInfo domain `a2abus.v1`, reason `DRAINING` (RFC-0002 section 4.8). The refusal creates no task. Tasks the Worker already owns continue to run and commit their terminal states; the drain timeout of RFC-0004 governs departure.
+
+- [0005-053] A workspace refusal or loss (RFC-0012) raised while a task exists MUST commit FAILED with code WORKSPACE_FAILED and detail `{"token": "<token>"}`, where token is one of the workspace tokens of RFC-0012 (the table in section 4.8): non_git_refused, copy_link_rejected, path_occupied, branch_exists, lease_lost, workspace_busy, state_invalid, path_escape, config, shared_checkout, copy_limit, path_too_long, git_failed, io. A refusal raised before any task exists stops the Worker start (RFC-0012) and creates no task.
 
 ### 4.10 Worked examples
 
@@ -225,7 +228,7 @@ A requester holds events through seq 4 of a long-running task `0195f3a2-6c20-7e2
 **Example 3: overload REJECTED ([0005-028], R-S6).**
 
 1. Hermes exceeds its per-peer queue quota. Its `SendMessage` on `a2a.v1.local.rpc.omp.send` gets a new task in REJECTED. No backend starts.
-2. The reply and the single event (seq 1, on `a2a.v1.local.ev.omp.0195f3a2-6c30-7e21-9b4d-2a7c8e9f0a13`, with `A2AB-Stream-End: true`) carry the same Task:
+2. The reply and the single event (seq 1, on `a2a.v1.local.ev.omp.0195f3a2-6c30-7e21-9b4d-2a7c8e9f0a13`, with `A2AB-Stream-End: true`) carry the same Task. The text part is informational; bus peers read the code from `a2abus.failure`:
 ```json
 {"task":{"id":"0195f3a2-6c30-7e21-9b4d-2a7c8e9f0a13","contextId":"0195f3a2-6c60-7d3c-8f10-4b5a6c7d8e9f","status":{"state":"TASK_STATE_REJECTED","timestamp":"2025-06-01T10:07:45.002Z","message":{"messageId":"7e8f9a0b-1c2d-4e3f-8a4b-5c6d7e8f9a0b","role":"ROLE_AGENT","parts":[{"text":"task rejected: rate limit exceeded"}],"metadata":{"a2abus.failure":{"code":"RATE_LIMITED"}}}},"metadata":{"urn:a2abus:ext:sequence:1":{"seq":"1"}}}}
 ```
@@ -317,7 +320,7 @@ ACP agents (omp `--mode acp`, `claude-agent-acp`, `acp-omp-claude.md`):
 | 0005-024 | Kill during admission; no half-created task (no task without SUBMITTED event) | MUST |
 | 0005-025 | Kill after backend start recorded, before any output; restart yields BACKEND_CRASHED | MUST |
 | 0005-026 | Admission records survive 2 x H in test clock; expire no earlier than max(created + W, terminal + T_task) | MUST |
-| 0005-027 | Submission with receipt older than Ttl plus 30 s staleness allowance; no task, audit record | MUST |
+| 0005-027 | Submission with receipt older than Ttl plus 30 s staleness allowance; `REQUEST_EXPIRED` reply, no task created, audit record | MUST |
 | 0005-028 | Exceed per-peer rate limit; REJECTED task with RATE_LIMITED, no backend start | MUST |
 | 0005-029 | Run the handler suite with every message duplicated; results identical | MUST |
 | 0005-030 | Restart with a COMPLETED task; no backend invocation | MUST |
@@ -343,6 +346,7 @@ ACP agents (omp `--mode acp`, `claude-agent-acp`, `acp-omp-claude.md`):
 | 0005-050 | Presence DRAINING: new send refused UNAVAILABLE with reason DRAINING and no task created; a running task still finishes | MUST |
 | 0005-051 | Cross-origin CancelTask expects TaskNotFoundError, not -32002; same-origin cancel of a terminal task still gets TaskNotCancelableError | MUST |
 | 0005-052 | Two origins send the same contextId through the Hermes bridge: no shared model history; cross-origin GetTask, CancelTask and SubscribeToTask are not forwarded; ListTasks is not sent | MUST |
+| 0005-053 | Inject a workspace loss during a task (token `lease_lost`); expect FAILED with code WORKSPACE_FAILED and detail token; a refusal at Worker start creates no task | MUST |
 
 ## 9. Open issues
 

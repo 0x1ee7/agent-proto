@@ -76,6 +76,8 @@ No `http` key is present (0010-003). Verified by spike `nats` (stub): with no `h
 - [0010-012] Plaintext on loopback is accepted in M1. A non-loopback listener MUST require TLS; M1 configurations never contain one (0010-002).
 - [0010-013] NATS authentication identifies the connection, not the task author. A2A-layer identity and card signatures (RFC-0007) remain authoritative for task authorship; the broker never decides who may act for an agent beyond section 4.11.
 
+[0010-078] The principal of an inbound request or delivery is the identity segment of the sender's reply inbox prefix `_INBOX.<identity>.` (0010-066). The server permissions bind that prefix to the identity of the connection, so a sender cannot choose another principal. The binding MUST attach this principal as RFC-0011 [0011-092] requires and MUST NOT deliver a request or delivery whose principal it cannot derive this way. The fallback of 0010-067 cannot satisfy this: an identity on the fallback MUST NOT be served until the client library supports the prefix, and the gap stays recorded under 0010-067.
+
 ### 4.3 Limits
 
 - [0010-014] Broker `max_payload` MUST be 1048576 bytes (1 MiB).
@@ -449,6 +451,7 @@ These requirements apply only when the post-M1 federation work is accepted. They
 | 0010-065 | Violation logged and audited as FORBIDDEN | M1 |
 | 0010-066 | Client inbox prefix is `_INBOX.<identity>.`; other inboxes not received | M1 |
 | 0010-067 | Fallback inbox mode recorded as known gap | M1 |
+| 0010-078 | Delivered principal equals the identity in the sender's inbox prefix; a request whose principal cannot be derived is not delivered; identity on fallback inbox is not served | M1 |
 | 0010-068 | Backup with broker stopped restores store and state; ACL on backup; stream backup and restore of the event stream | M1 |
 | 0010-069 | Upgrade with wrong SHA-256 refused; downgrade refused | M1 |
 | 0010-070 | Drain before stop; CTRL_BREAK graceful stop exits 0; in-flight turns complete or fail with bus-outage | M1 |

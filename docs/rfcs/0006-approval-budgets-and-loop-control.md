@@ -90,16 +90,16 @@ stateDiagram-v2
 ### 4.3 Decision
 
 - [0006-012] A decision MUST be a SendMessage on `a2a.v1.<tenant>.rpc.<agent>.send` (op token `send`, RFC-0002 section 4.3) carrying the same `task_id` and `context_id` as the open request, and one DataPart whose `metadata` has key `urn:a2abus:ext:approval:1` and whose `data` is an `ApprovalDecision` (approval.proto). A Part is a decision if and only if that metadata key is present (agreed with BindingAuthor, ExtensionsAuthor).
-- [0006-013] A decision is honored only if all of the following hold, checked in this order:
-  1. the request is open (state OPEN in 4.2);
-  2. `nonce` equals the request nonce;
-  3. `option_id` is one of the request's options;
-  4. the decision arrives before `expires_at`, by the owner's local clock;
-  5. the sender is an operator identity for the task's tenant (0006-014).
-  A decision failing any check is refused with InvalidParamsError (ErrorInfo domain `a2a-protocol.org`, reason `INVALID_PARAMS`, `metadata.detail` `APPROVAL_NOT_APPLICABLE`) and audited. It changes no state.
+- [0006-013] A decision is honored only if the following hold, checked in this order:
+  1. the origin is valid: when signing is enabled (RFC-0007), the envelope `A2AB-Sig` verifies (RFC-0007 [0007-039]), the signer is an operator identity for the task's tenant (0006-014), and `decided_by` matches the verified identity (0006-014). Origin failures are refused with the RFC-0007 reason that applies (for example `SIGNATURE_MISSING`, `KEY_ROLE_DENIED`, `SIGNATURE_IDENTITY_MISMATCH`), not with `APPROVAL_NOT_APPLICABLE`;
+  2. the request is open (state OPEN in 4.2);
+  3. `nonce` equals the request nonce;
+  4. `option_id` is one of the request's options;
+  5. the decision arrives before `expires_at`, by the owner's local clock.
+  A decision failing any of checks 2 to 5 is refused with InvalidParamsError (ErrorInfo domain `a2a-protocol.org`, reason `INVALID_PARAMS`, `metadata.detail` `APPROVAL_NOT_APPLICABLE`) and audited. It changes no state.
 - [0006-051] An `ApprovalDecision` MUST carry `request_sha256` (proto field 7; JSON `requestSha256`): the lowercase hex SHA-256 of the protobuf binary encoding of the `ApprovalRequest` that the Worker emitted for that request. The Worker stores this digest when it opens the request. A decision whose `request_sha256` is missing or differs from the stored digest is refused as in 0006-013, with `metadata.detail` `APPROVAL_NOT_APPLICABLE`. Only the owner Worker computes and checks the digest, so no cross-implementation canonical form is needed. The operator signature (RFC-0007) covers the whole decision, so the signed decision binds the exact grant: tool, tier, summary, options, chain and expiry.
 - [0006-014] Authority: only an operator identity defined by RFC-0007 may decide. An agent identity, including the requester, MUST NOT decide. The gateway forwards HTTP-originated decisions only when the caller presents operator credentials per RFC-0008. The Worker MUST set `decided_by` to the verified identity; a non-empty `decided_by` from the client that differs from the verified identity is refused. When signing is enabled (RFC-0007), the envelope `A2AB-Sig` MUST verify before any check in 0006-013 is applied.
-- [0006-015] Single use: the first honored decision closes the request (state ALLOWED or DENIED) and is recorded with `decided_at`. A later decision for the same request id returns the stored result if it names the same option id, and is otherwise refused with InvalidParamsError (ErrorInfo domain `a2a-protocol.org`, reason `INVALID_PARAMS`, `metadata.detail` `APPROVAL_ALREADY_RESOLVED`). Duplicated bus deliveries of the first decision are therefore harmless (RFC-0005 [0005-023]).
+- [0006-015] Single use: the first honored decision closes the request (state ALLOWED or DENIED) and is recorded with `decided_at`. A later decision for the same request id returns the stored result if it names the same option id, and is otherwise refused with InvalidParamsError (ErrorInfo domain `a2a-protocol.org`, reason `INVALID_PARAMS`, `metadata.detail` `APPROVAL_ALREADY_RESOLVED`). A byte-identical redelivery of a signed envelope is refused with `SIGNATURE_REPLAYED` under RFC-0007 [0007-041] before this rule runs; a fresh signed envelope carrying the same decision reaches this rule. Duplicated bus deliveries of the first decision are therefore harmless: they change no state (RFC-0005 [0005-023]).
 - [0006-016] A decision scope is exactly the request: task id, request id, tool and tier. It grants nothing to any other call, task or child (R-S3).
 - [0006-017] Expiry: when `expires_at` passes with the request still open, the Worker closes it (state EXPIRED), answers the backend with the ACP outcome `cancelled` (0006-027), and commits FAILED with `APPROVAL_TIMEOUT` (RFC-0005 table, 4.2). Default on timeout is deny (M1-6). A decision arriving after expiry is refused (RFC-0005 [0005-035]).
 - [0006-018] A cancel of the task closes every open request (state CLOSED) and answers the backend with `cancelled`, as RFC-0005 [0005-036] requires.
@@ -109,7 +109,7 @@ stateDiagram-v2
 ### 4.4 Fatigue and abuse limits (T7)
 
 - [0006-021] Coalescing: a gated call whose (task id, tool, tier, summary digest) equals an open request's within 30 seconds MUST join that request (same request id, same options). Coalesced calls are answered with the same decision.
-- [0006-022] Open requests per task: at most 3. A fourth gated call while three are open is answered with the reject option automatically, audited as `APPROVAL_FLOOD`, and the backend turn continues. This is a refusal of the call, not a task failure. `APPROVAL_FLOOD` is an audit reason only; it is not a task failure code and is not in the RFC-0005 registry.
+- [0006-022] Open requests per task: at most 3. A fourth gated call while three are open for the same task is answered with the reject option automatically, audited as `APPROVAL_FLOOD`, and the backend turn continues. This is a refusal of the call, not a task failure. `APPROVAL_FLOOD` is an audit reason only; it is not a task failure code and is not in the RFC-0005 registry. This cap is per task. RFC-0007 [0007-099] separately caps pending operator prompts per agent across its tasks (default 3); the two caps apply independently.
 - [0006-023] Decision rate: an operator identity may submit at most 10 decisions per minute per tenant. Excess decisions are refused with bus-level `OVERLOADED` (RFC-0002, domain `a2abus.v1`, with `google.rpc.RetryInfo`), `ErrorInfo.metadata.detail` `RATE_LIMITED`, and change no state.
 - [0006-024] The operator surface (RFC-0012) MUST show, before a decision: the action (tool and tier), the summary, the working directory, the requester and the full chain, and the expiry time. It MUST NOT offer bulk approval, and it MUST NOT pre-select an option.
 
@@ -186,7 +186,7 @@ ACP agents (omp, claude-agent-acp):
 - T7 (forged or fatigue-driven approval): decisions need an operator identity (0006-014), a fresh nonce (0006-013), single use (0006-015), exact scope (0006-016), a short expiry (0006-006), redacted actual-action summaries (0006-008), coalescing and per-task caps (0006-021, 0006-022) and a decision rate limit (0006-023). ALLOW_ALWAYS is never persistent and is not offered for exec or delete (0006-010).
 - Default deny is the rule everywhere: no answer means cancelled or reject (0006-001, 0006-017, 0006-027), and no elicitation answer means cancel or decline (0006-053, 0006-054).
 - T3 (ping-pong and cost runaway): allowances decrease monotonically (0006-034), each hop enforces locally (0006-039), depth and hops are always enforced (0006-042), and the breaker stops repeated abuse by origin (0006-048).
-- T11 (stale authority in partitions): approval and budget expiries are checked by the owner only, using its local clock; a late decision cannot revive a task (0006-013 step 4, RFC-0005 [0005-035]).
+- T11 (stale authority in partitions): approval and budget expiries are checked by the owner only, using its local clock; a late decision cannot revive a task (0006-013 step 5, RFC-0005 [0005-035]).
 - Prompt injection: summaries and tool text are untrusted (0006-008). The enforced boundary is scope and approval, not delimiters (R-S7).
 - Redaction (R-S5, L17): budget detail and audit records hold numbers and names only; no argument values, prompts or file content.
 - A breaker and a decision rate limit are denial-of-service controls against the operator as well as against agents. They fail closed for new work and never cancel running tasks.
@@ -427,16 +427,16 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-010 | Backend asks allow_always for exec; answered as allow once; no grant stored | MUST |
 | 0006-011 | Request shows requester and full chain | MUST |
 | 0006-012 | Decision without rpc send shape or without metadata key is not a decision | MUST |
-| 0006-013 | Each of the five checks fails in turn; no state change and audit record | MUST |
+| 0006-013 | Origin checks fail in turn (bad or missing signature, non-operator role, decided_by mismatch) with the RFC-0007 reason; request checks fail in turn (closed, nonce, option, expiry) with APPROVAL_NOT_APPLICABLE; no state change and audit record | MUST |
 | 0006-014 | Agent identity sends decision; refused. Client-supplied decidedBy mismatch refused | MUST |
-| 0006-015 | Two decisions with the same option; second returns stored result. Different option refused | MUST |
+| 0006-015 | Two decisions with the same option; second returns stored result. Different option refused APPROVAL_ALREADY_RESOLVED. Byte-identical envelope redelivery refused SIGNATURE_REPLAYED (0007-041); fresh envelope with the same option returns stored result | MUST |
 | 0006-016 | Decision for request A does not allow request B or a child task | MUST |
 | 0006-017 | Decision after expiry refused; backend receives cancelled; FAILED APPROVAL_TIMEOUT | MUST |
 | 0006-018 | Cancel with an open request; request CLOSED and backend cancelled | MUST |
 | 0006-019 | Deny then backend ends FAILED; FAILED APPROVAL_DENIED. Deny then COMPLETED; completes | MUST |
 | 0006-020 | Allow then backend continues; task WORKING | MUST |
 | 0006-021 | Identical call within 30 s joins the open request | MUST |
-| 0006-022 | Fourth open request refused automatically with APPROVAL_FLOOD; task continues | MUST |
+| 0006-022 | Fourth open request for one task refused automatically with APPROVAL_FLOOD; task continues | MUST |
 | 0006-023 | Eleventh decision in a minute refused OVERLOADED with detail RATE_LIMITED; no state change | MUST |
 | 0006-024 | UI test: fields shown; no bulk approve; no preselected option | MUST |
 | 0006-025 | Omp session starts with approvalMode always-ask-cached (configured ask-exec); always-ask, write and yolo never set; omp Start in any other mode refused; both channels relayed (0009-088); a write or exec that proceeds without an answered approval is BACKEND_CRASHED | MUST |

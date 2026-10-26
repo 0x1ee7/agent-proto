@@ -111,11 +111,11 @@ Terms below are not defined in RFC-0001.
 Header values are the exact bytes transmitted. An absent optional header contributes its line with an empty value; line 16 contributes nothing when absent. A value containing CR or LF makes the message invalid. The signed set is exactly these headers. `Payload-SHA256` is not a transmitted header: the receiver computes it over the received payload bytes ([0007-035]). `traceparent` and `tracestate` are not signed and are informational. `A2AB-Origin` is honored only when the verified sender is `gateway` (RFC-0002 [0002-014]); it is signed so a relaying peer cannot be asserted as origin by a non-gateway sender. `A2AB-Ttl-Ms`, `A2AB-Causation-Id`, `A2AB-Payload-Type`, `A2AB-After-Seq` and `Content-Type` are carried as defined by RFC-0002 and are signed when present or absent.
 - [0007-035] `Payload-SHA256` MUST be the base64url (no padding) SHA-256 of the payload bytes exactly as published. Verifiers hash the received bytes and MUST NOT re-serialize them.
 - [0007-036] `A2AB-Sig` MUST be the base64url (no padding) encoding of the 64-byte Ed25519 signature over the signing input.
-- [0007-037] Senders MUST emit `A2A-Extensions` in the canonical order defined by RFC-0003 before signing, so the signed string is unambiguous.
+- [0007-037] Senders MUST emit `A2A-Extensions` in the canonical order defined by RFC-0003 before signing, so the signed string is unambiguous. Verifiers verify the header bytes as received and MUST NOT reorder them.
 - [0007-038] `A2AB-Sender` MUST equal the agent id of the entry for `A2AB-Kid`, and MUST equal the publisher identity the broker established (RFC-0010). A mismatch is rejected with SIGNATURE_IDENTITY_MISMATCH.
-- [0007-039] At verification the entry MUST satisfy: status `active`, or `retired` with now before `not_after`; now not before `not_before`; role `agent` or `gateway`; tenant match (026). Otherwise reject with SIGNATURE_KEY_INACTIVE or SIGNATURE_KEY_REVOKED.
+- [0007-039] At verification the signing key is checked in this order: (a) the kid is in the allowlist and its entry serves the tenant (026); otherwise reject with SIGNATURE_KEY_UNKNOWN; (b) the status is `active`, or `retired` with now before `not_after`, and now is not before `not_before`; otherwise reject with SIGNATURE_KEY_INACTIVE; a `revoked` entry is rejected with SIGNATURE_KEY_REVOKED; (c) the role is `agent` or `gateway` for peer messages and `operator` for decisions (095, 098); otherwise reject with KEY_ROLE_DENIED; (d) the entry's agent id equals `A2AB-Sender` (038); otherwise reject with SIGNATURE_IDENTITY_MISMATCH.
 - [0007-040] `A2AB-Ts` MUST be RFC 3339 UTC with millisecond precision. It MUST lie within `max_skew_ms` of the receiver's clock; otherwise reject with SIGNATURE_TIMESTAMP_SKEW. This check bounds only the signature replay window and does not extend any other window. `A2AB-Ts` is also the reference for message staleness (RFC-0002 [0002-072]) and submission age (RFC-0005 [0005-027]); those rules alone decide staleness and age.
-- [0007-041] A receiver MUST store each `(kid, nonce)` for at least twice `max_skew_ms` and reject a repeat with SIGNATURE_REPLAYED. `A2AB-Nonce` is 16 random bytes, base64url encoded.
+- [0007-041] A receiver MUST store each `(kid, nonce)` for at least twice `max_skew_ms` and reject a repeat with SIGNATURE_REPLAYED. A full store MUST also reject a new envelope with SIGNATURE_REPLAYED (fail closed): it MUST NOT evict live entries and MUST NOT change state. `A2AB-Nonce` is 16 random bytes, base64url encoded.
 - [0007-042] Message dedupe on `A2AB-Msg-Id` (RFC-0005) applies in addition to the nonce check. Neither replaces the other. The dedupe store MUST retain each `A2AB-Msg-Id` for at least the staleness horizon of RFC-0002 [0002-072] (maximum TTL 3600000 ms plus 30 s, that is 3630 s), as RFC-0010 [0010-026] does for the event stream.
 - [0007-043] Verification MUST complete before delivery to a Backend, any task state change, or any token use. Rejected messages are not delivered and produce an audit event (aggregation: [0007-145]).
 - [0007-044] A sender MUST sign the exact bytes it publishes. Outbound redaction ([0007-130] to [0007-133]) happens before signing.
@@ -123,6 +123,7 @@ Header values are the exact bytes transmitted. An absent optional header contrib
 - [0007-046] When a signature block is present, a receiver MUST use only signed headers for security decisions. Unsigned `A2AB-*` headers are informational.
 - [0007-144] Accepted M1 gap: replies and events carry no signature block in M1, because signing covers requests only ([0007-034]). Their integrity on one host rests on the broker's subject permissions, which are defense in depth and not trusted for integrity (A1; only the Worker that owns a task publishes its `ev` subjects, RFC-0010), and on the single trust domain (A5). Per-agent read isolation on the event stream is not enforceable in M1 NATS: any identity holding a read bundle can read events. Mitigations: the single trust domain (A5); event and audit payloads carry redacted summaries (132, RFC-0013); cross-host or multi-tenant use requires per-event signatures and payload encryption (031; Open issues 6), which need an RFC-0002 change before that profile is enabled.
 - [0007-145] A receiver SHOULD aggregate audit events per sender when failures exceed a rate the operator configures (T9).
+- [0007-146] Timestamps are not reformatted. A sender MUST sign the `A2AB-Ts` header text exactly as published and MUST compute `Payload-SHA256` over the protobuf bytes as published. A receiver MUST NOT normalize a timestamp (for example its precision or offset) before verifying the signature or the digest. Signed statements (090, 091) are canonicalized as 090 defines, but the timestamp strings inside them, including `issuedAt`, are signed as received and are not reformatted.
 
 ### 4.5 Agent Card signatures
 
@@ -147,9 +148,9 @@ Header values are the exact bytes transmitted. An absent optional header contrib
 
 - [0007-095] When signing is enabled for a tenant, an approval decision (RFC-0006) that authorizes an action requiring operator approval, including delegation, MUST be signed by an operator-role kid. The decision is a SendMessage request, so its envelope signature (A2AB-Sig, [0007-034]) is that signature. With signing disabled (M1 default), decisions MUST be accepted only from the supervisor's local operator channel (RFC-0012) and never from the gateway (L10, T7, T12).
 - [0007-096] A signed decision MUST bind the `ApprovalDecision` fields defined by RFC-0006 (`approval.proto`): `request_id`, `task_id`, `option_id`, `nonce` (equal to the request nonce), `decided_at`, `decided_by` and `request_sha256`. `request_sha256` is the lowercase hex SHA-256 of the protobuf bytes of the ApprovalRequest, checked by the owner Worker (RFC-0006 [0006-051]). The signature covers the whole decision, so a change to any field, including `option_id` or `request_sha256`, invalidates it.
-- [0007-097] A decision MUST be consumed once. A second decision with the same request id or nonce is rejected with SIGNATURE_REPLAYED.
+- [0007-097] The first accepted decision closes the request. A later decision for the same request id is governed by RFC-0006 [0006-015]: the same option returns the stored result, and a different option is refused with APPROVAL_ALREADY_RESOLVED. A repeated `(kid, nonce)` is rejected with SIGNATURE_REPLAYED under 041, including a byte-identical redelivery; a fresh envelope carrying a later decision for the same request is not SIGNATURE_REPLAYED.
 - [0007-098] A decision signed by a key whose role is `agent` or `gateway` MUST be rejected with KEY_ROLE_DENIED. A gateway cannot approve on behalf of anyone (T12).
-- [0007-099] The operator UI SHOULD coalesce identical pending approvals and SHOULD cap pending prompts per agent (default 3, the RFC-0006 open-request limit of [0006-022]) to limit approval fatigue (T7).
+- [0007-099] The operator UI SHOULD coalesce identical pending approvals and SHOULD cap pending operator prompts per agent across its tasks (default 3) to limit approval fatigue (T7). This per-agent cap is separate from the per-task limit of RFC-0006 [0006-022], which is also 3.
 
 ### 4.8 Delegation tokens
 
@@ -157,14 +158,16 @@ Header values are the exact bytes transmitted. An absent optional header contrib
 - [0007-101] A recipient MUST verify a full token on first receipt and cache it by `tokenId` until its expiry. Later messages on the same task MAY carry only a `DelegationRef` (`delegation.proto`). A `DelegationRef` whose token is neither cached nor included is rejected with CAPABILITY_INVALID.
 - [0007-102] A `DelegationRef.tokenDigest` MUST equal `sha-256:` plus base64url over the JCS form of the full token including its signature. A mismatch is rejected with CAPABILITY_INVALID.
 - [0007-103] Root grants MUST have `issuer = "operator"`, `depth = 0`, and an operator-role `issuerKid`. They MUST be created only from an approved delegation decision (095). No agent or gateway can create a root grant (T2, T12).
-- [0007-104] A child grant MUST be issued by the audience of a valid token T for the same task, and its scope MUST be a subset of T's scope for every resource, action and constraint. The child MUST NOT end later than T, MUST have `maxUses` no greater than T's, MUST have `depth = T.depth + 1`, and MUST have `ancestors = T.ancestors + [T]`, root first. `depth` MUST NOT exceed 3.
+- [0007-104] A child grant MUST be issued by the audience of a valid token T for the same task, and its scope MUST be a subset of T's scope for every resource and action, and its constraints MUST satisfy 148. The child MUST NOT end later than T, MUST NOT be issued before T (147), MUST have `maxUses` no greater than T's, MUST have `depth = T.depth + 1`, and MUST have `ancestors = T.ancestors + [T]`, root first. `depth` MUST NOT exceed 3. A violated chain rule (issuer, depth, ancestors, end time, issue time, `maxUses`) is rejected with CAPABILITY_CHAIN_INVALID; a scope or constraint that widens T is rejected with CAPABILITY_SCOPE_DENIED.
 - [0007-105] A chain MUST NOT name as audience any agent id that already appears in the chain as an issuer or audience (no loops; T3).
-- [0007-106] A recipient MUST check, in order: (a) the signature of the token and of every ancestor (090); (b) the chain invariants (104, 105); (c) `audience` equals the recipient's agent id; (d) `taskId` equals the envelope task id; (e) receiver clock is no earlier than `issuedAt` minus the issuer's `max_skew_ms`, and before `issuedAt` plus `ttlMs` (no grace after expiry); (f) no issuer kid in the chain is revoked or inactive. Failure codes are in 140.
-- [0007-107] `maxUses` defaults to 1 and MUST be at least 1. A redemption is the first accepted use of a token to start an agent session or attach a grant for its task. Further messages and tool calls within that session are governed by scope and by the proxy (114), not counted. Exceeding `maxUses` is rejected with CAPABILITY_USED. Redemption counts live in recipient supervisor state (T4).
-- [0007-108] A token authorizes only messages on its `taskId` from its `audience`. Any other use is rejected with CAPABILITY_TASK_MISMATCH or CAPABILITY_AUDIENCE_MISMATCH.
+- [0007-106] A recipient MUST check, in order: (a) the signature of the token and of every ancestor (090), a non-verifying signature failing with CAPABILITY_INVALID, an issuer kid not in the allowlist for the tenant failing with SIGNATURE_KEY_UNKNOWN, and a role or identity mismatch failing with KEY_ROLE_DENIED or SIGNATURE_IDENTITY_MISMATCH; (b) the chain invariants (104, 105, 147); (c) `audience` equals the recipient's agent id, otherwise CAPABILITY_AUDIENCE_MISMATCH; (d) `taskId` equals the envelope task id, otherwise CAPABILITY_TASK_MISMATCH; (e) receiver clock is no earlier than `issuedAt` minus the issuer's `max_skew_ms` (CAPABILITY_NOT_YET_VALID otherwise), and before `issuedAt` plus `ttlMs` (CAPABILITY_EXPIRED at or after expiry; no grace after expiry); (f) no issuer kid in the chain is revoked or inactive, and no such key is not yet valid or past its `not_after` (CAPABILITY_REVOKED). Failure codes are in 140.
+- [0007-107] `maxUses` defaults to 1 when absent. An explicit value MUST be an integer of at least 1; 0, a negative value or a non-integer is rejected with CAPABILITY_INVALID. A redemption is the first accepted use of a token to start an agent session or attach a grant for its task. Further messages and tool calls within that session are governed by scope and by the proxy (114), not counted. Exceeding `maxUses` is rejected with CAPABILITY_USED. Redemption counts live in recipient supervisor state (T4).
+- [0007-108] A token authorizes only messages on its `taskId` received by its `audience`. A token presented by another recipient is rejected with CAPABILITY_AUDIENCE_MISMATCH (106(c)); a message on another task is rejected with CAPABILITY_TASK_MISMATCH (106(d)).
 - [0007-109] Default deny: an agent's own configuration (its providers, its MCP servers, its workspace) is that agent's authority and is not delegated authority. Any action an agent takes for another agent's task requires a valid token that scopes that action (T2, T14).
 - [0007-110] When a kid is revoked or becomes inactive, every token it issued and every token whose chain contains it is invalid from that moment (computed at verification from the chain). Supervisors MUST move affected tasks to the terminal state RFC-0005 defines for cancellation and MUST stop their proxies (T11).
 - [0007-111] Token expiry is hard. When `issuedAt + ttlMs` passes, redemptions and proxy calls under the token fail; the proxy for the grant MUST stop and the grant credential MUST be invalidated (T11).
+- [0007-147] A child grant's `issuedAt` MUST be no earlier than its parent's `issuedAt`; an earlier value is rejected with CAPABILITY_CHAIN_INVALID (104, 106(b)).
+- [0007-148] Constraint narrowing: every constraint key of the parent MUST exist in the child. An array-valued constraint MUST narrow to a subset of the parent's items. Every other parent constraint value MUST be equal in the child, so a child cannot change a numeric or string constraint. Extra child keys are allowed. A parent with no constraints allows any child constraint. A child that violates this is rejected with CAPABILITY_SCOPE_DENIED.
 
 ### 4.9 MCP access and proxies
 
@@ -184,7 +187,7 @@ Header values are the exact bytes transmitted. An absent optional header contrib
 - [0007-122] A message with more than 8 hops MUST be rejected with PROVENANCE_TOO_DEEP.
 - [0007-123] When `contentDigest` is present, a receiver MUST recompute it over the JCS form of the `parts` array as received and reject a mismatch with PROVENANCE_INVALID.
 - [0007-124] Any content whose trust class is not `TRUST_CLASS_OPERATOR` is untrusted input. Model-facing components MUST treat its text as data: it MUST NOT be able to change approvals, grants, identities or scopes. Enforcement is by capability scope and approval gates (T1, R-S7); text framing is hygiene only.
-- [0007-125] Before untrusted text reaches a Backend, the worker runtime MUST: (a) reject NUL and control characters other than tab, LF and CR; (b) enforce the size limit set by RFC-0002; (c) apply redaction (132); (d) wrap the text in a data block with a fresh 128-bit random boundary per message. The block's header line states the trust class and origin agent id. The text inside is unmodified. If the boundary occurs in the text, a new boundary is generated.
+- [0007-125] Before untrusted text reaches a Backend, the worker runtime MUST: (a) reject NUL and control characters other than tab, LF and CR; (b) reject text larger than 262144 bytes (256 KiB), measured before redaction, the limit of RFC-0002 [0002-110]; (c) apply redaction (132); (d) wrap the text in a data block with a fresh 128-bit random boundary per message. The block's header line states the trust class and origin agent id. The text inside is unmodified. If the boundary occurs in the text, a new boundary is generated.
 - [0007-126] Framing MUST be applied exactly once, by the component adjacent to the model. The gateway and drivers MUST NOT add framing to content they forward. Hermes frames content it receives from remote peers itself (`docs/interop/hermes.md` section 7), so Hermes-bound content is framed by Hermes and omp- or claude-bound content is framed by the worker.
 - [0007-127] Tool and MCP results are `TRUST_CLASS_TOOL_OUTPUT`. They are framed under 125 when they re-enter a model context.
 - [0007-128] Framing applies to model input only. It MUST NOT alter stored, signed or forwarded bytes.
@@ -192,7 +195,7 @@ Header values are the exact bytes transmitted. An absent optional header contrib
 
 ### 4.11 Redaction and credential handling
 
-- [0007-130] Credential-shaped strings are: (a) provider API key formats for configured providers; (b) bearer or `Authorization` values; (c) PEM private key blocks; (d) JWT-shaped strings; (e) cloud access key identifiers; (f) tokens of 32 or more characters with Shannon entropy above 4.5 bits per character. Patterns are maintained as data and are not reproduced in this RFC.
+- [0007-130] Credential-shaped strings are: (a) provider API key formats for configured providers; (b) bearer or `Authorization` values; (c) PEM private key blocks; (d) JWT-shaped strings; (e) cloud access key identifiers; (f) high-entropy tokens: a maximal run of at least 32 characters from `[A-Za-z0-9+/_=-]` whose Shannon entropy over byte frequencies is strictly above 4.5 bits per byte. Patterns (a) to (e) are maintained as data and are not reproduced in this RFC.
 - [0007-131] Each match MUST be replaced by `[REDACTED:<class>]`, where `<class>` is one of `provider-key`, `bearer`, `private-key`, `jwt`, `cloud-key-id`, `high-entropy`.
 - [0007-132] Redaction MUST be applied to logs, traces, audit events (RFC-0013), outbound bus and HTTP egress content, and to text entering a model context (125).
 - [0007-133] Outbound content MUST be redacted before signing (044). Inbound signed payloads MUST NOT be mutated; receivers redact only their copies for logs, audit and model input.
@@ -424,7 +427,7 @@ Security requirements (`docs/requirements.md` R-S1 to R-S7) and where this RFC m
 | R-S2 Agent Cards signed | 050-057 | Met |
 | R-S3 Grants bound to task, request and scope; single use; expiring; default deny | 100-111; 107 (single use), 111 (expiry), 109 (default deny); request binding in RFC-0006 [0006-016] | Met |
 | R-S4 Attenuated per-task delegation; no raw long-lived secrets in envelopes | 104 (attenuation); 100 and 116 (no secrets in envelopes) | Met |
-| R-S5 Redaction in logs, traces and outbound content | 130-133 | Met; thresholds per Open issues 9 |
+| R-S5 Redaction in logs, traces and outbound content | 130-133 | Met; thresholds fixed in 130(f); fixture set per Open issues 9 |
 | R-S6 Rate limits and quotas per peer; REJECTED on overload | 043 and 145 (rejection before work, aggregated audit); limits in RFC-0005 and RFC-0008 | Owned by RFC-0005 and RFC-0008 |
 | R-S7 Task content untrusted; provenance in metadata; text not rewritten | 120-129 | Met |
 
@@ -448,6 +451,9 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 - **MCP through a delegator-controlled proxy.** Keeps upstream credentials out of the recipient and out of the bus (L12). Direct mode is kept only as an explicit per-recipient opt-in because it cannot revoke a credential the recipient holds.
 - **Framing once, at the model boundary.** Double framing degrades model behavior and is inconsistent with Hermes's own framing. Framing is hygiene; capability scope is the boundary.
 - **No payload encryption in M1.** The broker is trusted on one host (A5), and encryption adds key distribution. Deferred with a default in Open issues.
+- **Key validity and token issuer keys.** A key that is not yet valid or past `not_after` is rejected with SIGNATURE_KEY_INACTIVE on an envelope (039). A token whose issuer key is not valid is rejected with CAPABILITY_REVOKED (106(f)), and a token whose own `issuedAt` is in the future is CAPABILITY_NOT_YET_VALID (106(e)). Folding these into SIGNATURE_KEY_UNKNOWN was rejected: it would hide a clock or rotation problem from the operator.
+- **Full replay store fails closed.** When the `(kid, nonce)` store is full, a new envelope is rejected with SIGNATURE_REPLAYED (041) and no live entry is evicted, because eviction would reopen a replay window. A separate reason code was rejected to keep the reason set in 140 unchanged.
+- **Separate reasons for widening and chain errors.** A scope or constraint that widens the parent is CAPABILITY_SCOPE_DENIED (104, 148). Every other attenuation failure (end time, issue time, maxUses, depth, ancestors, issuer) is CAPABILITY_CHAIN_INVALID (104, 147). Operators can then tell a policy violation from a malformed chain.
 
 ## 8. Conformance
 
@@ -481,11 +487,11 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 | 0007-034 | Golden vectors: signing input bytes match for fixtures (requests only), including empty optional headers, `A2AB-After-Seq`, `Content-Type` and `A2AB-SP-<key>` lines | MUST |
 | 0007-035 | Modify one body byte: Payload-SHA256 mismatch rejects | MUST |
 | 0007-036 | Signature over wrong input rejected; 64-byte length enforced | MUST |
-| 0007-037 | Sender with unsorted A2A-Extensions produces failing vector; sorted order passes | MUST |
+| 0007-037 | Sender with unsorted A2A-Extensions produces failing vector; sorted order passes; verifier verifies received header bytes unchanged | MUST |
 | 0007-038 | Sender header differs from broker identity: SIGNATURE_IDENTITY_MISMATCH | MUST |
-| 0007-039 | Retired past `not_after`, not-yet-valid, revoked: each rejected with its reason | MUST |
+| 0007-039 | Each check (a)-(d) has a failing fixture: unknown or wrong-tenant kid SIGNATURE_KEY_UNKNOWN; retired past not_after or not yet valid SIGNATURE_KEY_INACTIVE; revoked SIGNATURE_KEY_REVOKED; operator-role key on a peer message KEY_ROLE_DENIED; agent id mismatch SIGNATURE_IDENTITY_MISMATCH | MUST |
 | 0007-040 | Timestamp outside skew rejected; inside skew accepted; deadlines unaffected | MUST |
-| 0007-041 | Same (kid, nonce) twice: second rejected SIGNATURE_REPLAYED; entry kept for 2x skew | MUST |
+| 0007-041 | Same (kid, nonce) twice: second rejected SIGNATURE_REPLAYED; entry kept for 2x skew; full store rejects a new envelope SIGNATURE_REPLAYED and evicts no live entry | MUST |
 | 0007-042 | Same nonce with new msg-id and same msg-id with new nonce: each covered by its check | MUST |
 | 0007-043 | Rejected message never reaches Backend; audit emitted | MUST |
 | 0007-044 | Outbound body with credential-shaped string: sent bytes are redacted and signed | MUST |
@@ -506,18 +512,18 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 | 0007-094 | Root grant signed by agent-role key rejected | MUST |
 | 0007-095 | Approval with signing enabled and no operator signature rejected; M1 decisions only via local channel | MUST |
 | 0007-096 | Decision with altered `option_id` or `request_sha256` fails signature verification; missing `request_sha256` refused | MUST |
-| 0007-097 | Second decision with same request id or nonce rejected | MUST |
+| 0007-097 | Second decision for the same request id: same option returns stored result; different option APPROVAL_ALREADY_RESOLVED; repeated (kid, nonce) SIGNATURE_REPLAYED | MUST |
 | 0007-098 | Decision signed by gateway key rejected KEY_ROLE_DENIED | MUST |
-| 0007-099 | Ten identical requests produce one prompt; a fourth distinct pending prompt for one agent is held (cap of 3) | SHOULD |
+| 0007-099 | Ten identical requests produce one prompt; a fourth distinct pending prompt for one agent across its tasks is held (cap of 3) | SHOULD |
 | 0007-100 | Scan envelopes, cards and logs for secrets during delegation: none; token body absent from logs | MUST |
 | 0007-101 | Second message with DelegationRef only accepted from cache; cold cache rejected CAPABILITY_INVALID | MUST |
 | 0007-102 | Altered token digest rejected | MUST |
 | 0007-103 | Root grant from agent key rejected; root from non-decision rejected | MUST |
-| 0007-104 | Child with widened scope, later end, larger maxUses or depth 4 rejected | MUST |
+| 0007-104 | Child with widened scope or constraint CAPABILITY_SCOPE_DENIED; later end, larger maxUses, depth 4 or earlier issuedAt CAPABILITY_CHAIN_INVALID | MUST |
 | 0007-105 | Chain re-naming an earlier audience rejected | MUST |
 | 0007-106 | Each check (a)-(f) has a failing fixture with its reason | MUST |
-| 0007-107 | maxUses 1: second session attach rejected CAPABILITY_USED; tool calls within session not counted | MUST |
-| 0007-108 | Token used on other task or other agent rejected | MUST |
+| 0007-107 | maxUses 1: second session attach rejected CAPABILITY_USED; tool calls within session not counted; absent maxUses behaves as 1; 0 or non-integer CAPABILITY_INVALID | MUST |
+| 0007-108 | Token presented by another recipient CAPABILITY_AUDIENCE_MISMATCH; token on another task CAPABILITY_TASK_MISMATCH | MUST |
 | 0007-109 | Delegated action without token refused; own-config action allowed | MUST |
 | 0007-110 | Revoke ancestor kid: descendants fail; affected tasks reach terminal state; proxies stopped | MUST |
 | 0007-111 | Clock past expiry: redemption and proxy calls fail; proxy process gone | MUST |
@@ -534,7 +540,7 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 | 0007-122 | Nine hops rejected PROVENANCE_TOO_DEEP | MUST |
 | 0007-123 | Altered parts with stale contentDigest rejected | MUST |
 | 0007-124 | Untrusted text instructing approval or scope change does not change any grant or decision | MUST |
-| 0007-125 | Worker hygiene: NUL rejected; oversize rejected; boundary collision regenerates; redaction applied | MUST |
+| 0007-125 | Worker hygiene: NUL rejected; text over 262144 bytes rejected before redaction; boundary collision regenerates; redaction applied | MUST |
 | 0007-126 | Gateway-forwarded Hermes text has no added wrap; one wrap at worker | MUST |
 | 0007-127 | Tool output re-entering model is framed with TOOL_OUTPUT class | MUST |
 | 0007-128 | Stored and signed bytes equal before and after framing | MUST |
@@ -553,6 +559,9 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 | 0007-143 | Card failure produces unverified status, not RPC error | MUST |
 | 0007-144 | Documentation check: reply and event fixtures carry no signature block; accepted-gap text present in section 4.4 and section 6 | MUST |
 | 0007-145 | Flood of rejected messages above the configured rate yields aggregated audit events | SHOULD |
+| 0007-146 | Envelope whose A2AB-Ts or Payload-SHA256 input was re-serialized fails verification; signed statement verifies received member text unchanged | MUST |
+| 0007-147 | Child with issuedAt earlier than its parent's rejected CAPABILITY_CHAIN_INVALID | MUST |
+| 0007-148 | Child array constraint with an item outside the parent's items, or a changed numeric or string constraint, rejected CAPABILITY_SCOPE_DENIED; extra child key accepted | MUST |
 
 ## 9. Open issues
 
@@ -564,6 +573,6 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 6. **Payload confidentiality.** Default: none in M1 (045). A later profile may add per-recipient encryption; key distribution would then need its own RFC.
 7. **Session resume with new MCP servers.** Whether omp and claude accept `mcpServers` on `session/load` or `session/resume` is [UNVERIFIED]. Default: a new session per grant (`docs/interop/acp-omp-claude.md` sections 2 and 3).
 8. **`mcpCapabilities.http` in omp and claude.** [UNVERIFIED]. Default: stdio shim only (117).
-9. **Redaction thresholds.** The 4.5 bits per character and length-32 values in 130 are defaults. Default: fix them with fixtures before any release that relies on them.
-10. **Approval prompt cap.** Default 3 pending per agent (099, RFC-0006 [0006-022]); to be tuned in use.
+9. **Redaction fixtures.** The thresholds in 130(f) are fixed: a run of at least 32 characters from `[A-Za-z0-9+/_=-]` with Shannon entropy above 4.5 bits per byte. Default: fix the fixture set with its positive and negative cases before any release that relies on them.
+10. **Approval prompt cap.** Default 3 pending per agent across its tasks (099); RFC-0006 [0006-022] caps 3 per task. The two caps apply independently; both are to be tuned in use.
 11. **Approval decision shape.** Resolved by RFC-0006 [0006-051]: `ApprovalDecision.request_sha256` binds the decision to the exact ApprovalRequest, and the operator signature covers the whole decision (095-096). The root grant is created from that approved request (103); its scope is bound through the request's tool, tier, summary, chain and expiry. Binding the minted token bytes is deferred to RFC-0006 section 9 open issue 9 (owner RFC-0007).

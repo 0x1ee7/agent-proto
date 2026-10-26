@@ -95,7 +95,7 @@ Each case names its tier. Cases marked `live` MUST run on both platforms. Where 
 | ID | Scenario | Steps | Assertion | Tier |
 |---|---|---|---|---|
 | [0014-021] | N1: publish with another agent's identity | A client with the credentials of agent B publishes a request for agent A | Refused at the bus; no event, no task created; the refusal is audited | nats |
-| [0014-022] | N2: two workers on one checkout | Configure two workers with the same working directory | The second worker refuses to start with a configuration error naming the directory; no lock is taken and no task runs in the shared directory (RFC-0012, M1-5) | live |
+| [0014-022] | N2: two workers on one checkout; workspace root inside checkout | (a) Configure two workers with the same `repo` (b) Configure a worker whose state directory lies inside its `repo` | (a) Both start, each in its own worktree and branch; workspaces do not overlap. (b) The worker refuses to start with `shared_checkout` naming the directory, before any lock or workspace is created (RFC-0012 [0012-031]) | live |
 | [0014-023] | N3: unauthenticated gateway request | Send an HTTP request with no or invalid credentials | 401; nothing is published to the bus (RFC-0008, L14) | live |
 | [0014-024] | N4: unsupported operation on the bus | Send an operation token that the binding does not define | Refused with an unsupported-operation error; no state change | mem |
 | [0014-025] | N5: stale request | Send a request whose `A2AB-Ts` is outside the allowed skew | Refused with REQUEST_EXPIRED; no backend start (RFC-0002 [0002-070] to [0002-073]) | mem and nats |
@@ -320,7 +320,7 @@ Threats are the T-numbers of `docs/requirements.md` section 8. Each row names th
 | [0014-019] | live: S8 cancel; CANCELED within 15 s; no child process after cancel | MUST |
 | [0014-020] | interop: pinned a2a-sdk client; card fetched; message completed; no bus-specific import | MUST |
 | [0014-021] | nats: publish with wrong identity; refused; no event; audit record present | MUST |
-| [0014-022] | live: two workers on one directory; second refuses to start; no lock file is created | MUST |
+| [0014-022] | live: two workers on one `repo` both start in separate worktrees; a worker whose workspace root lies inside its `repo` refuses with `shared_checkout`; no lock or workspace is created | MUST |
 | [0014-023] | live: request without credentials; 401; bus publish count is zero | MUST |
 | [0014-024] | mem: unknown operation token; unsupported-operation error; no state change | MUST |
 | [0014-025] | mem and nats: request outside skew; REQUEST_EXPIRED; no backend start | MUST |
@@ -370,7 +370,7 @@ Each item has a proposed default. The default holds unless the named RFC changes
 26. **Payload confidentiality.** RFC-0007 O6. Default: none in M1. Out of scope per section 2.2.
 27. **MCP session and `mcpCapabilities.http`.** RFC-0007 O7 and O8. Default: new MCP session per grant; stdio shim only; HTTP MCP not offered in M1. Out of scope for M1 cases.
 28. **Redaction thresholds.** RFC-0007 O9. Default: 4.5 bits per character, length 32. Confirmed by case 0014-021 and the gate report scan.
-29. **Operator approval cap.** RFC-0007 O10 and RFC-0006 [0006-022]. Default: 3 open requests per task (RFC-0006); RFC-0007 cap at 5 pending per agent is an additional limit. Change neither unless measured.
+29. **Operator approval cap.** RFC-0007 O10 and RFC-0006 [0006-022]. Default: 3 open requests per task (RFC-0006 [0006-022]); 3 pending prompts per agent (RFC-0007 [0007-099], SHOULD; O10). Change neither unless measured.
 30. **Gateway attested card.** RFC-0008 O6. Default: none in M1; gateway card unsigned (RFC-0008 [0008-016]).
 31. **Peer timeout.** RFC-0009 [0009-053] default 330 s and RFC-0008 [0008-092] blocking wait 100 s with a 20 s margin under the Hermes 120 s client timeout. Default: as written. Recorded so the values are not changed independently.
 32. **Backend mapping of PEER_* names.** RFC-0009 is being edited by BackendAuthor to split PEER_* into `health_class` and bus reasons. Default: the names in RFC-0009 [0009-051] and [0009-072] as merged. The RFC-0014 references are re-checked at gate.

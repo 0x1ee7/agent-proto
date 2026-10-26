@@ -5,7 +5,7 @@
 | Status | Proposed |
 | Depends on | RFC-0000 |
 | Owner area | architecture |
-| Interop notes | `docs/interop/*.md` |
+| Related interop notes | `docs/interop/*.md` |
 
 ## 1. Summary
 
@@ -223,10 +223,15 @@ Layering confines secrets: only `a2a-security` handles private keys; only driver
 
 | ID | Test idea | Level |
 |---|---|---|
-| 0001-001..003 | `cargo metadata` graph check in `a2a-conformance` | CI |
+| 0001-001 | `cargo metadata` graph check in `a2a-conformance`: no crate outside L1 and L5 depends on `bus-nats` or `bus-mem` | CI |
+| 0001-002 | `cargo metadata` graph check: no driver crate depends on another driver, on `gateway-http`, or on a concrete bus | CI |
+| 0001-003 | `cargo metadata` graph check: `gateway-http` has no dependency on any `driver-*` crate | CI |
 | 0001-004 | Core test suite passes using only `bus-mem` | CI |
 | 0001-005 | Every crate dir contains `AGENTS.md` with owns/provides/uses | CI |
 | 0001-007 | Supervisor integration test: process count equals worker count | M1 |
+| 0001-006 | Compile-time check: each seam (`Bus`, `Backend`, `Signer`/`Verifier`, `AuditSink`) has one trait; swapping the `bus-mem` binding for a stub leaves crates above L1 unchanged | CI |
+| 0001-008 | Supervisor test: a worker process that spawns a child process is detected and fails the boot check | M1 |
+| 0001-009 | Run each component alone with a bus address and credentials, without `a2ad`; the component starts and serves | M1 |
 
 ## 9. Open issues
 

@@ -81,7 +81,7 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 
 [0002-010] The tenant of a request is the `<tenant>` token of its request subject. If the request body carries a non-empty `tenant` field (A2A proto request messages), it MUST equal the subject tenant; otherwise the Worker MUST reply with a bus-level error `TENANT_MISMATCH` (section 4.8).
 
-[0002-011] The sender identity is the value of `A2AB-Sender`. When the transport supplies an authenticated principal (RFC-0010 credentials), the Worker MUST compare it with `A2AB-Sender`; a mismatch MUST be rejected with `PERMISSION_DENIED`. When signing is enabled (RFC-0007), the signature MUST verify before the header is trusted; a failed signature MUST be rejected with `UNAUTHENTICATED`.
+[0002-011] The sender identity is the value of `A2AB-Sender`. The binding delivers the authenticated principal of the transport peer with every inbound request (RFC-0011 [0011-092]; NATS: RFC-0010 [0010-078]). Receivers compare `A2AB-Sender` with that principal; a mismatch MUST be rejected with `PERMISSION_DENIED`. When signing is enabled (RFC-0007), the signature MUST verify before the header is trusted; a failed signature MUST be rejected with `UNAUTHENTICATED`.
 
 [0002-012] Cross-tenant messages are not allowed. A message whose sender is authorized only for tenant `A` MUST NOT be accepted on a subject of tenant `B`. Enforcement is by bus permissions and by [0002-010].
 
@@ -170,6 +170,8 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 
 [0002-040] For a unary operation the Worker MUST send exactly one reply to the reply subject supplied by the request mechanism (RFC-0011 request/reply). The reply payload is either the success payload of section 4.3 or a `google.rpc.Status` (section 4.8), selected by `A2AB-Payload-Type`. A requester MUST accept the first reply to a request and ignore later replies to the same request.
 
+[0002-116] A reply, success or error, MUST NOT carry `A2AB-Msg-Id`. It carries `A2AB-Causation-Id` equal to the `A2AB-Msg-Id` of the request it answers.
+
 [0002-041] Task events are published by the Worker that owns the task, one event per message, on `a2a.v1.<tenant>.ev.<agent>.<task_id>`. Each event payload is a `lf.a2a.v1.StreamResponse` whose oneof holds exactly one of `statusUpdate` or `artifactUpdate` (L3). A `Task` or `Message` element is never published on an event subject; the initial element is delivered on the reply (section 4.5.1).
 
 [0002-042] The per-task sequence number `seq` is defined by RFC-0005 and carried in the event metadata under `urn:a2abus:ext:sequence:1` (L8). Events of one task are published in strictly increasing `seq` order starting at 1. The Worker MUST NOT publish event `n+1` for a task before the bus has acknowledged event `n` (RFC-0011 publish acknowledgement). The Worker MUST NOT reuse a `seq` value for a different event.
@@ -216,9 +218,11 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 
 [0002-071] The receiver computes the request deadline as its own receipt time plus `A2AB-Ttl-Ms`. A Worker MUST NOT start processing of a request after that deadline has passed and MUST answer it with `REQUEST_EXPIRED` (section 4.8) if it has not yet started work.
 
-[0002-072] Receivers MUST reject a request as stale when `local_now - A2AB-Ts` exceeds `A2AB-Ttl-Ms + 30000` (allowance 30 s, [INFERENCE] default), answering `REQUEST_EXPIRED`. When `A2AB-Ts` is more than 30 s ahead of local time, the receiver MUST ignore `A2AB-Ts` for the staleness check and use receipt time only. No other use of `A2AB-Ts` is permitted.
+[0002-072] The receiver owns the staleness check. It MUST reject a request as stale when `local_now - A2AB-Ts` exceeds `A2AB-Ttl-Ms + 30000`, answering `REQUEST_EXPIRED`. The 30 s allowance is fixed (O-8) and is not a clock-skew setting. When `A2AB-Ts` is more than 30 s ahead of local time, the receiver MUST ignore `A2AB-Ts` for the staleness check and use receipt time only. No other use of `A2AB-Ts` is permitted.
 
 [0002-073] Expiry MUST fail closed (T11): a request whose expiry cannot be established MUST NOT be processed.
+
+[0002-114] If the receiver cannot read its clock, the request MUST be answered `REQUEST_EXPIRED` (section 4.8) and MUST NOT be processed. This is the fail-closed rule of [0002-073].
 
 ### 4.7 Service parameters, extensions and versions
 
@@ -227,6 +231,8 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 [0002-081] `A2A-Extensions` lists the extension URIs the requester supports for this operation, comma-separated, each an absolute URI (L2, RFC-0003). A Worker that requires an extension it advertises as required (A2A section 3.3.4) and that is absent from the list MUST answer `ExtensionSupportRequiredError`. Unknown non-required extensions are ignored (A2A section 3.3.4).
 
 [0002-082] The bus binding carries the A2A service parameters `Version` and `Extensions` in the headers `A2A-Version` and `A2A-Extensions` (A2A section 12.3). Any other service parameter `K` is carried in the header `A2AB-SP-<k>`, where `<k>` is `K` lowercased and restricted to `[a-z0-9-]{1,48}`. A value MUST be printable ASCII of at most 1024 bytes (section 4.4 [0002-033]). A client MUST NOT send a service parameter whose value cannot be expressed this way; it MUST fail the call with `MALFORMED_MESSAGE` locally. The binding defines no fallback body field in M1.
+
+[0002-115] On read, a receiver lowercases the key of every `A2AB-SP-<k>` header before matching it, so a service parameter name is case-insensitive on the bus.
 
 [0002-083] Extension URIs are `urn:a2abus:ext:<name>:<major>` for bus-defined extensions (`approval:1`, `budget:1`, `sequence:1`) (L7-L9, RFC-0003). A new URI is required for a breaking change (A2A section 4.6.3); a receiver MUST NOT fall back from a URI it does not understand to an older one.
 
@@ -253,6 +259,7 @@ No other subject family is defined by this RFC. Presence and card storage are ke
 | ExtensionSupportRequiredError | 9 FAILED_PRECONDITION | `EXTENSION_SUPPORT_REQUIRED` |
 | VersionNotSupportedError | 9 FAILED_PRECONDITION | `VERSION_NOT_SUPPORTED` |
 | EXTENSION_DATA_INVALID (InvalidParams, JSON-RPC -32602; RFC-0003) | 3 INVALID_ARGUMENT | `EXTENSION_DATA_INVALID` |
+| UnknownOperation: operation token not in [0002-020] (code 12 distinguishes it from UnsupportedOperationError above) | 12 UNIMPLEMENTED | `UNSUPPORTED_OPERATION` |
 
 The table follows the A2A canonical mapping (A2A section 5.4); the gRPC codes are those of the A2A gRPC binding. [0002-091] also applies to the UnsupportedOperationError that a Worker raises for an invalid `send` (section 4.5.3). Where a detail is needed, the Worker MUST put it in `ErrorInfo.metadata` (string values), e.g. `taskId`, `detail`.
 
@@ -261,10 +268,10 @@ The table follows the A2A canonical mapping (A2A section 5.4); the gRPC codes ar
 | Bus-level reason | `status.code` | Meaning |
 |---|---|---|
 | `UNAUTHENTICATED` | 16 | signature missing or invalid where required |
-| `PERMISSION_DENIED` | 7 | sender not allowed to call the agent or operation, or sender/principal mismatch |
-| `REQUEST_EXPIRED` | 4 DEADLINE_EXCEEDED | request stale or expired (section 4.6) |
+| `PERMISSION_DENIED` | 7 | sender not allowed to call the agent or operation, sender/principal mismatch, or blob reference naming another tenant ([0002-119]) |
+| `REQUEST_EXPIRED` | 4 DEADLINE_EXCEEDED | request stale or expired (section 4.6), or no clock reading ([0002-114]) |
 | `PAYLOAD_TOO_LARGE` | 8 RESOURCE_EXHAUSTED | payload above the negotiated limit and no blob reference used (section 4.10) |
-| `MALFORMED_MESSAGE` | 3 INVALID_ARGUMENT | unparseable payload, bad header, bad subject token, bad TTL |
+| `MALFORMED_MESSAGE` | 3 INVALID_ARGUMENT | unparseable payload, bad header, bad subject token, bad TTL, malformed blob reference or digest mismatch ([0002-118]) |
 | `UNSUPPORTED_MEDIA_TYPE` | 3 INVALID_ARGUMENT | JSON payload without debug mode |
 | `TENANT_MISMATCH` | 3 INVALID_ARGUMENT | body tenant differs from subject tenant |
 | `OVERLOADED` | 14 UNAVAILABLE | admission refused for load; carries `google.rpc.RetryInfo` |
@@ -276,6 +283,8 @@ The table follows the A2A canonical mapping (A2A section 5.4); the gRPC codes ar
 [0002-094] Overload: a Worker that refuses a `send` for load MUST NOT drop it silently (R-S6, T9). If the Worker can record the task, it MUST create the task in state `REJECTED` with a status message explaining the overload and reply normally (A2A `REJECTED` is a terminal state of the task). If it cannot record the task, it MUST reply `OVERLOADED` with `RetryInfo`.
 
 [0002-095] Error payloads MUST NOT contain the request body, credentials, file paths of the host or stack traces (R-S5, T5). Error `message` strings are short English sentences from a fixed set.
+
+[0002-117] An error reply is a binary protobuf `google.rpc.Status` (section 4.4.2). A reply, success or error, to a debug-mode JSON request ([0002-037]) MUST use JSON in the request's encoding.
 
 ### 4.9 Agent Card binding declaration
 
@@ -295,13 +304,17 @@ The table follows the A2A canonical mapping (A2A section 5.4); the gRPC codes ar
 
 ### 4.10 Payload size and large content
 
-[0002-110] The inline payload limit for a message is the smaller of the bus limit reported by the bus binding (`max_message_size`, RFC-0011) and the limit of 262144 bytes (256 KiB, default). A sender MUST NOT publish a request or event above the inline limit unless the bus limit allows it and the content is by reference (below).
+[0002-110] The inline payload limit is 262144 bytes (256 KiB), measured before redaction. The effective limit is the smaller of that and the bus limit reported by the bus binding (`max_message_size`, RFC-0011). A sender MUST NOT publish a request or event above the effective limit unless the content is by reference (below). This limit is also the size bound that worker hygiene applies to untrusted text (RFC-0007 [0007-125]).
 
 [0002-111] Content above the inline limit MUST be placed in the bus blob store (RFC-0011) and referenced from a `Part.url` with scheme `a2abus-blob` and the form `a2abus-blob://<tenant>/<sha256-hex>`, where `<sha256-hex>` is the lowercase hex SHA-256 of the bytes. `Part.mediaType` and `Part.filename` carry the media type and name (A2A section 4.1.6).
 
-[0002-112] A receiver that dereferences a blob reference MUST verify the SHA-256 digest of the fetched bytes against the reference and MUST discard the content on mismatch. A receiver MUST NOT treat a blob reference from a tenant other than the message's tenant as valid.
+[0002-112] A receiver that dereferences a blob reference MUST verify the SHA-256 digest of the fetched bytes against the reference (blob contract RFC-0011 [0011-017]) and MUST discard the content on mismatch, answering `MALFORMED_MESSAGE` ([0002-118]). A receiver MUST NOT treat a blob reference from a tenant other than the message's tenant as valid ([0002-119]).
 
 [0002-113] A payload above the inline limit that is not a blob reference is refused with `PAYLOAD_TOO_LARGE`. The Worker MUST NOT truncate content.
+
+[0002-118] A blob reference that does not match the form of [0002-111], or whose fetched bytes fail the digest check of [0002-112], MUST be answered `MALFORMED_MESSAGE`.
+
+[0002-119] A blob reference naming a tenant other than the subject tenant MUST be answered `PERMISSION_DENIED`, and the content MUST NOT be fetched.
 
 ### 4.11 Sequence diagram (normative by illustration)
 
@@ -583,7 +596,7 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 | [0002-006] | Worker publish on another agent's event subject; expect bus permission denial (bus-mem fault test) | MUST |
 | [0002-007] | Start two Worker instances for one agent; expect presence conflict (RFC-0004) | MUST |
 | [0002-010] | Body tenant differs from subject tenant; expect `TENANT_MISMATCH` | MUST |
-| [0002-011] | Sender header differs from transport principal; expect `PERMISSION_DENIED` | MUST |
+| [0002-011] | `A2AB-Sender` differs from the delivered principal; expect `PERMISSION_DENIED` | MUST |
 | [0002-012] | Message from tenant A on tenant B subject; expect denial | MUST |
 | [0002-013] | Authorization header on bus; expect `MALFORMED_MESSAGE`; scan logs and events for secrets | MUST |
 | [0002-014] | Gateway-set origin honored from gateway sender only; same header from other sender ignored | MUST |
@@ -602,6 +615,7 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 | [0002-037] | JSON payload without debug flag; expect `UNSUPPORTED_MEDIA_TYPE` | MUST |
 | [0002-038] | Binary `Part.raw` round-trip byte-exact | MUST |
 | [0002-040] | Exactly one reply per request, duplicate reply ignored by client | MUST |
+| [0002-116] | Reply carries no `A2AB-Msg-Id` and carries `A2AB-Causation-Id` of the request | MUST |
 | [0002-041] | Event payload check: one of statusUpdate or artifactUpdate, no Task element | MUST |
 | [0002-042] | Events of one task strictly increasing seq from 1; no publish before ack | MUST |
 | [0002-043] | Duplicate seq ignored; seq gap triggers get and resubscribe | MUST |
@@ -623,9 +637,11 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 | [0002-071] | Request arriving after TTL not started; `REQUEST_EXPIRED` | MUST |
 | [0002-072] | Stale Ts beyond allowance rejected; future Ts ignored for staleness | MUST |
 | [0002-073] | Clock source unavailable; request not processed | MUST |
+| [0002-114] | Clock reading unavailable; expect `REQUEST_EXPIRED` and no processing | MUST |
 | [0002-080] | Missing `A2A-Version`; expect `VERSION_NOT_SUPPORTED`; `0.3` rejected | MUST |
 | [0002-081] | Required extension absent; expect `EXTENSION_SUPPORT_REQUIRED` | MUST |
 | [0002-082] | Service parameter `Tenant-Hint` maps to `A2AB-SP-tenant-hint`; oversize value rejected locally | MUST |
+| [0002-115] | Service parameter header `A2AB-SP-Tenant-Hint` read back as key `tenant-hint` | MUST |
 | [0002-083] | Unknown `urn:a2abus:ext:foo:2` not substituted by `:1` | MUST |
 | [0002-084] | Extension data only in metadata maps | MUST |
 | [0002-090] | Error reply carries exactly one ErrorInfo with correct domain | MUST |
@@ -634,15 +650,18 @@ A card fragment for the `omp` agent in the per-tenant KV bucket (RFC-0004, L6):
 | [0002-093] | No-responder maps to UNAVAILABLE locally; timeout to DEADLINE_EXCEEDED | MUST |
 | [0002-094] | Overload in bus-mem fault mode: task REJECTED recorded, or OVERLOADED with RetryInfo | MUST |
 | [0002-095] | Error payload scan contains no request body or path | MUST |
+| [0002-117] | Binary error reply to a binary request; JSON reply in the request's encoding to a debug-mode JSON request | MUST |
 | [0002-100] | Card includes bus entry with correct URI, version and tenant | MUST |
 | [0002-101] | Card with userinfo in `url` rejected by card check | MUST |
 | [0002-102] | Hermes client selects JSONRPC entry from a card with bus entry first | SHOULD |
 | [0002-103] | Capability flags match served operations | MUST |
 | [0002-104] | Unsigned card rejected for cross-host use (RFC-0007 test) | MUST |
-| [0002-110] | Payload just above inline limit with blob reference accepted; without it refused | MUST |
+| [0002-110] | Payload just above 262144 bytes with blob reference accepted; without it refused | MUST |
 | [0002-111] | Blob URL form and hash match content | MUST |
-| [0002-112] | Corrupted blob fails verification; cross-tenant reference rejected | MUST |
+| [0002-112] | Corrupted blob fails digest verification and is discarded; cross-tenant reference rejected | MUST |
 | [0002-113] | Oversize payload without reference: `PAYLOAD_TOO_LARGE`, no truncation | MUST |
+| [0002-118] | Blob reference with bad form or digest mismatch; expect `MALFORMED_MESSAGE` | MUST |
+| [0002-119] | Blob reference naming another tenant; expect `PERMISSION_DENIED` and no fetch | MUST |
 | [0002-085] | Bus card with `securitySchemes` or `security` rejected by card check | MUST |
 | [0002-086] | Breaking wire change published under the old binding URI; expect a new URI | MUST |
 | [0002-087] | `historyLength` 0 returns no history and omits the field; N returns at most N messages | MUST |
@@ -660,6 +679,6 @@ Levels: MUST = required for any conformant bus binding; SHOULD = recommended, fa
 - **O-4 Task ownership across Worker restarts.** A new Worker instance for the same agent id after failover. Default: not supported in M1; the agent id is down until its Worker returns (section 4.1 [0002-007]). RFC-0004 owns failover.
 - **O-5 Origin identity for delegated calls.** The original external caller behind a gateway request is not carried on the bus. Default: `A2AB-Sender` is the gateway; original identity travels only as signed delegation data defined by RFC-0007.
 - **O-6 Event retention figure.** Default: the event stream max age is the greater of 7 days and T_task + 24 hours (RFC-0010 [0010-027]; section 4.5 [0002-046]). Non-terminal events may age out before the task ends; `get` is then authoritative and the requester re-subscribes for the snapshot (section 4.5.2 [0002-063]).
-- **O-7 Inline size limit.** Default: 256 KiB (section 4.10). Tuned after measurement in RFC-0014.
-- **O-8 Clock allowance.** Default: 30 s (section 4.6). Configurable per deployment.
+- **O-7 Inline size limit.** Default: 262144 bytes (256 KiB, section 4.10). The bus limit may lower it; configuration never raises it. Tuned after measurement in RFC-0014, downward only.
+- **O-8 Clock allowance.** Default: fixed 30 s added to the Ttl (section 4.6). It is not a per-deployment setting (RFC-0005 [0005-027] relies on the same value).
 - **O-9 Consumer reads on the bus.** Default: the NATS binding MUST provide durable consumer reads on ev subjects before M1 exit. RFC-0010 [0010-060] lists this as an M1 gap. Until it closes, `stream` and `subscribe` cannot be tested end to end (section 4.5 [0002-043], [0002-053], [0002-060], [0002-061]). The wire contract does not change to work around it.

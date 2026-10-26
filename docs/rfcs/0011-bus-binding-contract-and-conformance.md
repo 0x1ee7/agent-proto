@@ -61,17 +61,17 @@ Terms below are not defined in RFC-0001.
 
 ### 4.2 Operations
 
-[0011-010] `publish(subject, headers, payload) -> PublishAck`: append-or-send a message. For a durable subject, `PublishAck` MUST NOT be returned until the message is stored in a durable stream. A binding MUST report the stream sequence it assigned.
+[0011-010] `publish(subject, headers, payload) -> PublishAck`: append-or-send a message. For a durable subject, `PublishAck` MUST NOT be returned until the message is stored in a durable stream. A binding MUST report the stream sequence it assigned. A binding MUST expose a kill-before-ack injection (`kill_before_ack`, [0011-061]) that stops the binding after the message is stored and before the `PublishAck` is returned; the caller then receives `Timeout` or `Unavailable`, never success ([0011-064]). A binding that declares `partition_tolerant` MAY expose this behaviour as part of its partition faults instead.
 
 [0011-011] `request(subject, headers, payload, timeout) -> Reply`: send a message and receive exactly one reply or an error. The result is one of `Reply(headers, payload)`, `NoResponder`, `Timeout`, or a `BusError` (section 4.6).
 
-[0011-012] `serve(subject_pattern) -> RequestStream`: receive requests for a subject pattern. Each request exposes its headers, payload and a single-use reply handle. Replying more than once MUST be rejected by the binding.
+[0011-012] `serve(subject_pattern) -> RequestStream`: receive requests for a subject pattern. Each request exposes its headers, payload, principal ([0011-092]) and a single-use reply handle. The handle is single-use by type: replying consumes it, so a second reply does not compile. A binding MUST NOT offer any other path that sends a second reply to one request.
 
-[0011-013] `append(stream, subject, headers, payload, msg_id) -> PublishAck`: publish into a durable stream with a message id. A binding MUST reject a second append with the same `msg_id` made within the stream's dedupe window with `Duplicate(original_seq)`, and MUST NOT store a second copy.
+[0011-013] `append(stream, subject, headers, payload, msg_id) -> PublishAck`: publish into a durable stream with a message id. A binding MUST reject a second append with the same `msg_id` made within the stream's dedupe window with `Duplicate(original_seq)`, and MUST NOT store a second copy. An append to a subject that the named stream does not capture MUST fail with `Absent`.
 
-[0011-014] `consume(stream, consumer_name, filter, start) -> Consumer`: create or attach a named durable consumer. `start` is one of `from_seq(n)`, `from_first`, `new_only`. A consumer MUST deliver messages with stream sequence at or after `from_seq(n)` and MUST NOT silently skip retained messages.
+[0011-014] `consume(stream, consumer_name, filter, start) -> Consumer`: create or attach a named durable consumer. `start` is one of `from_seq(n)`, `from_first`, `new_only`. A consumer MUST deliver messages with stream sequence at or after `from_seq(n)` and MUST NOT silently skip retained messages. The filter and `start` are fixed when the consumer is created. A later `consume` on an existing consumer resumes it with its original filter, and the binding MUST NOT apply a different filter to it.
 
-[0011-015] `Consumer::next() -> Delivery`: each delivery exposes headers, payload, the stream sequence and a delivery attempt counter. The consumer then calls exactly one of `ack()`, `nak(delay)`, or `term()`. A delivery left unacknowledged for longer than the consumer's `ack_wait` MUST be redelivered (at-least-once, D3).
+[0011-015] `Consumer::next() -> Delivery`: each delivery exposes headers, payload, the stream sequence and a delivery attempt counter. The consumer then calls exactly one of `ack()`, `nak(delay)`, or `term()`. `ack()` and `term()` both settle the delivery so that it is never redelivered; the contract defines no dead-letter behaviour for `term()`, and a binding MAY implement `term()` as `ack()`. `in_progress()` extends the ack deadline to now plus `ack_wait`; the delivery stays invisible to other consumers until then. A delivery left unacknowledged for longer than the consumer's `ack_wait` MUST be redelivered (at-least-once, D3).
 
 [0011-016] `kv_put(bucket, key, value, ttl) -> Revision`, `kv_get(bucket, key) -> Entry | Absent`, `kv_create(bucket, key, value, ttl) -> Revision | Conflict` (only if absent), `kv_update(bucket, key, value, expected_revision, ttl) -> Revision | Conflict` (compare-and-set), `kv_delete(bucket, key, expected_revision?)`, `kv_watch(bucket, prefix, start) -> Watch`. A key with a `ttl` MUST disappear from `kv_get` and `kv_watch` after that interval without a delete being issued by the writer. A write that re-creates a key whose previous entry expired, was deleted or was purged MUST apply its `ttl` on that same write, and MUST be fenced by the revision of the marker that the expiry or delete left behind. A binding MUST NOT silently drop the `ttl` on such a re-create (RFC-0010 [0010-031] documents the NATS case).
 
@@ -129,7 +129,7 @@ Terms below are not defined in RFC-0001.
 
 [0011-034] The M1 profile `a2a-bus-m1` requires: `headers`, `request_reply`, `no_responder_signal`, `durable_streams`, `dedupe_window >= 3630 s`, `replay_from_seq`, `ordered_per_subject`, `max_message_size >= 262144`, `kv`, `kv_ttl`, `kv_snapshot_end`, `blob_store`. `partition_tolerant` is recommended, not required, in M1 (section 9 O-2).
 
-[0011-035] A process MUST evaluate its declared profile against the binding's capabilities at start. If a required capability is absent, or a declared value is below the profile minimum, the process MUST refuse to start and MUST log the missing capability by name. It MUST NOT start in a degraded mode that skips the missing feature (T11, fail closed).
+[0011-035] A process MUST evaluate its declared profile against the binding's capabilities at start. If a required capability is absent, or a declared value is below the profile minimum, the binding's constructor MUST return an error that names the missing capability. The process MUST refuse to start and MUST log the missing capability by name. It MUST NOT start in a degraded mode that skips the missing feature (T11, fail closed).
 
 [0011-036] A process MUST NOT use a feature that its profile does not require, and a binding MUST NOT advertise a feature in order to pass the profile check.
 
@@ -145,11 +145,13 @@ Terms below are not defined in RFC-0001.
 
 [0011-043] A binding MUST NOT include secret material (credentials, key material, bearer tokens) in any error, log record, watch event or diagnostic that it produces (RFC-0002 [0002-013], T5).
 
-[0011-044] The binding MUST report permission denials as `PermissionDenied` (section 4.6) without revealing whether the denied subject, bucket or digest exists in another tenant.
+[0011-044] The binding MUST report permission denials as `PermissionDenied` (section 4.6) without revealing whether the denied subject, bucket or digest exists in another tenant. The error taxonomy is the only channel through which a caller observes a denial; the contract defines no denial callback or log for callers. Binding-level audit of denials (for example RFC-0010 [0010-065]) is outside this contract.
+
+[0011-092] Every request and every delivery that a binding hands to a caller carries the principal of its transport peer, as authenticated by the binding. The binding derives it; the sender cannot set it, and neither headers nor payload can carry it. The binding MUST NOT deliver a request or delivery without a principal. The in-memory binding uses the identity the caller is registered under. RFC-0010 [0010-066] states how the NATS binding derives it. RFC-0002 [0002-011] depends on this rule.
 
 ### 4.6 Error taxonomy
 
-[0011-050] Every bus operation returns either its success value or one of the following errors. A binding MUST NOT return an untyped error to a caller of this contract.
+[0011-050] Every bus operation returns either its success value or one of the following errors. A binding MUST NOT return an untyped error to a caller of this contract. `DuplicateInProgress` and `Internal` are produced only from a binding's own internal state, never by a caller's request; a binding that cannot produce a variant reports that variant's trigger test as `not_applicable` with the reason ([0011-081]).
 
 | Error | Retryable | Meaning | RFC-0002 mapping (section 4.8 there) |
 |---|---|---|---|
@@ -162,7 +164,7 @@ Terms below are not defined in RFC-0001.
 | `Duplicate { original_seq }` | no (success for the caller) | `append` dedupe hit | not on wire; the Worker treats it as already stored |
 | `DuplicateInProgress` | yes, after backoff | the same `msg_id` is being stored | `DUPLICATE_IN_PROGRESS` |
 | `Conflict { current_revision }` | caller decides | CAS or create failed | not on wire; Worker re-reads and retries (RFC-0005) |
-| `Absent` | no | key or blob does not exist | not on wire; `TASK_NOT_FOUND` when a task record is missing |
+| `Absent` | no | key, blob, or stream capture for the subject does not exist; an `append` to a subject that the named stream does not capture returns `Absent` ([0011-013]) | not on wire; `TASK_NOT_FOUND` when a task record is missing |
 | `Corrupt { digest }` | no | blob bytes do not match digest | `INVALID_AGENT_RESPONSE` for artifact references (RFC-0002 [0002-112]) |
 | `Unsupported { capability }` | no | operation needs a capability the binding does not declare | not on wire; startup error |
 | `Internal` | yes, with backoff | binding fault, detail not exposed | `INTERNAL` locally |
@@ -177,7 +179,7 @@ Terms below are not defined in RFC-0001.
 
 [0011-060] The contract is defined under the following faults: message loss, duplication, reordering across subjects, delay, consumer crash between delivery and ack, binding restart, and network partition between a process and the bus or between bus replicas.
 
-[0011-061] `bus-mem` (R-F4) MUST implement the contract in process and MUST expose fault injection with these switches: `drop(p)`, `duplicate(p)`, `reorder(window)`, `delay(distribution)`, `partition(set_a, set_b)`, `restart_bus()`, `crash_consumer(name)`. Each switch MUST be deterministic under a seed.
+[0011-061] `bus-mem` (R-F4) MUST implement the contract in process and MUST expose fault injection with these switches: `drop(p)`, `duplicate(p)`, `reorder(window)`, `delay(distribution)`, `partition(set_a, set_b)`, `restart_bus()`, `crash_consumer(name)`, `kill_before_ack()` ([0011-010]). Each switch MUST be deterministic under a seed. The switches are the synchronous control surface of `bus-api` (Appendix A).
 
 [0011-062] Under `duplicate`, `drop` and `reorder`, the in-memory binding MUST still satisfy sections 4.3 and 4.6 as they apply to its declared capabilities. Faults change timing and multiplicity, never the error taxonomy or the stored content.
 
@@ -199,7 +201,7 @@ Terms below are not defined in RFC-0001.
 
 [0011-081] A binding declares its result as a conformance report: the profile tested, the binding name and version, the capability values, and, per requirement ID, `pass`, `fail` or `not_applicable` with the reason. A report MUST be reproducible from the seed it records.
 
-[0011-082] A binding MUST NOT claim conformance to a profile if any required requirement of that profile is `fail`. A `not_applicable` result is allowed only where the capability is not declared.
+[0011-082] A binding MUST NOT claim conformance to a profile if any required requirement of that profile is `fail`. A `not_applicable` result is allowed only where the capability is not declared, or where [0011-050] makes a variant unreachable from outside the binding.
 
 [0011-083] The report is an artifact of the M1 plan (RFC-0014). Its format is defined by the `a2a-conformance` crate, not by this RFC.
 
@@ -267,12 +269,12 @@ The suite is organized in levels. Each requirement belongs to exactly one level.
 | [0011-001] | Compile-time check: no technology types exposed to core crates | C |
 | [0011-002] | Trait method set matches section 4.2 names for the profile | C |
 | [0011-003] | Subjects and headers round-trip byte-exact through the binding | C |
-| [0011-010] | Publish returns ack with stream sequence only after store; kill before ack, no ack returned | D |
+| [0011-010] | Publish returns ack with stream sequence only after store; kill_before_ack: caller gets `Timeout` or `Unavailable`, never success | D |
 | [0011-011] | Request with a server returns one reply; no server returns `NoResponder` promptly | C |
-| [0011-012] | Second reply on one handle is rejected | C |
-| [0011-013] | Second append with the same msg_id inside window returns `Duplicate`; one stored message | D |
-| [0011-014] | Consumer from seq n sees all retained messages from n in order | D |
-| [0011-015] | Unacked delivery redelivered after ack_wait; nak delays; term stops | D |
+| [0011-012] | Single-use reply is a compile-time property (`ReplyHandle::reply` consumes the handle; compile-fail check); distinct requests get distinct replies at run time | C |
+| [0011-013] | Second append with the same msg_id inside window returns `Duplicate`; one stored message; append to an uncaptured subject returns `Absent` | D |
+| [0011-014] | Consumer from seq n sees all retained messages from n in order; a second consume with another filter keeps the original filter | D |
+| [0011-015] | Unacked delivery redelivered after ack_wait; nak delays; ack and term stop redelivery; in_progress extends deadline to now + ack_wait | D |
 | [0011-016] | CAS conflict returns `Conflict`; TTL key absent after interval without delete; re-create after expiry or purge carries the TTL and is fenced by the marker revision | K |
 | [0011-017] | Digest mismatch from storage returns `Corrupt`, bytes never returned | B |
 | [0011-018] | Capabilities stable across calls | C |
@@ -289,15 +291,16 @@ The suite is organized in levels. Each requirement belongs to exactly one level.
 | [0011-032] | `max_message_size` at least 262144 bytes after framing; 262145 rejected with `PayloadTooLarge` | C |
 | [0011-033] | Each declared partition_tolerant claim passes level P tests | P |
 | [0011-034] | Profile check passes for complete binding; each required capability removed in turn fails startup | C |
-| [0011-035] | Startup with a missing or undersized capability exits non-zero and names the capability | C |
+| [0011-035] | Startup with a missing or undersized capability: constructor returns an error naming the capability; process exits non-zero | C |
 | [0011-036] | Process that does not need a feature does not probe for it; no capability advertised without implementation | C |
 | [0011-037] | Profile names in configuration are validated against the registry | C |
-| [0011-040] | Operation without principal rejected; principal visible in permission log | T |
+| [0011-040] | Operation without principal rejected; denial observable only as `PermissionDenied` | T |
 | [0011-041] | Publish and consume denial per subject and stream; allowed paths succeed | T |
 | [0011-042] | Cross-tenant KV watch, KV get, blob get with known digest all denied | T |
 | [0011-043] | Injected credential-like values absent from errors, logs and watch events | T |
 | [0011-044] | Denied subject and absent subject return indistinguishable errors | T |
-| [0011-050] | Each error variant produced by its trigger; no untyped error type | C |
+| [0011-092] | Each request and delivery carries the principal of its transport peer; a forged header or payload does not change it | T |
+| [0011-050] | Each error variant produced by its trigger; variants a caller cannot trigger (`DuplicateInProgress`, `Internal`) reported `not_applicable` with reason; no untyped error type | C |
 | [0011-051] | Duplicate on append treated as success by the caller helper | D |
 | [0011-052] | Conflict never resolved by overwrite | K |
 | [0011-053] | Transport error during append retried with same msg_id; dedupe holds | D |
@@ -356,6 +359,15 @@ pub trait Consumer: Send {
     async fn term(&self) -> Result<(), BusError>;
 }
 
+// Abridged. bus-api::control defines the full trait. The switches of [0011-061],
+// including kill_before_ack, are set through set_fault.
+pub trait BusControl: Send + Sync {
+    fn advance(&self, by: Duration);
+    fn set_fault(&self, fault: Fault);
+    fn restart_bus(&self);
+    fn crash_consumer(&self, stream: &StreamName, consumer: &ConsumerName) -> bool;
+}
+
 pub enum BusError {
     NoResponder,
     Timeout,
@@ -373,4 +385,4 @@ pub enum BusError {
 }
 ```
 
-`Delivery` carries headers, payload, stream sequence, attempt count, and `ack`, `nak(delay)`, `term` methods. The types `Subject`, `Headers`, `MsgId`, `Digest` and `Revision` are defined by `bus-api` and are not repeated here.
+`Delivery` carries headers, payload, the principal that published it ([0011-092]), stream sequence, attempt count, and `ack`, `nak(delay)`, `term` and `in_progress` methods; `in_progress` extends the ack deadline to now plus `ack_wait` ([0011-015]). `Request` carries headers, payload, the principal ([0011-092]) and a single-use reply handle ([0011-012]). The types `Subject`, `Headers`, `MsgId`, `Digest` and `Revision` are defined by `bus-api` and are not repeated here.

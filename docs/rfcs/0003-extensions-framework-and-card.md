@@ -83,6 +83,8 @@ Terms from RFC-0001 sec 4.4 are used as defined there. New terms:
 
 [0003-009] A caller that wants an extension applied MUST list its URI in the `A2A-Extensions` header of the bus request. The header is the A2A name, unprefixed (RFC-0001 L2), value is a comma-separated list of URIs with optional spaces, and it MUST NOT be repeated across multiple header lines.
 
+[0003-053] A receiver MUST ignore an entry in `A2A-Extensions` equal to the binding URI `urn:a2abus:binding:bus:1`. Such an entry activates nothing and is not an error.
+
 [0003-010] A receiver MUST apply data under a URI only if that URI is activated on the request. Data under a non-activated URI MUST be ignored and MUST NOT cause a failure.
 
 [0003-011] A receiver that applies one or more extensions MUST echo the URIs it applied in the `A2A-Extensions` header of the reply, in any order. The reply MUST NOT list a URI that was not applied.
@@ -483,6 +485,7 @@ Attack descriptions are kept generic on purpose. No attack payloads are included
 | 0003-007 | Secret and path scan of params; params size under 4 KiB. | MUST |
 | 0003-008 | Send data under an activated URI and a non-activated URI; only the first is applied. | MUST |
 | 0003-009 | Header parse: comma and space separated values; repeated header lines rejected. | MUST |
+| 0003-053 | Send `A2A-Extensions: urn:a2abus:binding:bus:1` with a request; request succeeds, no extension is applied, and the reply header does not list it. | MUST |
 | 0003-010 | Non-activated data is ignored, request succeeds. | MUST |
 | 0003-011 | Reply header lists exactly the applied URIs. | MUST |
 | 0003-012 | Carrier check for each URI (request, status, artifact, event). | MUST |

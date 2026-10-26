@@ -41,7 +41,7 @@ Terms not defined in RFC-0001:
 - **Workspace**: the directory tree a mutating agent uses as its working directory. It is either a git worktree or a copy-mode tree with a private baseline commit.
 - **Session workspace**: one workspace per worker process lifetime (`mode = "per-session"`).
 - **Task workspace**: one workspace per task id (`mode = "per-task"`).
-- **Shared checkout**: any two working directories where one equals, contains, or is contained by the other.
+- **Shared checkout**: two working directories where one equals, contains, or is contained by the other. Two session workspaces made from one operator checkout are separate worktrees and are not a shared checkout (0012-031).
 - **Lifeline**: on Linux, the pipe from supervisor to worker whose EOF means the supervisor is gone.
 - **Run record**: a small file under `run/` holding the process id, process group or job name, and process start time of a child, used for stale-tree reaping.
 - **Operator**: the human-facing identity (default id `tui`) whose Ed25519 key (RFC-0007) signs approval decisions.
@@ -214,15 +214,38 @@ The workspace root is `<state_dir>\ws` on Windows and `<state_dir>/ws` on Linux.
 - [0012-028] MUST give every `kind = "worker"` agent a workspace. Default `workspace.mode = "per-session"` (D12). Gateway and external kinds have none.
 - [0012-029] MUST allow `workspace.mode = "per-task"` as explicit opt-in per agent; the workspace is created when a task starts and removed by the rules in 035.
 - [0012-030] MUST ensure a mutating worker's working directory (`{workspace}`, `A2AB_WORKSPACE`) is a git worktree or copy-mode workspace created by `a2a-workspace`. The operator's checkout MUST NOT be a working directory of any worker (L16, M1-5).
-- [0012-031] MUST refuse to start an agent whose workspace equals, contains, or is contained by any other running agent's workspace or by the operator's `repo`. Paths are compared canonically (symlinks and junctions resolved, `\\?\` prefix removed, case-insensitive on Windows). Reason code: `shared_checkout`.
+- [0012-031] MUST refuse to start an agent with reason `shared_checkout`, before any lock or workspace is created (the registry mutex of 0012-071 is taken for the check and released on return), when: its workspace overlaps the operator's `repo` (equal, contains, or contained; this includes a workspace root inside `repo`); its workspace overlaps another live lease's workspace or `repo`; or its `repo` contains another live lease's workspace. The same session or task key leased by another live process is refused too. Two agents or sessions on one `repo` are allowed: each gets its own worktree and branch under the root, and those workspaces do not overlap. Paths are compared canonically (symlinks and junctions resolved, `\\?\` prefix removed, case-insensitive on Windows).
 - [0012-032] MUST create worktrees with `git -C <repo> worktree add -b <branch> <path> <base_ref>`; `base_ref` defaults to `HEAD`. The supervisor MUST NOT push, fetch, or run any remote operation, and MUST NOT check out or reset the operator's branches.
-- [0012-033] MUST serialize mutating tasks on one per-session workspace: two non-terminal tasks MUST NOT run in the same checkout at the same time. Per-task workspaces are independent and MAY run in parallel.
+- [0012-033] MUST serialize the tasks of one per-session workspace: two non-terminal tasks of one session MUST NOT run in that workspace at the same time, whether or not either one mutates it. Per-task workspaces are independent and MAY run in parallel.
 - [0012-034] MUST refuse a non-git directory when `non_git = "refuse"` (the default). When `non_git = "copy"`, the supervisor MUST copy the tree into the workspace, run `git init`, and commit a baseline; it MUST reject symlinks and Windows reparse points, and MUST stop with reason `copy_limit` above 2 GiB or 100000 files.
 - [0012-035] MUST, when a workspace is no longer needed (per-task at task terminal; per-session at worker stop), remove the worktree and its branch if the worktree has no uncommitted changes, no untracked files, and no commits beyond `base_ref`. Otherwise MUST retain it and record it as retained in `ws/index.json` with the reason. Removal failure (for example a Windows file lock) MUST be retried at the next start and MUST NOT delete a retained workspace silently.
 - [0012-036] MUST enforce retention: retained workspaces are deleted oldest first when they are older than 14 days or when the retained total exceeds 20 GiB. A workspace referenced by a non-terminal task MUST NOT be deleted.
 - [0012-037] MUST, on Windows, pass `-c core.longpaths=true` to every git invocation that touches a worktree and MUST refuse to create a workspace whose root path is longer than 180 characters, with reason `path_too_long`. The supervisor MUST NOT assume `LongPathsEnabled` is set on the host.
 - [0012-038] SHOULD keep the Windows workspace root short (`<state_dir>\ws`) so that typical repository paths fit within the 180-character budget of 037.
 - [0012-039] MUST run git with an explicit argv (no shell), `GIT_TERMINAL_PROMPT=0`, and a fixed working directory. Git output is parsed, never executed.
+- [0012-067] MUST report the workspace refusals and losses below with exactly these tokens (the table after 0012-072). An acquire of the session workspace at worker start is start-time: a refusal stops the start and creates no task. An acquire of a per-task workspace, or any use or release of a lease while a task exists, is task-time: the task fails as `WORKSPACE_FAILED` with detail token (RFC-0005 [0005-053]). The table gives the meaning and time of each token.
+- [0012-068] MUST NOT count ignored files as dirty. The removal check of 035 considers tracked modifications and untracked files that are not ignored. A clean worktree with ignored files is removed with them.
+- [0012-069] MUST allow a start from an operator checkout with uncommitted or untracked changes; this is not an error. A worktree starts from `base_ref` and does not contain those changes; the lease records `source_dirty`. A copy starts from the source tree as it is at acquire, and its baseline commit records that state.
+- [0012-070] MUST give every task of a session the session workspace. While the session's lease is live, further acquires by the same process for that session key return the same path and branch.
+- [0012-071] MUST wait up to 30 seconds for the workspace registry mutex on acquire. On timeout the acquire MUST fail with `workspace_busy` and create no path, lock or branch.
+- [0012-072] MUST refuse to acquire while a lease lock file or the registry mutex holds content that cannot be parsed; the failure is `state_invalid`. The supervisor MUST NOT overwrite or delete that file; recovery is manual.
+
+| Token | Meaning | Start-time or task-time |
+|---|---|---|
+| `non_git_refused` | Source is not a git checkout and `non_git = "refuse"` (034) | Start or task (acquire) |
+| `copy_link_rejected` | Copy mode met a symlink, junction, reparse point or special file (034) | Start or task (acquire) |
+| `path_occupied` | Workspace path exists and no live lease owns it | Start or task (acquire) |
+| `branch_exists` | Lease branch exists with commits beyond `base_ref`; it is not replaced | Start or task (acquire) |
+| `lease_lost` | Caller does not hold the lease on release, or the leased workspace is missing | Task (use or release of a live lease) |
+| `workspace_busy` | Registry mutex not acquired within 30 s (071) | Start or task (acquire) |
+| `state_invalid` | A lock file, the registry mutex or `ws/index.json` cannot be parsed (072) | Start or task (acquire or use) |
+| `path_escape` | A path contains `..`, a removal target is a link, or it lies outside the workspace root | Task (removal); start (root check) |
+| `config` | Invalid path or setting, source not a directory, scope or mode mismatch, or session leased from another source or kind | Start (before any task); task if raised by a per-task acquire |
+| `shared_checkout` | Workspace overlaps the operator `repo` or another live lease (031) | Start (before any lock or workspace); task if raised by a per-task acquire |
+| `copy_limit` | Copy mode above 2 GiB or 100000 files (034) | Start or task (acquire) |
+| `path_too_long` | Workspace root above 180 characters on Windows (037) or store path refused at start (066) | Start or task (acquire) |
+| `git_failed` | A git command failed or its output could not be parsed (039) | Start or task (acquire, use or release) |
+| `io` | A filesystem operation on a workspace, lease or registry file failed | Start or task (acquire, use or release) |
 
 ### 4.9 Artifacts and diffs
 
@@ -374,9 +397,9 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 | 0012-028 | Worker config without workspace gets per-session default; gateway has none | Unit |
 | 0012-029 | `per-task` creates one worktree per task id | Integration |
 | 0012-030 | Worker cwd equals operator repo path is refused | Unit |
-| 0012-031 | Nested and equal paths, junction and case variants on Windows, are refused with `shared_checkout` | Unit (Windows and Linux) |
+| 0012-031 | Nested and equal paths, junction and case variants on Windows, are refused with `shared_checkout`; two sessions on one repo start in separate worktrees | Unit (Windows and Linux) |
 | 0012-032 | Branch name matches `a2abus/<agent>/<short-id>`; no remote operations are issued (git argv recorded) | Integration |
-| 0012-033 | Two mutating tasks on one per-session workspace do not overlap (timing trace) | Integration |
+| 0012-033 | Two non-terminal tasks on one per-session workspace do not overlap, whether or not they mutate (timing trace) | Integration |
 | 0012-034 | Non-git dir refused by default; copy mode rejects symlink and reparse point; 2 GiB limit enforced | Integration (Windows and Linux) |
 | 0012-035 | Clean worktree removed with branch; dirty worktree retained and indexed | Integration |
 | 0012-036 | Retention removes oldest first by age and total size; never deletes a non-terminal task's workspace | Integration |
@@ -410,6 +433,12 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 | 0012-064 | nats-server exits 0 on CTRL_BREAK in its own process group; TerminateProcess leaves exit 1; claude CTRL_BREAK exit 0xC000013A is not graceful | Integration (Windows) |
 | 0012-065 | icacls grant on a fixture file leaves only the user ACE | Integration (Windows) |
 | 0012-066 | `LongPathsEnabled` 0 with a 300-character store path refuses with `path_too_long` | Unit (Windows) |
+| 0012-067 | Each failure in the table after 0012-072 is reported with its listed token | Unit |
+| 0012-068 | Worktree with only ignored files is removed with them; one with an untracked non-ignored file is retained; copy baseline commit contains an ignored file | Integration |
+| 0012-069 | Start from a checkout with uncommitted and untracked changes succeeds; worktree lacks them; lease records `source_dirty` | Integration |
+| 0012-070 | Two acquires for one session key from one process return the same path and branch; a second task reuses the workspace | Unit |
+| 0012-071 | Registry mutex held by a live process: acquire returns `workspace_busy` after 30 s and creates no path, lock or branch | Integration (Windows and Linux) |
+| 0012-072 | Unparseable lease lock blocks acquire with `state_invalid`; file bytes unchanged | Unit |
 
 ## 9. Open issues
 

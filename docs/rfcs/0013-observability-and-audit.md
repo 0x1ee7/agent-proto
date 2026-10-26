@@ -47,7 +47,7 @@ Terms not defined in RFC-0001:
 - [0013-005] MUST write `time` as RFC 3339 UTC with millisecond precision and a trailing `Z` (for example `2026-10-26T09:14:03.218Z`). Clock source is the emitter's system clock; no clock correction is applied to already-written events.
 - [0013-006] MUST emit each fact from the component that observed it. The supervisor MAY emit process facts about agents it runs. No component emits facts about another component's internal state. A component MUST NOT publish under another emitter's subject.
 - [0013-007] MUST use only the enum values in table 4.2. Consumers MUST keep events whose `type` they do not recognise (store the canonical JSON as is) and MUST NOT fail on them.
-- [0013-008] MUST restrict `details` to the keys listed for the type in table 4.2. `details` values MUST be strings, booleans, or arrays of strings or objects, and MUST NOT be `number` for values that can exceed 2^53 (encode such values as decimal strings).
+- [0013-008] MUST restrict `details` to the keys listed for the type in table 4.2. `details` values MUST be strings, booleans, or arrays or objects whose members follow the same rules. Numbers and nulls MUST be refused. Every integer (counts, sequence numbers, sizes, budget amounts) MUST be a decimal string, for example `"first_seq": "42"`.
 
 Table 4.2: event types, emitter, and `details` keys (all keys optional unless marked *).
 
@@ -57,14 +57,14 @@ Table 4.2: event types, emitter, and `details` keys (all keys optional unless ma
 | `AGENT_STOPPED` | supervisor | `reason` (`graceful`, `forced`, `exited_during_drain`), `exit_code` |
 | `AGENT_RESTARTED` | supervisor | `attempt`, `backoff_ms`, `previous_reason` |
 | `AGENT_ABANDONED` | supervisor | `failures_in_window`, `window_s` |
-| `AGENT_PRESENCE_CHANGED` | worker | `from_state`, `to_state` (RFC-0004 presence states) |
+| `AGENT_PRESENCE_CHANGED` | worker (050) | `from_state`, `to_state` (RFC-0004 presence states) |
 | `DANGEROUS_MODE_ACTIVE` | supervisor | `approval_mode`, `reason` (RFC-0012 sec 4.10) |
 | `START_REFUSED` | supervisor | `reason` (`credential_acl`, `shared_checkout`, `path_too_long`, `config`) |
 | `TASK_SUBMITTED` | worker | `origin` (`gateway`, `bus-local`, `operator`), `peer` (configured name only) |
 | `TASK_STATE_CHANGED` | worker | `from_state`*, `to_state`* (RFC-0005 `TASK_STATE_*` values), `seq` (RFC-0005 task sequence) |
 | `TASK_CANCEL_REQUESTED` | worker | `requested_by` (`operator`, `peer`, `supervisor`) |
 | `DELEGATION_ISSUED` | worker | `to_agent`*, `budget_remaining_hop`, `depth` (RFC-0006 chain) |
-| `APPROVAL_REQUESTED` | worker | `request_id`*, `tool`, `risk_tier`, `expires_at` |
+| `APPROVAL_REQUESTED` | worker | `request_id`*, `tool`, `risk_tier`, `expires_at`, `args_summary` (R-A2, 023) |
 | `APPROVAL_DECIDED` | worker | `request_id`*, `decision` (`approve_once`, `approve_task`, `deny`, `expired`), `decision_id`, `signature_status` (`verified`, `unsigned`, `failed`), `key_id` |
 | `BUDGET_DEBITED` | worker | `budget_kind`*, `amount`*, `remaining` (decimal strings) |
 | `BUDGET_TRIPPED` | worker | `budget_kind`*, `limit`, `reason` (RFC-0006) |
@@ -72,17 +72,17 @@ Table 4.2: event types, emitter, and `details` keys (all keys optional unless ma
 | `SIGNATURE_FAILED` | worker or gateway | `component`*, `key_id`, `reason` (`unknown_key`, `bad_signature`, `expired_key`) |
 | `PEER_REJECTED` | gateway | `reason` (`auth`, `rate_limited`, `untrusted_peer`, `payload_too_large`), `peer` (configured name), `count` (coalesced, sec 4.11) |
 | `WORKSPACE_CREATED` | worker | `mode`, `kind` (`worktree`, `copy`), `base_commit` |
-| `WORKSPACE_RETAINED` | worker or supervisor | `reason` |
-| `WORKSPACE_REMOVED` | worker or supervisor | `reason` |
-| `WORKSPACE_REFUSED` | worker or supervisor | `reason` (RFC-0012 codes) |
+| `WORKSPACE_RETAINED` | worker or supervisor (050) | `reason` |
+| `WORKSPACE_REMOVED` | worker or supervisor (050) | `reason` |
+| `WORKSPACE_REFUSED` | worker or supervisor (050) | `reason` (RFC-0012 codes) |
 | `OPERATOR_ACTION` | tui or cli | `action` (`approve_once`, `approve_task`, `deny`, `cancel`, `start`, `stop`), `decision_id`, `outcome` (`acked`, `unknown`, `rejected`) |
-| `REDACTION_APPLIED` | emitter of the task | `rules` (rule ids and counts, no content) |
-| `AUDIT_GAP` | emitter | `first_seq`*, `last_seq`* (events dropped from spool overflow, sec 4.4) |
-| `AUDIT_CHECKPOINT` | supervisor | `emitters` (object: emitter to `seq` and `chain_hash`), `signed_at` |
+| `REDACTION_APPLIED` | worker or gateway (050) | `rules` (JSON object: rule id to count as decimal string; no content, 046) |
+| `AUDIT_GAP` | emitter | `first_seq`*, `last_seq`* (decimal strings; one per contiguous discarded range, 015) |
+| `AUDIT_CHECKPOINT` | supervisor | `emitters` (object: emitter name to `{"seq": decimal string, "chain_hash": 64 lowercase hex}`), `signed_at` (RFC 3339 UTC, 027) |
 | `CARD_DECOMMISSIONED` | worker | `agent_id`* |
 | `TASK_TRANSITION_REFUSED` | worker | `task_id`*, `from_state`*, `attempted_state`* (RFC-0005 [0005-006]) |
 | `LATE_OUTPUT_DROPPED` | worker | `task_id`*, `state`* (RFC-0005 [0005-007]) |
-| `SUBMISSION_DROPPED` | worker | `message_id`*, `reason` (`stale_receipt`) (RFC-0005 [0005-027]) |
+| `SUBMISSION_DROPPED` | worker (050) | `message_id`*, `reason` (`stale_receipt`) (RFC-0005 [0005-027]) |
 | `APPROVAL_FLOOD` | worker | `task_id`*, `open_count`* (RFC-0006 [0006-022]) |
 | `APPROVAL_NOT_APPLICABLE` | worker | `request_id`*, `reason` (RFC-0006 [0006-013]) |
 | `APPROVAL_AUTO_ALLOWED` | worker | `task_id`*, `tool`*, `tier`*, `mode`* (RFC-0006 [0006-003]) |
@@ -119,21 +119,21 @@ sequenceDiagram
 ### 4.3 Local spool and JSONL sink
 
 - [0013-014] MUST write an event to the emitter's local spool (`<state_dir>/audit/spool/<emitter>.jsonl`) and sync it before publishing. An entry is removed from the spool only after the publish ack.
-- [0013-015] MUST cap each spool at 64 MiB. When a spool is full, the emitter MUST NOT block task processing. It MUST discard the oldest unacknowledged entries, MUST increment `a2abus_audit_dropped_total`, and when space returns it MUST publish one `AUDIT_GAP` event with the discarded `seq` range. A discarded event MUST NOT be silently absent: the gap is always recorded.
+- [0013-015] MUST cap each spool at 64 MiB. When a spool is full, the emitter MUST NOT block task processing. It MUST discard the oldest unacknowledged entries, MUST increment `a2abus_audit_dropped_total`, and when space returns it MUST publish `AUDIT_GAP` events with the discarded `seq` ranges. Discarded entries that are contiguous in `seq` form one pending range; a discard adjacent to a pending range extends that range, so one `AUDIT_GAP` covers one contiguous range, and non-adjacent ranges each get their own `AUDIT_GAP`. Each `AUDIT_GAP` takes the next `seq` of its emitter when published. A discarded event MUST NOT be silently absent: the gap is always recorded.
 - [0013-016] MUST implement one JSONL sink per host (the `AuditSink` seam, RFC-0001 rule 0001-006, in `a2a-audit`). The sink is the only writer of `events-*.jsonl`. It consumes the durable consumer `sink-local` (`docs/interop/nats.md` sec 2.3) and acks a message only after its line is written and synced.
 - [0013-017] MUST make the sink idempotent: an event whose `seq` is less than or equal to the last `seq` written for its emitter is skipped and counted as duplicate.
 - [0013-018] MUST write each line as the JCS (RFC 8785) canonical JSON of the event, including `prev_hash` and `chain_hash`, so the line bytes are reproducible. Files are `<state_dir>/audit/events-<UTC yyyymmdd>-<n>.jsonl`, rotated when the file reaches 64 MiB or at the UTC day boundary, whichever is first. Rotation closes the old file before opening the next.
 - [0013-019] MUST sync data to disk at least once per second and after every batch; the maximum loss on power failure is the events written after the last sync, which are still in the spool and are re-delivered.
 - [0013-020] MUST keep audit files owner-only: mode `0600` on Linux; on Windows a DACL granting only the current user. On Windows the sink opens files with share-read and share-delete so that readers, rotation and retention are never blocked by an open file.
-- [0013-021] MUST apply local retention: delete files older than 90 days, or delete the oldest files while the total exceeds 1 GiB. The current file is never deleted. Retention runs at sink start and at each rotation.
+- [0013-021] MUST apply local retention: delete files older than 90 days, or delete the oldest files while the total exceeds 1 GiB. The total is the sum over all `events-*.jsonl` files, the current file included. The current file is never deleted, so the size rule stops once only the current file remains above the limit. Retention runs at sink start and at each rotation.
 
 ### 4.4 Redaction (R-S5, T10)
 
 - [0013-022] MUST apply redaction before an event is hashed, spooled, published or written. Nothing downstream sees an unredacted value.
-- [0013-023] MUST apply these rules and record the rule id in `redactions` (without content):
+- [0013-023] MUST apply these rules and record each rule id that fired in the `rules` detail of the task's `REDACTION_APPLIED` (046), which is the redactions list; no content is recorded:
   - R-A1: no message text, prompt text, model output, artifact content, diff content, or tool output is ever stored.
-  - R-A2: `args_summary` (a field of `details` on `APPROVAL_REQUESTED`, when present) is normalized and limited to 512 characters. Values that look like credentials (assignments to key-like names, bearer tokens, private-key blocks, URL user-info) are replaced by the token `[redacted]`. Long high-entropy strings are replaced by `[redacted:entropy]`.
-  - R-A3: absolute filesystem paths are replaced by the workspace id plus a relative path, or by `<workspace>` when no relative path applies. Operators resolve the id locally in the TUI (RFC-0012 sec 4.10).
+  - R-A2: `args_summary` (a field of `details` on `APPROVAL_REQUESTED`, when present) is normalized and limited to 512 characters. R-A2 applies to every string in `details`. Values that look like credentials (assignments to key-like names, bearer tokens, private-key blocks, URL user-info) have the value replaced in place by the marker `[redacted]`. Long high-entropy strings are replaced in place by `[redacted:entropy]`. The detection thresholds (length, entropy, patterns) are those of RFC-0007 [0007-130] and are not restated here.
+  - R-A3: absolute filesystem paths are replaced by the workspace id plus a relative path (`<workspace-id>/<relative>`), by `<workspace>` when the path is the workspace root, or by `<path>` when the path is outside the workspace or no workspace is known. Operators resolve the id locally in the TUI (RFC-0012 sec 4.10).
   - R-A4: environment variable values are never stored; only names when a name is itself needed.
   - R-A5: credential material (NKey seeds, bearer tokens, operator or peer keys, push secrets) is never stored, not even redacted.
   - R-A6: remote network addresses are omitted; peers are identified only by their configured names.
@@ -143,13 +143,13 @@ sequenceDiagram
 ### 4.5 Hash chain and checkpoints (tamper evidence)
 
 - [0013-026] MUST chain events per emitter. `chain_hash` = lowercase hex SHA-256 over the JCS canonical JSON of the event with `chain_hash` and `signature` removed. `prev_hash` is the previous event's `chain_hash` from the same emitter, or 64 zero characters for `seq` 1.
-- [0013-027] MUST emit an `AUDIT_CHECKPOINT` from the supervisor every hour and at clean supervisor shutdown. The checkpoint `details.emitters` maps each emitter to its latest `seq` and `chain_hash`. The checkpoint is signed with the supervisor key through the RFC-0007 Signer; the base64url signature is in `signature` and the key id in `key_id`.
-- [0013-028] MUST provide `a2a audit verify <file>` (local, read-only). It recomputes `chain_hash` for every line, checks `prev_hash` linkage and `seq` contiguity per emitter, verifies checkpoint signatures, and reports the first break by line number. Exit codes: 0 verified; 1 break found; 2 usage error.
-- [0013-029] MUST state the guarantee plainly: the chain detects in-place edit, deletion and reordering within a stream, and checkpoints detect rewriting of the stream prefix after a checkpoint. A full rewrite with a recomputed chain and a stolen supervisor key is not detected (open issue 2).
+- [0013-027] MUST emit an `AUDIT_CHECKPOINT` from the supervisor every hour and at clean supervisor shutdown. `details.emitters` is a JSON object keyed by emitter name, with one entry per emitter whose head the supervisor knows (its own included); each value is `{"seq": "<decimal string>", "chain_hash": "<64 lowercase hex>"}`, the emitter's latest `seq` and `chain_hash`. `details.signed_at` is the signing time as an RFC 3339 UTC millisecond timestamp (005). The checkpoint is signed with the supervisor key through the RFC-0007 Signer; the base64url signature is in `signature` and the key id in `key_id`.
+- [0013-028] MUST provide `audit verify <file>` (RFC-0012 [0012-054]). It recomputes every `chain_hash` and checkpoint signature in the file, reports the first broken line for an in-place edit, a deletion or a reordering, and exits 0 only when the file verifies; any other outcome uses a non-zero exit code from RFC-0012 [0012-055].
+- [0013-029] MUST state the guarantee plainly: the chain detects in-place edit, deletion and reordering within a stream, and checkpoints detect rewriting of the stream prefix after a checkpoint. Verify reports a late `seq` that fills an earlier jump as `SeqOrder` (a break), not as a gap. Not detected: a full rewrite with a recomputed chain and a stolen supervisor key (open issue 2); a deleted tail (lines removed from the end leave no seq jump) unless a later checkpoint covers the removed events; and any rewrite of events after the last checkpoint.
 
 ### 4.6 Correlation
 
-- [0013-030] MUST carry, when known: `traceparent` (W3C, unchanged across hops, L2), `context_id`, `task_id`, `message_id` (value of `A2AB-Msg-Id`), `chain` (ordered root-to-leaf list of `agent_id`/`task_id`), and `workspace_id` (RFC-0012 short id).
+- [0013-030] MUST carry, when known: `traceparent` (W3C, unchanged across hops, L2), `context_id`, `task_id`, `message_id` (value of `A2AB-Msg-Id`), `chain` (ordered root-to-leaf list of `agent_id`/`task_id`), and `workspace_id` (the RFC-0012 workspace `<short-id>`: the first 12 hexadecimal characters of the session or task UUIDv7, RFC-0012 sec 4.8). The schema check admits any token of 1 to 64 characters from `[A-Za-z0-9_-]` for `workspace_id`; that check guards against paths and is not a second format.
 - [0013-031] MUST use the same `traceparent` for every event of one task, including events emitted by other hops that carry the task's chain.
 - [0013-032] MUST write `event_id` into the log line of any log entry that is associated with an audit event, so that logs and audit can be joined.
 
@@ -157,7 +157,7 @@ sequenceDiagram
 
 - [0013-033] MUST serve Prometheus text exposition at `http://127.0.0.1:9465/metrics` by default (port configurable under `[supervisor]`). The listener MUST bind to a loopback address; any non-loopback bind value MUST be refused at start.
 - [0013-034] MUST expose the metrics in table 4.8 with the given types and labels. Label values MUST come from bounded sets: configured agent ids, enum values, and reason codes. Task ids, context ids, message ids, text, paths and peer addresses MUST NOT be labels.
-- [0013-035] SHOULD name metrics with the `a2abus_` prefix, the unit as suffix (`_seconds`, `_bytes`), and `_total` for counters.
+- [0013-035] SHOULD name metrics with the `a2abus_` prefix, the unit as suffix (`_seconds`, `_bytes`), and `_total` for counters. Gauges need no unit suffix; gauges that count things (for example `a2abus_tasks_inflight`) are named without one.
 
 Table 4.8: metrics.
 
@@ -186,7 +186,7 @@ Table 4.8: metrics.
 ### 4.8 Health endpoints
 
 - [0013-036] MUST serve `GET /healthz` and `GET /readyz` on the same loopback listener as 033. `/healthz` returns 200 while the supervisor loop runs. `/readyz` returns 200 only when the bus is connected, the sink can write, and no spool is above 80% of its cap; otherwise 503.
-- [0013-037] MUST return JSON bodies of the form `{"status":"ok","bus":"connected","sink":"writing","agents":{"omp":"ready"}}` with no configuration values, no paths, and no credential names. Health endpoints MUST NOT require authentication and MUST NOT accept writes.
+- [0013-037] MUST return JSON bodies of the form `{"status":"ok","bus":"connected","sink":"writing","agents":{"omp":"ready"}}` with no configuration values, no paths, and no credential names. `status` is `ok` when `/readyz` would return 200 and `unavailable` otherwise; `bus` is `connected` or `disconnected`; `sink` is `writing` or `unavailable`; `agents` maps each configured agent id to its supervisor state label. Both endpoints return this body; `/healthz` returns 200 with it even when `status` is `unavailable`. Health endpoints MUST NOT require authentication and MUST NOT accept writes.
 
 Workers expose no HTTP listener in M1; their health is their presence key (RFC-0004) as seen by `/readyz` and `a2a discover`. Gateway health is its A2A card endpoint and its own `/health` as defined in RFC-0008.
 
@@ -203,16 +203,18 @@ Workers expose no HTTP listener in M1; their health is their presence key (RFC-0
 - [0013-043] MUST emit `BUDGET_DEBITED` once per hop at task terminal and `BUDGET_TRIPPED` at the moment of a trip. Per-token or per-message debits MUST NOT produce events. Usage numbers come from RFC-0009 usage reports; ACP `usage_update` values are context usage, not billing (`docs/interop/acp-omp-claude.md` sec 2.8), and MUST NOT be debited as money.
 - [0013-044] MUST emit `LOOP_TRIPPED` with the loop guard limit and count. The reply to the peer is the RFC-0006 error; the audit event never includes the message body.
 - [0013-045] SHOULD emit `OPERATOR_ACTION` for every operator decision and cancel, with `outcome = unknown` when no ack arrived (RFC-0012 050). The operator identity is the operator key id, not a name typed in the UI.
-- [0013-046] MUST emit `REDACTION_APPLIED` at most once per task, with rule counts, when any redaction rule fired for that task.
+- [0013-046] MUST emit `REDACTION_APPLIED` at most once per task, at task terminal, when any redaction rule fired for that task. Its `rules` detail is a JSON object mapping each rule id that fired (R-A1 to R-A6) to its number of firings as a decimal string. The event carries no other count and no content.
 
 ### 4.11 Coalescing and rate limits
 
-- [0013-047] MUST coalesce `PEER_REJECTED` events: at most one event per (peer, reason) per 10 seconds, with `count` carrying the number suppressed in that window. Coalescing prevents audit flooding by an unauthenticated caller (T12) while counts remain accurate in metrics.
+- [0013-047] MUST coalesce `PEER_REJECTED` events: rejections are counted per (peer, reason) in a window of 10 seconds that opens at the first rejection. One `PEER_REJECTED` event per window is emitted when the window closes, with `count` equal to the total rejections in that window, including the first. A window still open at clean shutdown is emitted then. Coalescing prevents audit flooding by an unauthenticated caller (T12) while counts remain accurate in metrics.
 - [0013-048] MUST NOT coalesce any other event type. Approval, budget, loop, signature and lifecycle events are always recorded.
 
 ### 4.12 Retention summary
 
 - [0013-049] MUST keep the bus stream for 7 days (0013-012), the spool until acknowledged, the JSONL files for 90 days or 1 GiB (0013-021), and the logs for 5 rotated files (0013-039).
+- [0013-050] MUST emit the types that table 4.2 lists with two emitter kinds from the component named here: `AGENT_PRESENCE_CHANGED` from the worker of the agent whose presence changed; `REDACTION_APPLIED` from the worker that owns the task, or from a gateway only for redactions it applied to its own events of that task; `SUBMISSION_DROPPED` from the worker that received the submission (RFC-0005 [0005-027]); `WORKSPACE_RETAINED` and `WORKSPACE_REMOVED` from the worker when it acts at task end, and from the supervisor when it acts at agent stop or on an operator action; `WORKSPACE_REFUSED` from the worker when refused while a task acquires its workspace, and from the supervisor when refused at agent start.
+- [0013-051] MUST keep a consumer-observed sequence gap (a jump in a stream that the sink sees, `SeqGap`) durable as a `warn` log line in the sink's log under `<state_dir>/logs/` (039), with the emitter, `first` and `last`. The consumer MUST NOT write an `AUDIT_GAP` into the audit files or the stream: only the emitter publishes under its subject (006), and the emitter's own chain must not be altered. The in-memory accessor `take_gaps()` is the source of that line, not the record itself. The emitter-side record of a spool discard is the `AUDIT_GAP` of 015.
 
 Normative and advisory split: sec 4 IDs are normative. The default log text format, JSON field order of logs, and the dashboards are advisory.
 
@@ -233,7 +235,7 @@ No change is visible to existing clients. The audit subject and stream are new a
 - **T15 native-mode bypass**: dangerous-mode starts are recorded at each start (042).
 - **T12 gateway attack surface**: coalescing (047) prevents a flood of auth failures from filling the stream while counts remain in metrics.
 - **Forging events from another emitter**: prevented by per-subject publish permissions (011). A component that is compromised could still write its own events; chains and checkpoints detect later edits (026, 027).
-- **Editing the local files**: detected by verify (028) within the limits of 029.
+- **Editing the local files**: detected by verify (028) within the limits of 029. Not detected: a deleted tail with no later checkpoint, a full recomputed rewrite with a stolen supervisor key, and events rewritten after the last checkpoint. A late `seq` that fills an earlier jump is a `SeqOrder` break, not a gap.
 - **Spool and disk exhaustion**: caps (015, 021) with counted drops, never silent loss.
 - **Loopback-only listener**: 033 forbids binding metrics to a non-loopback address, so metrics are not a remote surface.
 - **Windows file sharing**: share-delete (020) keeps rotation and operator tooling from being blocked by an open audit file.
@@ -259,14 +261,14 @@ No change is visible to existing clients. The audit subject and stream are new a
 | 0013-005 | Timestamps match the RFC 3339 UTC millisecond pattern with trailing Z | Unit |
 | 0013-006 | Publishing under another emitter's subject fails under the RFC-0010 permission fixture | Integration |
 | 0013-007 | Unknown enum value stored verbatim by the sink; sink keeps running | Unit |
-| 0013-008 | Each type's `details` keys match table 4.2; large integers are strings | Unit |
+| 0013-008 | Each type's `details` keys match table 4.2; numbers and nulls are refused; integers are decimal strings | Unit |
 | 0013-009 | Each emitter publishes only to `a2a.v1.<tenant>.audit.<emitter>`; reserved ids rejected in config | Integration |
 | 0013-010 | Published message has `Nats-Msg-Id` equal to `event_id`; redelivery is deduped | Integration |
 | 0013-011 | Peer identity cannot subscribe to `a2a.v1.<tenant>.audit.>` (fixture) | Integration |
 | 0013-012 | Stream exists with subjects, file storage and `max_age` 7 days | Integration |
 | 0013-013 | Duplicate delivery yields one sink line; gap recorded | Integration |
 | 0013-014 | Event present in spool before publish; removed after ack (kill test between steps) | Integration |
-| 0013-015 | Full spool increments dropped counter; `AUDIT_GAP` published on recovery with correct range | Integration |
+| 0013-015 | Full spool increments dropped counter; one `AUDIT_GAP` per contiguous range published on recovery with correct range; non-adjacent ranges give separate events | Integration |
 | 0013-016 | Sink acks only after line sync (fault injection on sync) | Integration |
 | 0013-017 | Event with seq at or below last written is skipped and counted | Unit |
 | 0013-018 | Line bytes equal JCS output; rotation at 64 MiB and at UTC midnight (fake clock) | Unit |
@@ -278,9 +280,9 @@ No change is visible to existing clients. The audit subject and stream are new a
 | 0013-024 | Oversized details are cut and `truncated` is true | Unit |
 | 0013-025 | Grep of sink, logs and examples for attack fixtures finds nothing | Integration |
 | 0013-026 | Verify passes on a generated chain; `chain_hash` recomputed independently matches | Unit |
-| 0013-027 | Hourly and shutdown checkpoints verify with the supervisor public key | Integration |
+| 0013-027 | Hourly and shutdown checkpoints verify with the supervisor public key; `emitters` and `signed_at` have the 027 shapes | Integration |
 | 0013-028 | Verify reports first broken line for an edit, a deletion and a reordering; exit codes match | Integration (Windows and Linux) |
-| 0013-029 | Documented limit test: full recomputed rewrite passes verify (expected, documents the limit) | Manual |
+| 0013-029 | Documented limit tests: full recomputed rewrite passes verify; deleted tail passes without a later checkpoint; late seq filling a jump reports `SeqOrder` | Manual |
 | 0013-030 | Task events carry context id, task id, message id, chain and workspace id when known | Integration |
 | 0013-031 | All events of one task share one traceparent across two hops | Integration |
 | 0013-032 | Log line for an audited action includes its `event_id` | Unit |
@@ -297,10 +299,12 @@ No change is visible to existing clients. The audit subject and stream are new a
 | 0013-043 | One `BUDGET_DEBITED` per hop per task; no event per usage update | Integration |
 | 0013-044 | Loop trip emits `LOOP_TRIPPED` with no message body | Integration |
 | 0013-045 | Cancel from TUI emits `OPERATOR_ACTION` with key id; unacked decision shows `unknown` | Integration |
-| 0013-046 | `REDACTION_APPLIED` appears at most once per task with rule counts | Unit |
-| 0013-047 | 100 rejections in 10 s from one peer produce at most one event for that window with count 100 | Unit |
+| 0013-046 | `REDACTION_APPLIED` appears at most once per task, at terminal, with `rules` counts as decimal strings | Unit |
+| 0013-047 | 100 rejections in one window from one peer produce one event at window close with count 100 | Unit |
 | 0013-048 | Approval, budget, loop, signature and lifecycle events are never coalesced | Unit |
 | 0013-049 | Retention settings match the stated values in the config defaults | Unit |
+| 0013-050 | Each two-kind type in table 4.2 is emitted only by the component named in 050 | Unit |
+| 0013-051 | Consumer-observed gap is logged at warn with emitter, first and last; sink writes no AUDIT_GAP | Integration |
 
 ## 9. Open issues
 
