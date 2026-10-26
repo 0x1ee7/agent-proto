@@ -1,0 +1,36 @@
+[package]
+name = "gateway-http"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+a2a-client = { version = "0.1.0", path = "../a2a-client" }
+a2a-core = { version = "0.1.0", path = "../a2a-core" }
+a2a-types = { version = "0.1.0", path = "../a2a-types" }
+axum = "0.8.9"
+bus-api = { version = "0.1.0", path = "../bus-api" }
+bytes = "1.12.1"
+http = "1.5.0"
+hyper-util = { version = "0.1.21", features = ["server-auto", "tokio"] }
+pbjson-types = "0.9.0"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+tokio-stream = "0.1.19"
+url = "2.5.8"
+
+[dev-dependencies]
+bus-mem = { version = "0.1.0", path = "../bus-mem" }
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }
