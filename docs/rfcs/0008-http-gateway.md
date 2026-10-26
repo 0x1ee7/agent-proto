@@ -62,13 +62,13 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 - [0008-010] Each exposed agent has a base URL `http://<host>:<port>/agents/<agentId>` (no trailing slash). JSON-RPC POSTs are accepted at exactly that path and at that path with one trailing slash.
 - [0008-011] `GET <base>/.well-known/agent-card.json` MUST return the derived card for that agent. It is public (no authentication), carries `ETag` and `Cache-Control: max-age=60`, and returns HTTP 304 on a matching `If-None-Match`.
 - [0008-012] If `default_agent` is configured (M1: `omp`) and exposed, the root paths `/.well-known/agent-card.json` and `POST /` serve that agent. The root card is the same document as the agent's own card, including the canonical interface URL `<public_base_url>/agents/<agentId>`. Otherwise the root paths MUST return HTTP 404, and a POST to `/` MUST return HTTP 404 with JSON-RPC error `-32601`, reason `NO_AGENT_SELECTED`. Root routing never selects an agent other than `default_agent`.
-- [0008-013] The derived card MUST contain: `name`, `description`, `version`, `skills`, `defaultInputModes`, `defaultOutputModes`, `capabilities` (`streaming` true; `pushNotifications` per configuration; `extendedAgentCard` as the bus card states), and the bus card's extension declarations, unchanged. It MUST add one HTTP bearer security scheme in `securitySchemes` (exact field shape per RFC-0003 and the card notes in `docs/interop/a2a-spec-notes.md`, `[UNVERIFIED]`). It MUST NOT declare a card-level security requirement, because the card itself is public.
+- [0008-013] The derived card MUST contain: `name`, `description`, `version`, `skills`, `defaultInputModes`, `defaultOutputModes`, `capabilities` (`streaming` true; `pushNotifications` per configuration; `extendedAgentCard` as the bus card states), and the bus card's extension declarations, unchanged. It MUST add one HTTP bearer security scheme in `securitySchemes` (exact field shape per RFC-0003 and the card notes in `docs/interop/a2a-spec-notes.md`, `[UNVERIFIED]`). It MUST NOT declare a card-level security requirement, because the card itself is public. The bridge publishes a sanitized bus card (0008-099), so Hermes' card-level `security` never reaches the derived card.
 - [0008-014] The derived card's `supportedInterfaces` MUST contain exactly one entry: `url` = `<public_base_url>/agents/<agentId>`, `protocolBinding` = `JSONRPC`, `protocolVersion` = `1.0`. The `tenant` field MUST be omitted.
 - [0008-015] The derived card MUST NOT contain bus URLs, bus credentials, bus interface entries, or any field marked internal by RFC-0003.
 - [0008-016] The derived card is an unsigned view. The gateway MUST remove `signatures` and MUST NOT copy the bus card's JWS, because the content differs and the signature would not verify.
 - [0008-017] If the agent is not exposed or no bus card exists, the card route MUST return HTTP 404 (not 503).
 - [0008-018] The gateway MUST serve cards from an in-memory cache fed by a watch on the card bucket (RFC-0004). Card requests MUST NOT wait on the bus.
-- [0008-019] `GetExtendedAgentCard` requires an authenticated peer on the agent's allowlist. Unauthenticated calls get HTTP 401. If the agent declares no extended card, the gateway returns `-32007` (4.6).
+- [0008-019] `GetExtendedAgentCard` requires an authenticated peer on the agent's allowlist. Unauthenticated calls get HTTP 401. If the agent's card declares `extendedAgentCard` false, the gateway returns `-32004` UnsupportedOperation (4.6). If it declares true but no extended card is configured, the gateway returns `-32007` (4.6).
 
 ### 4.3 Request admission
 
@@ -79,7 +79,7 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 - [0008-024] Non-loopback callers MUST be listed in `trusted_peers`; otherwise HTTP 403 with JSON-RPC `-32052` (reason `PEER_NOT_TRUSTED`). Loopback callers are not subject to the list.
 - [0008-025] `Content-Type` MUST be `application/json` (parameters allowed). Otherwise HTTP 415 with JSON-RPC `-32600`, reason `UNSUPPORTED_MEDIA_TYPE`.
 - [0008-026] A request body larger than 1 MiB MUST be rejected with HTTP 413 before parsing.
-- [0008-027] The `A2A-Version` header MUST be `1.0` or `1.0.0`. Any other value, including an absent header, MUST yield a JSON-RPC `-32009` (VersionNotSupportedError, reason `VERSION_NOT_SUPPORTED`) with HTTP 200. Deviation from the spec-notes default that an absent header means 0.3: the gateway serves no 0.3 payload shapes (NG5), so it cannot answer such a caller usefully. See Rationale.
+- [0008-027] The `A2A-Version` header MUST be `1.0` or `1.0.0`. Any other value, including an absent header, MUST yield a JSON-RPC `-32009` (VersionNotSupportedError, reason `VERSION_NOT_SUPPORTED`) with HTTP 200. Deviation from the spec-notes default that an absent header means 0.3: the gateway serves no 0.3 payload shapes (NG5), so it cannot answer such a caller usefully. Hermes server quirks on this header are tolerated by the bridge only (0008-098); the gateway stays strict for every peer. See Rationale.
 - [0008-028] `A2A-Extensions` (request) MUST be parsed. Each required extension of the bus card that the request does not list MUST yield `-32008` (reason `EXTENSION_SUPPORT_REQUIRED`). The response `A2A-Extensions` header, present only when the request carried one, MUST list only URIs that the request listed and the gateway activated. The gateway MUST NEVER add an extension URI on behalf of an HTTP peer, including the approval extension.
 - [0008-029] The gateway MUST emit only canonical PascalCase method names. It MUST accept the pre-1.0 aliases of `docs/interop/a2a-spec-notes.md` section 7.2 and the Hermes aliases `tasks/subscribe`, `tasks/pushNotificationConfig/create`, and `tasks/pushNotification/set` on ingress only.
 - [0008-030] Alias methods MUST carry v1.0 parameter shapes. Pre-1.0 shapes (`kind` discriminators, lowercase roles, pre-1.0 field names) MUST yield `-32602` with message `pre-1.0 parameter shape not accepted`.
@@ -87,7 +87,7 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 - [0008-032] The gateway MUST overwrite the provenance extension key (`urn:a2abus:ext:provenance:1`) on every inbound message with its own record: `{"source": "http-jsonrpc", "peer": "<effective origin>", "transport": "http"}`. Any caller-supplied provenance value MUST be discarded.
 - [0008-033] Budget (`urn:a2abus:ext:budget:1`, RFC-0006): if the caller supplies budget values, the gateway MUST set each limit to the minimum of the caller's value and the peer's `ingress_budget`. If the caller supplies none, the gateway MUST set the peer's `ingress_budget`. The gateway MUST NEVER raise a limit.
 - [0008-034] The gateway MUST NOT mint, forward, or synthesize approval decisions (RFC-0006). A continuation message from an HTTP peer is an ordinary message; it does not satisfy an approval gate.
-- [0008-035] The gateway MUST NOT rewrite `contextId` or task ids in either direction. If a SendMessage has no `contextId`, the gateway passes none and the worker assigns one (RFC-0005).
+- [0008-035] The gateway MUST NOT rewrite `contextId` or task ids in either direction. If a SendMessage has no `contextId`, the gateway passes none and the worker assigns one (RFC-0005). A supplied contextId is forwarded unchanged; a worker that cannot accept it refuses with `INVALID_PARAMS` (0002-089). Bridge-side contextId namespacing for Hermes is in 0008-097.
 - [0008-036] Every bus publish made for an HTTP request MUST carry `A2AB-Origin` set to the effective origin (RFC-0002 header rule).
 
 ### 4.4 Operation mapping
@@ -101,7 +101,7 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 | GetTask | `get` | `{id, historyLength?}` | `Task` | ownership check (0008-043) |
 | ListTasks | `list` | `ListTasksRequest` | `ListTasksResponse` | filtered by effective origin by the worker |
 | CancelTask | `cancel` | `{id}` | `Task` | ownership check |
-| SubscribeToTask | `subscribe` | `{id}` | snapshot `Task` plus subscription | 4.7 |
+| SubscribeToTask | `subscribe` | `{id}` | snapshot `Task` plus subscription | 4.7; JSON-RPC over `POST`, no REST verb in M1 |
 | CreateTaskPushNotificationConfig | `push-create` | config object | config | 4.8 |
 | GetTaskPushNotificationConfig | `push-get` | `{taskId, id}` | config | 4.8 |
 | ListTaskPushNotificationConfigs | `push-list` | `{taskId}` | list | 4.8 |
@@ -110,7 +110,7 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 
 - [0008-038] `ListTasks` `pageSize` MUST be between 1 and 100 (default 50, per the spec). Values above 100 MUST yield `-32602`. The gateway MUST NOT cache list results.
 - [0008-039] Push configuration records are stored in the bus KV bucket named by RFC-0010 (the gateway does not own a bucket name). Records MUST NOT hold tokens or credentials (4.8).
-- [0008-040] Ownership: for any operation that names a task, the gateway MUST pass the effective origin to the worker, and the worker MUST answer `TaskNotFound` (`-32001`) for a task owned by another origin, identical to a missing task. The gateway MUST NOT disclose the existence of other origins' tasks. Operator visibility exceptions of RFC-0005 apply only to bus-side operator identities; an HTTP peer is never an operator identity, and the gateway never forwards one.
+- [0008-040] Ownership: for any operation that names a task, the gateway MUST pass the effective origin to the worker, and the worker MUST answer `TaskNotFound` (`-32001`) for a task owned by another origin, identical to a missing task. This includes CancelTask: a cross-origin CancelTask MUST return `-32001`, not `-32002` (the Hermes server returns `-32002`, defect T23 in `docs/spikes/hermes-a2a.md`). The gateway MUST NOT disclose the existence of other origins' tasks. ListTasks and SubscribeToTask follow the same rule (0008-095). Operator visibility exceptions of RFC-0005 apply only to bus-side operator identities; an HTTP peer is never an operator identity, and the gateway never forwards one.
 - [0008-041] The gateway MUST NOT reorder, merge, or otherwise rewrite `Task` content. Its only egress changes are the sequence removal in 4.5 and the redaction in RFC-0013.
 
 ### 4.5 Extensions, metadata, and Struct form
@@ -152,8 +152,8 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 
 - [0008-050] A non-streaming SendMessage with `returnImmediately` absent or false MUST: publish `send`; receive the initial `Task`; subscribe to `ev.<agent>.<task_id>` with header `A2AB-After-Seq: 0` (replay from seq 1, RFC-0005 replay rule); wait for the first event carrying `A2AB-Stream-End: true` (RFC-0005 stream-end rule, 0008-053); and return `{"task": <assembled Task>}`. The assembled Task is the initial `Task` with each status update applied and each artifact update applied in stream order (`append` and `lastChunk` per the spec).
 - [0008-051] With `returnImmediately` true, the gateway MUST return the initial `Task` as soon as the reply arrives and MUST release its subscription.
-- [0008-052] The blocking wait deadline (`blocking_wait`, default 100 s) MUST be shorter than the default Hermes client timeout (120 s). When the deadline passes, the gateway MUST return HTTP 200 with the current non-terminal `Task` (state `TASK_STATE_SUBMITTED` or `TASK_STATE_WORKING`), release its subscription, and MUST NOT cancel the task. The caller continues with GetTask or SubscribeToTask.
-- [0008-053] Interrupted state `TASK_STATE_INPUT_REQUIRED` ends a blocking wait with a normal result (RFC-0005, RFC-0006). It is not an error. A peer `AUTH_REQUIRED` is not a bus state in M1; it reaches the bus as a FAILED task (0008-079).
+- [0008-052] The blocking wait deadline (`blocking_wait`, default 100 s) MUST be shorter than the default Hermes client timeout (120 s). When the deadline passes, the gateway MUST return HTTP 200 with the current non-terminal `Task` (state `TASK_STATE_SUBMITTED` or `TASK_STATE_WORKING`), release its subscription, and MUST NOT cancel the task. The caller continues with GetTask or SubscribeToTask. This bounded wait is a deliberate deviation from the blocking reading of A2A section 3.2.2 (Section 5, deviation D-3).
+- [0008-053] Interrupted states are `TASK_STATE_INPUT_REQUIRED` and `TASK_STATE_AUTH_REQUIRED`; each ends a blocking wait with a normal result (RFC-0005, RFC-0006). Neither is an error. M1 emits no `TASK_STATE_AUTH_REQUIRED`, so in M1 only INPUT_REQUIRED ends a wait; a peer `AUTH_REQUIRED` reaches the bus as a FAILED task (0008-079).
 - [0008-054] SendStreamingMessage MUST respond HTTP 200 with `Content-Type: text/event-stream`. Each frame is `data: <JSON-RPC response>` followed by a blank line, where `result` is a `StreamResponse`. The first frame MUST be the `Task` (snapshot). Later frames are `statusUpdate` or `artifactUpdate` in stream order. The stream closes after the event with `A2AB-Stream-End: true` is sent.
 - [0008-055] While a streamed task is non-terminal, the gateway MUST send a keepalive comment (`: keepalive`) at least every 15 s.
 - [0008-056] The gateway MUST drop any event whose `seq` is not greater than the last delivered `seq` for that task. Events lacking `seq` MUST be ordered by bus arrival (RFC-0005 rules).
@@ -163,7 +163,7 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 
 - [0008-058] A push config record MUST hold: config id, task id, effective origin, `url`, and creation time. It MUST NOT hold tokens, credentials, or secrets (0008-059, 0008-063).
 - [0008-059] Create requests with a non-empty `authentication` or `token` MUST yield `-32602`, reason `PUSH_CREDENTIALS_NOT_SUPPORTED`. In M1 the only authentication of webhook deliveries is the HMAC signature in 0008-062.
-- [0008-060] The push `url` MUST use `https` (or `http` to a loopback host when the peer's `push_allow` says so). Its host MUST match the peer's `push_allow` list. Otherwise `-32602`, reason `PUSH_URL_NOT_PERMITTED`. The gateway MUST re-check the resolved address at delivery against the same policy (the SSRF guard), and it MUST NOT follow redirects.
+- [0008-060] The push `url` MUST use `https` (or `http` to a loopback host when the peer's `push_allow` says so). Its host MUST match the peer's `push_allow` list. Otherwise `-32602`, reason `PUSH_URL_NOT_PERMITTED`. The gateway MUST re-check the resolved address at delivery against the same policy (the SSRF guard), and it MUST NOT follow redirects. The default `push_allow` is empty, so `http` is refused unless the operator names a loopback host explicitly.
 - [0008-061] Delivery: the gateway subscribes to the task's event subject with a durable consumer per config, and POSTs each `StreamResponse` event to `url` with `Content-Type: application/a2a+json`, a 10 s timeout, and up to 5 attempts with 1, 2, 4, 8 s backoff. Delivery is at-least-once; receivers MUST deduplicate by `(taskId, seq)`. Hermes' own push sender uses `application/json` (`docs/interop/hermes.md` section 6.8); this is a known divergence, and the gateway keeps `application/a2a+json`.
 - [0008-062] Each POST MUST carry `X-A2A-Signature: <lowercase hex HMAC-SHA256>` computed with the peer's push secret over the exact body bytes. The body MUST be serialized as JSON with object keys sorted by code point, separators `", "` and `": "`, and `ensure_ascii` disabled. This matches the Hermes signing convention (`docs/interop/hermes.md` section 6.8), so a receiver that re-serializes with the same rules verifies the signature.
 - [0008-063] Push secrets MUST be stored in the host secret store (4.9), keyed by peer, not per task and not on the bus.
@@ -181,7 +181,7 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 - [0008-072] The bus agent id of a bridged agent comes from bridge configuration. It MUST NOT be derived from the external card's `name`.
 - [0008-073] The published bus card for a bridged agent MUST NOT contain the external URL. It MUST carry the provenance extension with `{"source": "external-a2a-http", "verified": false}` (RFC-0007) and MUST be signed with the bridge's agent key (RFC-0007).
 - [0008-074] Transport: when the external card declares `capabilities.streaming`, the bridge MUST use `SendStreamingMessage` and reattach with `SubscribeToTask` after a dropped stream. Otherwise it MUST use `SendMessage` and poll `GetTask` every 2 s, backing off to 10 s. The external request timeout is 330 s (0009-053: the Hermes server reply timeout of 300 s plus a margin). A stream with no frame or keepalive for 30 s MUST be treated as dropped. The Hermes server sends keepalives every 5 s (`docs/interop/hermes.md` section 3).
-- [0008-075] The external context id MUST equal the bus context id (no rewrite; 0008-035). Hermes' ownership binding (peer, tenant, contextId) is therefore stable across the hop.
+- [0008-075] The external context id MUST equal the bus context id (no rewrite; 0008-035), except for Hermes-profile peers, where 0008-097 namespaces it per origin. Hermes' ownership binding (peer, tenant, contextId) is therefore stable across the hop for each origin.
 - [0008-076] External task ids are stored in a bus KV bucket owned by the bridge (bucket name per RFC-0010), keyed by bus task id. On start the bridge rebuilds its mapping from that bucket.
 - [0008-077] Transport retries MUST reuse the A2A `messageId` of the logical message. A new bus message to the external agent MUST use a new `messageId`. Hermes counts admissions per `(contextId, messageId)` and treats retries with the same pair as non-admissions (`docs/interop/hermes.md` sections 4 and 6.2), so reuse keeps the anti-loop budget correct.
 - [0008-078] Outbound error mapping (bridge to bus task state; the reason is a token from RFC-0009, carried in status metadata per RFC-0005):
@@ -208,15 +208,22 @@ Scope boundary: the bus wire (subjects, headers, error encoding, op tokens) is o
 
 ### 4.11 Hermes profile
 
-- [0008-085] For Hermes-profile peers the gateway MUST accept the Hermes request shape exactly: `POST` to the agent base path; headers `Content-Type: application/json`, `A2A-Version: 1.0`, optional `Authorization: Bearer`; no `A2A-Extensions`; body `SendMessage` with `params.message` carrying `role: "ROLE_USER"`, `parts` as `{text, mediaType}`, `messageId` (32 lowercase hex characters, a uuid4 without hyphens), and `contextId` (string). The JSON-RPC `id` may be a 32-hex string.
+- [0008-085] For Hermes-profile peers the gateway MUST accept the Hermes request shape exactly: `POST` to the agent base path; headers `Content-Type: application/json`, `A2A-Version: 1.0`, optional `Authorization: Bearer`; no `A2A-Extensions`; body `SendMessage` with `params.message` carrying `role: "ROLE_USER"`, `parts` as `{text, mediaType}`, `messageId` (32 lowercase hex characters, a uuid4 without hyphens), and `contextId` (string). The JSON-RPC `id` MAY be any string or number (Hermes sends `task-<16 hex>`, for example `task-49ab68213de847b9`); the gateway MUST echo it unchanged.
 - [0008-086] Hermes-profile responses MUST follow the spec: SendMessage returns `result: {"task": ...}` or `{"message": ...}`. Hermes unwraps both (`docs/interop/hermes.md` section 8.4).
-- [0008-087] For Hermes-profile peers, the gateway MUST pass `TASK_STATE_INPUT_REQUIRED` unchanged in the state field and MUST pass the text unchanged. No text prefix is added. Hermes detects input-required from the TaskState enum (`docs/interop/hermes.md` section 8.5). The gateway MUST NOT emit `TASK_STATE_AUTH_REQUIRED` to a Hermes-profile peer.
+- [0008-087] For Hermes-profile peers, the gateway MUST pass `TASK_STATE_INPUT_REQUIRED` unchanged in the state field and MUST pass the text unchanged. The gateway adds no text prefix and MUST NOT strip one. Hermes detects input-required from the TaskState enum (`docs/interop/hermes.md` section 8.5). Hermes itself strips a leading `[INPUT_REQUIRED]` marker from the text it sends (observed in SP-4). The gateway MUST NOT emit `TASK_STATE_AUTH_REQUIRED` to a Hermes-profile peer.
 - [0008-088] The gateway MUST NOT require `A2A-Extensions` from Hermes-profile peers. Configuration validation MUST refuse to route a Hermes-profile peer to an agent that declares a required extension.
 - [0008-089] If `params.tenant` is present, it MUST equal `local`. Any other value yields `-32602`, reason `TENANT_MISMATCH`. The card omits `tenant` (0008-014), so Hermes normally sends none.
 - [0008-090] Hermes card discovery: Hermes fetches `<base>/.well-known/agent-card.json` and falls back to `agent.json` on 404 (`docs/interop/hermes.md` section 1.1, verified against Hermes `tools.py`). The gateway does not serve `agent.json`. If Hermes' fallback to the base URL for RPC is used, it still reaches the agent. The gateway MUST serve correct results for both paths (join order verified; Open issue 4 resolved).
 - [0008-091] Anti-loop: the gateway MUST NOT change `contextId` to evade a peer's admission limits, MUST keep the `messageId` stable across retries of one logical message (0008-082), and MUST NOT split one turn into several bus admissions. The bus loop budget (RFC-0006) is the enforced limit.
 - [0008-092] Timeouts: the configured `blocking_wait` (default 100 s) plus a 20 s margin MUST not exceed the Hermes peer `timeout` for that agent. The default Hermes client timeout is 120 s. The operations guide MUST record this pairing.
 - [0008-093] A Hermes-profile peer whose agent takes longer than `blocking_wait` receives a non-terminal `Task` with no artifact text. This is a known limitation (Open issue 3).
+- [0008-094] The gateway MUST forward `historyLength` on GetTask and SubscribeToTask unchanged to the worker and MUST return the history the worker returns without rewriting it (0002-087; GAP-C in `docs/spikes/a2a-binding-conformance.md`).
+- [0008-095] ListTasks: the gateway MUST forward the request to the worker with the effective origin and MUST return only tasks owned by that origin. The pageSize rules of 0008-038 apply. `nextPageToken` is passed through unchanged (open issue 11). `totalSize`, the update-time sort, and the `includeArtifacts` and `statusTimestampAfter` filters are the worker's and are passed through without rewriting (0002-088; GAP-D).
+- [0008-096] Bridge (RFC-0009 `driver-a2a-http`, Hermes profile): to continue a task in INPUT_REQUIRED, the bridge MUST reuse the external contextId of that task. Hermes ignores `message.taskId`, so the bridge MUST NOT rely on it; a new contextId starts a new Hermes task (spike Q4).
+- [0008-097] Bridge, Hermes profile: the bridge MUST namespace the Hermes contextId per bus origin, derived from the origin and the bus contextId, so that two origins never share a Hermes contextId. Hermes shares model history across peers that reuse a contextId and exposes other peers' tasks through cross-peer GetTask, CancelTask and ListTasks (spike Q6: T21, T22, T24). The bridge MUST NOT forward a request whose visibility would cross origins.
+- [0008-098] Bridge error tolerance (Hermes is the bridge's upstream): the bridge MUST accept an upstream `-32602` for an invalid `A2A-Version` or a non-object body, and MUST accept error objects without `error.data`. It maps them to a bus failure by JSON-RPC code class, never by ErrorInfo. The bridge always sends `A2A-Version: 1.0`.
+- [0008-099] Bridge card sanitization: the bridge MUST ingest the Hermes card and publish a sanitized bus card with coarse skills (no tool names; for example one entry for the peer), no card-level `security` field, `capabilities.extendedAgentCard` false, and the provenance extension of 0008-073. Hermes' 33 tool-name skills MUST NOT appear on the bus or in the gateway card (spike Q2).
+- [0008-100] Hermes operator configuration: the Hermes process MUST be started with a profile in which `gateway.standalone` is true. The default profile exits with code 78 (spike Q1). The RFC-0012 `hermes-peer` command MUST name that profile.
 
 ### 4.12 Worked examples
 
@@ -363,7 +370,7 @@ A request with `A2A-Version: 0.3` (or none) returns HTTP 200 with `error.code` `
 ## 5. Interoperability
 
 - **Stock A2A v1.0 clients (for example the official Python SDK)** see a standard agent card at the per-agent base URL, one JSONRPC interface, standard method names, standard result wrapping, standard `ErrorInfo` errors, and standard SSE framing. They do not see bus URLs or signatures. The card is unsigned; a client that requires signed cards cannot verify it over HTTP (Open issue 6). Pre-1.0 method names work; pre-1.0 bodies do not, which the spec permits.
-- **Hermes** (`docs/interop/hermes.md`): Hermes sends the request shape in 0008-085 and tolerates the bare or wrapped result (section 8.4). It reads the reply text from artifacts, then status message. Divergences the profile accepts: Hermes server returns a bare Task for non-1.0 callers, and it returns `-32602` for a bad `A2A-Version` where the spec says `-32009`. The gateway follows the spec (0008-027) and does not emulate Hermes server quirks. The `-32050..-32052` codes are kept for Hermes-side mapping.
+- **Hermes** (`docs/interop/hermes.md`): Hermes sends the request shape in 0008-085 and tolerates the bare or wrapped result (section 8.4). It reads the reply text from artifacts, then status message. Divergences the profile accepts: Hermes server returns a bare Task for non-1.0 callers, and it returns `-32602` for a bad `A2A-Version` where the spec says `-32009`. The gateway follows the spec (0008-027) and does not emulate Hermes server quirks; the bridge tolerates them (0008-098). Hermes also accepts any tenant; the gateway enforces 0008-089. The `-32050..-32052` codes are kept for Hermes-side mapping.
 - **Hermes card discovery**: Hermes' card fetch and RPC fallback are covered by 0008-010 and 0008-012 with both code paths working.
 - **ACP agents (claude, omp)**: unaffected. The gateway talks only to the bus; ACP is between the worker driver and the agent (RFC-0009).
 - **Bus-native agents**: unaffected. Their origin is their envelope sender; no HTTP path is involved.
@@ -428,7 +435,7 @@ Test plan (not run by this RFC):
 | 0008-016 | Card has no `signatures` | MUST |
 | 0008-017 | Card request for unexposed agent; expect 404 | MUST |
 | 0008-018 | Stop bus; card still served from cache | MUST |
-| 0008-019 | GetExtendedAgentCard without token; expect 401; with token and no extended card; expect -32007 | MUST |
+| 0008-019 | GetExtendedAgentCard without token expect 401; with token and `extendedAgentCard` false expect -32004; true and none configured expect -32007 | MUST |
 | 0008-020 | Malformed body from unauthenticated caller; expect 401 and no bus publish | MUST |
 | 0008-021 | Wrong token; expect 401 and `WWW-Authenticate`; digest-only config check | MUST |
 | 0008-022 | Loopback, no header; origin `loopback`; with invalid token, expect 401 | MUST |
@@ -449,7 +456,7 @@ Test plan (not run by this RFC):
 | 0008-037 | Method table contract test per row | MUST |
 | 0008-038 | pageSize 0, 100, 101; expect -32602 above 100 | MUST |
 | 0008-039 | Push create; inspect bus KV record fields | MUST |
-| 0008-040 | Two origins; GetTask of other origin's task; expect -32001 identical to missing | MUST |
+| 0008-040 | Two origins; GetTask of other origin's task expect -32001 identical to missing; cross-origin CancelTask expect -32001 (not -32002) | MUST |
 | 0008-041 | Golden-file compare of Task content through gateway | MUST |
 | 0008-042 | Round-trip extension Struct in JSON form | MUST |
 | 0008-043 | Integer above 2^53 in extension; expect rejection on ingress and no truncation | MUST |
@@ -494,21 +501,28 @@ Test plan (not run by this RFC):
 | 0008-082 | Same HTTP retry after gateway restart; worker reports one admission | MUST |
 | 0008-083 | Restart bridge mid-task; mapping rebuilt; no duplicate external task | MUST |
 | 0008-084 | Document per-process limits; no multi-instance deployment | SHOULD |
-| 0008-085 | T-B request shape against gateway; expect success | MUST |
+| 0008-085 | T-B request shape against gateway with `id` `task-<16 hex>` and with a 32-hex id; expect success | MUST |
 | 0008-086 | Result wrapper parsed by Hermes-shaped client | MUST |
-| 0008-087 | INPUT_REQUIRED for Hermes peer; state enum passed unchanged; no text prefix added; AUTH_REQUIRED never emitted to Hermes | MUST |
+| 0008-087 | INPUT_REQUIRED for Hermes peer; state enum passed unchanged; gateway adds no text prefix; AUTH_REQUIRED never emitted to Hermes | MUST |
 | 0008-088 | Hermes peer with required-extension agent; expect configuration refusal | MUST |
 | 0008-089 | tenant `local` accepted; other value expects -32602 | MUST |
 | 0008-090 | Card 404 on first path; RPC via base URL still works | SHOULD |
 | 0008-091 | Repeated retries do not exceed peer anti-loop budget; contextId unchanged | MUST |
 | 0008-092 | Configuration validation warns when blocking_wait plus margin exceeds peer timeout | SHOULD |
 | 0008-093 | Long agent turn via Hermes peer; non-terminal Task observed | SHOULD |
+| 0008-094 | GetTask with `historyLength` 1 on a three-message task; worker's truncated history returned unchanged | MUST |
+| 0008-095 | Two origins; ListTasks returns only the caller's origin; pageSize rules as 0008-038 | MUST |
+| 0008-096 | Bridge against Hermes fixture: continuation after INPUT_REQUIRED reuses contextId; `message.taskId` ignored | MUST |
+| 0008-097 | Same bus contextId from two origins yields two distinct Hermes contextIds; cross-origin GetTask, ListTasks, CancelTask not forwarded | MUST |
+| 0008-098 | Fake Hermes upstream returns -32602 for bad version and non-object body, no error.data; bridge maps to failure without requiring ErrorInfo | MUST |
+| 0008-099 | Captured Hermes card (6047-byte fixture) ingested; published bus card has no tool names and no card-level security | MUST |
+| 0008-100 | Hermes default profile exits 78; standalone profile starts and serves | SHOULD |
 
 ## 9. Open issues
 
 1. **HTTP+JSON (REST) binding not served in M1.** Default: not served; the card lists only JSONRPC. A later RFC can add it over the same mapping table.
 2. **Hermes detection of input-required.** Resolved: Hermes reads the TaskState enum (`docs/interop/hermes.md` section 8.5). No text prefix is added (0008-087).
-3. **Long-running tasks over Hermes.** Default: `blocking_wait` 100 s; longer tasks return a non-terminal Task. Hermes has no polling tool, so such results are lost to Hermes users until a Hermes-side change. Operators limit turn length for Hermes-exposed agents.
+3. **Long-running tasks over Hermes.** Default: `blocking_wait` 100 s; longer tasks return a non-terminal Task. Hermes has no polling tool, so such results are lost to Hermes users until a Hermes-side change. Operators limit turn length for Hermes-exposed agents. SP-4 (stub) observed SSE framing and no keepalive in a 0.2 s run; long-run keepalive behavior is unobserved.
 4. **Hermes card join behavior.** Resolved: Hermes tries the JSON-RPC interface from the card, then the card `url`, then the base URL (`docs/interop/hermes.md` section 1.1). Both the per-agent card path and the base-URL fallback are correct (0008-090).
 5. **Crate placement of the HTTP client.** Resolved by integrator ruling: the HTTP client bridge to external A2A agents lives in `driver-a2a-http` (RFC-0009). `gateway-http` does not link it, consistent with rule 0001-002.
 6. **Gateway-attested card.** Default: none. The derived card is unsigned (0008-016).
@@ -517,4 +531,6 @@ Test plan (not run by this RFC):
 9. **Loopback anonymous default.** Default: enabled for direct loopback, disabled automatically when a proxy is declared (0008-009). Operators on shared hosts disable it.
 10. **Failure reason location.** Resolved: the `a2abus.failure` key in status message metadata (plain key, not an extension), value is the bare RFC-0009 token; registry owned by RFC-0005 section 4.9. Bus-visible reasons carry no ErrorInfo domain (0008-079).
 11. **ListTasks page token format.** Default: opaque, worker-defined; the gateway passes it through unchanged.
-12. **Hermes `[UNVERIFIED]` ErrorInfo spelling.** Reasons in this RFC follow `docs/interop/a2a-spec-notes.md` section 6.1, whose spelling is `[UNVERIFIED]`. Default: adopt the names as listed and confirm against the official proto before implementation.
+12. **Hermes `[UNVERIFIED]` ErrorInfo spelling.** Reasons follow `docs/interop/a2a-spec-notes.md` section 6.1, still `[UNVERIFIED]`. SP-4 observed that Hermes emits no `error.data` at all, so Hermes cannot confirm the spelling. Default: adopt the names as listed and confirm against the official proto before implementation.
+13. **Hermes items UNOBSERVED in SP-4.** 413 body, 429 body, 403 PEER_NOT_TRUSTED, WWW-Authenticate, configured-peer bearer success, SSE keepalive in long runs, non-terminal cancel, cross-origin taskId in SendMessage, card GET path, non-1.0 bare Task. Default: the gateway follows the spec; the bridge tolerates Hermes deviations (0008-098). Re-check before Accepted.
+14. **Card `pushNotifications` under D-2.** The spike suggested advertising `pushNotifications` false when credentials are required. M1 rejects credentials (0008-059) but keeps push create, so the card keeps the per-configuration value (0008-013). Integrator to confirm.

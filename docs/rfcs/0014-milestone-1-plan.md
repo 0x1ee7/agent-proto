@@ -184,7 +184,7 @@ Per-slice notes that are not obvious from the table:
 
 Spikes run in parallel on day one. Each spike is time-boxed to one day unless the owning RFC says otherwise.
 
-- [0014-040] Each spike MUST end with a result note recorded in the owning RFC's open issues (the question, the observed answer, the version tested, and the RFC change or default confirmed). Spike code MUST be deleted after the note is written.
+- [0014-040] Each spike MUST end with a result note recorded in the owning RFC's open issues (the question, the observed answer, the version tested, and the RFC change or default confirmed). Spike scripts MUST stay committed under `spikes/<spike>/` (the NATS scripts under `spikes/nats/`) as reproducible evidence. They are not production code, are not part of the Rust workspace, and MUST NOT be built by the workspace.
 - [0014-041] A spike whose result contradicts a MUST in an RFC MUST block that RFC's move to Accepted until the RFC is revised.
 
 | Spike | Question | Source of the unverified item | Owning RFC to update |
@@ -196,6 +196,18 @@ Spikes run in parallel on day one. Each spike is time-boxed to one day unless th
 | SP-5 | Does `async-nats` build on MSVC and Linux; can it set the inbox prefix (0010-066); does it support ordered consumers with heartbeats and `allow_responses` as configured? | RFC-0010 open issues 4 to 8 | RFC-0010 |
 | SP-6 | Read the A2A custom-binding conformance text against the bus. Which of the transition, terminal-immutability, `TASK_STATE_UNSPECIFIED` and error-spelling items in `docs/interop/a2a-spec-notes.md` are normative for the bus? Does the gateway need HTTP 401 and 403 mapped to A2A errors? | `docs/interop/a2a-spec-notes.md` sections 6, 8, 10 (D-6 to D-9); RFC-0002 section 7 conflicts (a) to (d) | RFC-0002, RFC-0008 |
 | SP-7 | Does the pinned a2a-sdk Python client fetch the gateway card and send a message with no bus knowledge? Does a card with unknown fields parse? How does the client react to 503 with `Retry-After`? | RFC-0003 open issue 3; RFC-0004 open issue 3; RFC-0008 open issue 4 | RFC-0003, RFC-0004, RFC-0008 |
+
+Spike verdicts (results in `docs/spikes/*.md`; stub-observed results are protocol evidence, not real-model evidence):
+
+- SP-1: verified by spike omp-acp (stub). omp does not use `session/request_permission` for write or read tools; under always-ask it sends `elicitation/create` when the client advertises `elicitation.form`, and denies outright otherwise. Driver advertises `elicitation.form` (RFC-0009). `ask-all` is not declared (D21). Real-model behavior remains UNVERIFIED.
+- SP-2: verified by spike claude-acp (stub). Launch and `session/load` work; `session/resume` works; `CLAUDE_CONFIG_DIR/settings.json` sets `defaultMode`; process cleanup observed (stdin close exit 0; terminate, kill and taskkill exit 1; CTRL_BREAK exit 0xC000013A). Real-model Q4 to Q8 and Q10 remain UNVERIFIED.
+- SP-3: verified by spike nats (nats-server v2.15.2) for the items it covers; see `docs/spikes/nats.md` and AmendNats' RFC-0010/0011 changes.
+- SP-4: verified by spike hermes-a2a (stub, Hermes v0.22.5). Standalone profile required; SendMessage and SSE work; INPUT_REQUIRED detectable from the enum; cross-peer contextId shares history; error deviations confirmed. Unobserved items are listed in RFC-0008 section 9, item 13.
+- SP-5: verified by spike nats (async-nats 0.50.0 builds on MSVC).
+- SP-6: verified by spike a2a-binding-conformance (text reading and stub checks); GAP items assigned to RFC-0002 and RFC-0008.
+- SP-7: no result in `docs/spikes/`; remains open.
+
+Residual real-model re-runs (not yet observed): omp write allow and reject under always-ask, usage, cancel, and resume with a completed turn; claude Q4 write allow and reject, Q5 usage, Q6 cancel, Q7 resume, Q8 advertise, Q10 `claude -p`.
 
 ### 4.5 Test levels and conformance mapping
 
@@ -209,9 +221,9 @@ Likelihood and impact are H, M or L. Mitigations link to spikes or cases.
 
 | Ref | Risk | L | I | Mitigation | Trigger that changes the plan | Owner |
 |---|---|---|---|---|---|---|
-| RK-1 | omp does not gate writes under ACP without elicitation (0006-029 fails) | M | H | SP-1; `ask-all` not declared until 0006-029 passes; the driver fails the task on unanswered calls (0006-025) | SP-1 failure | RFC-0009 driver |
+| RK-1 | omp does not gate writes under ACP without elicitation (0006-029 fails) | M | H | SP-1 (stub) observed the elicitation path; the driver advertises `elicitation.form` and answers `elicitation/create`; `ask-all` is not declared; the driver fails the task on unanswered calls (0006-025). Real-model run still required | SP-1 failure in the real-model run | RFC-0009 driver |
 | RK-2 | NATS per-key KV TTL or JetStream behaviour on Windows differs from RFC-0010 | M | H | SP-3 before any `bus-nats` integration (0014-032); fallback is bucket-level TTL with periodic re-claim | SP-3 failure | RFC-0010 |
-| RK-3 | claude-agent-acp on Windows does not launch under `node` or does not stop cleanly | H | M | SP-2; forced kill at `grace_ms` (RFC-0012 open issue 6) | SP-2 failure | RFC-0009, RFC-0012 |
+| RK-3 | claude-agent-acp on Windows does not launch under `node` or does not stop cleanly | H | M | SP-2 (stub) observed launch and stdin-close exit 0; forced kill at `grace_ms` (RFC-0012 0012-061 and open issue 6) | SP-2 failure or a non-zero exit on stdin close in the real-model run | RFC-0009, RFC-0012 |
 | RK-4 | Hermes does not expose `[INPUT_REQUIRED]` reliably; approvals from Hermes are not detected | M | M | SP-4; detection is enum-only (0009-048); Hermes-side approval is out of the S-cases if not detectable, and the limitation is recorded | SP-4 failure | RFC-0008, RFC-0009 |
 | RK-5 | Stock a2a-sdk rejects extra card fields or the gateway card shape | M | M | SP-7; `[UNVERIFIED]` card tolerance (RFC-0003 open issue 3) | SP-7 failure | RFC-0003 |
 | RK-6 | Duplicate delivery re-runs a turn after a bus restart | L | H | Case 0014-017 and 0014-018; claims and `A2AB-Msg-Id` admission (0005-023, 0005-024) | Any duplicate start | RFC-0005 |
@@ -232,11 +244,11 @@ Likelihood and impact are H, M or L. Mitigations link to spikes or cases.
 - [ ] RFC-0005: transition `(create) -> FAILED LOOP_DETECTED` confirmed (RFC-0006 section 9 request 1); open issue 2 states the retention rule of section 9, item 7; SP-6 result recorded.
 - [ ] RFC-0006: approval field names confirmed with RFC-0012 (section 9, item 14); SP-1 result recorded for 0006-025 and 0006-029.
 - [ ] RFC-0007: [0007-141] error domain changed to `a2abus.v1` (section 9, item 1).
-- [ ] RFC-0008: SP-4 result recorded; `[UNVERIFIED]` items O2, O4, O12 recorded with their defaults; binary name settled with RFC-0012 (section 9, item 13).
+- [ ] RFC-0008: SP-4 result recorded (stub); unobserved Hermes items listed in section 9, item 13; `[UNVERIFIED]` items O2, O4, O12 recorded with their defaults; binary name settled with RFC-0012 (section 9, item 13).
 - [ ] RFC-0009: PEER_* split from BackendAuthor merged and consistent with 0009-051 and 0009-072; SP-1 and SP-2 results recorded; SP-4 result recorded.
 - [ ] RFC-0010: [0010-025] matches section 9, item 2 exactly; open issue 10 states the retention rule of item 7; SP-3 and SP-5 results recorded; open issues 1 to 4 and 17 closed or defaulted.
 - [ ] RFC-0011: O2 partition-tolerance wording confirmed (not claimed in M1); O7 read authorization recorded against RFC-0010.
-- [ ] RFC-0012: open issues 1 to 6 defaulted or resolved; CTRL_BREAK result from SP-2 recorded.
+- [ ] RFC-0012: open issues 1 to 6 defaulted or resolved; CTRL_BREAK result from SP-2 (claude 0xC000013A, nats-server exit 0) recorded.
 - [ ] RFC-0013: [0013-012] matches section 9, item 2 exactly; L1 wording covered by RFC-0001 (item 6); reserved emitter ids (RFC-0001 section 4.4, item 16); spool and sink rows run.
 - [ ] Every section 9 item marked "blocks M1" is closed.
 
@@ -319,7 +331,7 @@ Threats are the T-numbers of `docs/requirements.md` section 8. Each row names th
 | [0014-030] | Dependency check from `cargo metadata` against the graph in 4.3; any extra edge fails | MUST |
 | [0014-031] | Each crate directory has an `AGENTS.md`; each slice's rows are present in the suite | MUST |
 | [0014-032] | `bus-nats` integration suite refuses to run unless the SP-3 result is recorded in RFC-0010 | MUST |
-| [0014-040] | Spike notes exist in the owning RFCs and no spike code is in the repository | MUST |
+| [0014-040] | Spike notes exist in the owning RFCs; spike scripts stay committed under `spikes/` (NATS under `spikes/nats/`) as reproducible evidence, not production code and not in the Rust workspace | MUST |
 | [0014-041] | Gate checklist shows the affected RFC not Accepted when a spike contradicts it | MUST |
 | [0014-050] | Each row in the gate report carries one of the five level names | MUST |
 | [0014-060] | Gate checklist check: each RFC line in 4.7 checked before its status changes | MUST |
@@ -340,8 +352,8 @@ Each item has a proposed default. The default holds unless the named RFC changes
 8. **`T_task` default (resolved by integrator ruling).** `T_task` defaults to 24 h (RFC-0005 [0005-043]); the event `max_age` rule of item 7 applies. Closed.
 9. **Single live worker per agent id.** RFC-0005 open issue 1 names the store lease as the enforcer. Default: one live worker per agent id per tenant, enforced by the store lease. Closed.
 10. **Dedupe window.** RFC-0010 [0010-026] and RFC-0011 [0011-031] both use 3630 s for event streams. Default: 3630 s. Closed.
-11. **Omp elicitation.** RFC-0009 open issue O1 and RFC-0006 [0006-025] and [0006-029]. Default: `elicitation.form` not advertised; `ask-all` not declared until the conformance case passes (SP-1). Blocks M1 until SP-1 result.
-12. **Claude session restore.** RFC-0009 [0009-013] and open issue O2. Default: `session/load` then `session/resume` then new session with notice. Resolved by SP-2.
+11. **Omp elicitation (resolved by SP-1, stub).** Driver advertises `elicitation.form`; `elicitation/create` maps to the approval extension and is answered (RFC-0006 [0006-025] and [0006-029]). `ask-all` is not declared; `ask-exec` maps to `always-ask-cached`, beyond-stub behavior UNVERIFIED. Real-model re-run remains. Does not block M1 on the stub result.
+12. **Claude session restore (resolved by SP-2, stub).** `session/load` and `session/resume` work with claude; omp returns "ACP session not found" (-32603) after a completed turn, so the driver treats not-found as a fresh session and rebuilds context from the bus Worker task history (RFC-0009 [0009-013]). Never assume resume.
 13. **Binary name for the gateway.** RFC-0012 open issue 4 uses `a2a-gateway` as an example; RFC-0008 names the binary. Default: RFC-0008 name wins; RFC-0012 example is aligned. Change RFC-0012 example.
 14. **Approval field names.** RFC-0012 open issue 9 defers to RFC-0006. Default: RFC-0006 names. Closed by RFC-0012 following them.
 15. **Transition for loop rule.** RFC-0006 section 9 request 1 adds `(create) -> FAILED LOOP_DETECTED`; RFC-0005 table row 66 carries it. Default: keep the row; integrator confirms. Blocks RFC-0005 acceptance.
