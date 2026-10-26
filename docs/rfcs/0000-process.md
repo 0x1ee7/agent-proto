@@ -43,7 +43,7 @@ Every normative statement carries an ID of the form `[NNNN-xxx]` where NNNN is t
 
 ## 5. Writing rules
 
-- State behavior, not implementation. Rust types appear only in RFC-0001 and RFC-0011.
+- State behavior, not implementation. Rust types appear only in RFC-0001, and in non-normative appendices labeled as sketches (RFC-0009 Backend, RFC-0011 Bus).
 - Every field, subject, header and state named in an RFC is defined exactly once; other RFCs reference it, never redefine it.
 - Examples are normative-by-illustration: they MUST be consistent with the text and use the same names.
 - Cross-RFC references use `RFC-NNNN [NNNN-xxx]`.
