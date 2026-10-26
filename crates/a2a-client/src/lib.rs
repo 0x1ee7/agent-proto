@@ -15,6 +15,7 @@ pub mod error;
 pub mod event;
 pub mod outbound;
 pub mod presence;
+pub mod signing;
 pub mod stream;
 
 pub use client::{Client, Outcome, SendReply, StreamStart, Unary};

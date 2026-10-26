@@ -17,7 +17,7 @@ use pbjson_types::{Struct, Timestamp};
 use serde_json::{Value, json};
 
 use crate::client::{Client, SendReply, Unary};
-use crate::config::CallOptions;
+use crate::config::{CallOptions, SigningHook};
 use crate::error::{ApprovalError, ClientError};
 use crate::outbound::Outbound;
 
@@ -135,7 +135,8 @@ impl<B: Bus> Client<B> {
     /// Sends the operator's decision for `pending` to `agent` (RFC-0006 0006-012).
     ///
     /// The decision is a continuation of the waiting task in its context. It names the request
-    /// id, task id, option, nonce and digest, and carries this client's identity as `decidedBy`.
+    /// id, task id, option, nonce and digest. `decidedBy` is left empty: the worker fills in the
+    /// verified identity of the operator ([0007-098]).
     /// The option must be offered and the request must not have expired ([0006-013]).
     ///
     /// # Errors
@@ -148,15 +149,53 @@ impl<B: Bus> Client<B> {
         option_id: &str,
         opts: &CallOptions,
     ) -> Result<Unary<SendReply>, ClientError> {
+        self.decide_with(
+            agent,
+            pending,
+            option_id,
+            self.config.signing.as_deref(),
+            opts,
+        )
+        .await
+    }
+
+    /// Sends the operator's decision with the envelope signed by `operator` (RFC-0007 0007-095).
+    ///
+    /// The message is the same as [`Self::decide`]. `operator` is a hook built on the operator
+    /// key, such as [`crate::signing::envelope_hook`]. The verifier then checks the signature
+    /// against the operator role and the relay sender of this client (`tui` or `cli`).
+    ///
+    /// # Errors
+    /// As [`Self::decide`], plus any error the `operator` hook returns while signing.
+    pub async fn decide_signed(
+        &self,
+        agent: &a2a_types::ids::AgentId,
+        pending: &PendingApproval,
+        option_id: &str,
+        operator: &dyn SigningHook,
+        opts: &CallOptions,
+    ) -> Result<Unary<SendReply>, ClientError> {
+        self.decide_with(agent, pending, option_id, Some(operator), opts)
+            .await
+    }
+
+    async fn decide_with(
+        &self,
+        agent: &a2a_types::ids::AgentId,
+        pending: &PendingApproval,
+        option_id: &str,
+        signing: Option<&dyn SigningHook>,
+        opts: &CallOptions,
+    ) -> Result<Unary<SendReply>, ClientError> {
         let now = self.clock.now_ms().ok_or(ClientError::Clock)?;
         pending.check(option_id, now)?;
-        let outbound = decision_outbound(self.sender.as_str(), pending, option_id, now)?;
-        self.send(agent, &outbound, opts).await
+        let outbound = decision_outbound(pending, option_id, now)?;
+        self.send_with(agent, &outbound, opts, outbound.return_immediately, signing)
+            .await
     }
 }
 
 fn decision_outbound(
-    decided_by: &str,
     pending: &PendingApproval,
     option_id: &str,
     now_ms: u64,
@@ -170,7 +209,6 @@ fn decision_outbound(
         "taskId": pending.request.task_id,
         "optionId": option_id,
         "nonce": pending.request.nonce,
-        "decidedBy": decided_by,
         "decidedAt": serde_json::to_value(decided_at).map_err(|_| ClientError::Clock)?,
         "requestSha256": pending.digest,
     });

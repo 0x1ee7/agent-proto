@@ -20,7 +20,7 @@ use bus_api::bus::Bus;
 use bus_api::message::Reply;
 use bus_api::name::Principal;
 
-use crate::config::{CallOptions, Config};
+use crate::config::{CallOptions, Config, SigningHook};
 use crate::error::ClientError;
 use crate::outbound::Outbound;
 use crate::stream::EventStream;
@@ -140,6 +140,27 @@ impl<B: Bus> Client<B> {
             tenant: self.tenant_string(),
             id: id.as_str().to_owned(),
             ..Default::default()
+        });
+        self.call(agent, Op::Get, body, opts, MessageId::generate())
+            .await
+    }
+
+    /// Fetches a task snapshot (`GetTask`) with `historyLength` forwarded unchanged
+    /// (RFC-0008 [0008-094]). `None` keeps the protocol default.
+    ///
+    /// # Errors
+    /// Returns the mapped bus, wire or local error of the call.
+    pub async fn get_task_with_history(
+        &self,
+        agent: &AgentId,
+        id: &TaskId,
+        history_length: Option<i32>,
+        opts: &CallOptions,
+    ) -> Result<Unary<pb::Task>, ClientError> {
+        let body = RequestBody::GetTask(pb::GetTaskRequest {
+            tenant: self.tenant_string(),
+            id: id.as_str().to_owned(),
+            history_length,
         });
         self.call(agent, Op::Get, body, opts, MessageId::generate())
             .await
@@ -295,8 +316,14 @@ impl<B: Bus> Client<B> {
         outbound: &Outbound,
         opts: &CallOptions,
     ) -> Result<Unary<SendReply>, ClientError> {
-        self.send_with(agent, outbound, opts, outbound.return_immediately)
-            .await
+        self.send_with(
+            agent,
+            outbound,
+            opts,
+            outbound.return_immediately,
+            self.config.signing.as_deref(),
+        )
+        .await
     }
 
     /// Sends a message, retrying up to `attempts` times on local deadline expiry.
@@ -424,7 +451,15 @@ impl<B: Bus> Client<B> {
         let mut call_opts = opts.clone();
         call_opts.timeout = Some(bound + Duration::from_millis(a2a_core::budget::WALL_MARGIN_MS));
         call_opts.ttl_ms.get_or_insert(ttl_ms);
-        let reply = self.send_with(agent, outbound, &call_opts, false).await?;
+        let reply = self
+            .send_with(
+                agent,
+                outbound,
+                &call_opts,
+                false,
+                self.config.signing.as_deref(),
+            )
+            .await?;
         match reply.value {
             SendReply::Message(message) => Ok(Outcome::Message(message)),
             SendReply::Task(task) => {
@@ -457,16 +492,24 @@ impl<B: Bus> Client<B> {
         }))
     }
 
-    async fn send_with(
+    pub(crate) async fn send_with(
         &self,
         agent: &AgentId,
         outbound: &Outbound,
         opts: &CallOptions,
         return_immediately: bool,
+        signing: Option<&dyn SigningHook>,
     ) -> Result<Unary<SendReply>, ClientError> {
         let body = self.send_body(outbound, return_immediately)?;
         let reply: Unary<pb::SendMessageResponse> = self
-            .call(agent, Op::Send, body, opts, outbound.message_id.clone())
+            .call_signed(
+                agent,
+                Op::Send,
+                body,
+                opts,
+                outbound.transport_id.clone(),
+                signing,
+            )
             .await?;
         let value = match reply.value.payload {
             Some(pb::send_message_response::Payload::Task(task)) => SendReply::Task(task),
@@ -491,7 +534,7 @@ impl<B: Bus> Client<B> {
     ) -> Result<Unary<SendReply>, ClientError> {
         let body = self.send_body(outbound, true)?;
         let reply: Unary<pb::StreamResponse> = self
-            .call(agent, Op::Stream, body, opts, outbound.message_id.clone())
+            .call(agent, Op::Stream, body, opts, outbound.transport_id.clone())
             .await?;
         let value = match reply.value.payload {
             Some(pb::stream_response::Payload::Task(task)) => SendReply::Task(task),
@@ -516,6 +559,27 @@ impl<B: Bus> Client<B> {
         body: RequestBody,
         opts: &CallOptions,
         msg_id: MessageId,
+    ) -> Result<Unary<M>, ClientError> {
+        self.call_signed(
+            agent,
+            op,
+            body,
+            opts,
+            msg_id,
+            self.config.signing.as_deref(),
+        )
+        .await
+    }
+
+    /// Runs one exchange like [`Self::call`], signing with `signing` instead of the configured hook.
+    async fn call_signed<M: WireMessage>(
+        &self,
+        agent: &AgentId,
+        op: Op,
+        body: RequestBody,
+        opts: &CallOptions,
+        msg_id: MessageId,
+        signing: Option<&dyn SigningHook>,
     ) -> Result<Unary<M>, ClientError> {
         if let Some(traceparent) = &opts.traceparent {
             headers::validate_traceparent(traceparent).map_err(ClientError::Header)?;
@@ -556,7 +620,7 @@ impl<B: Bus> Client<B> {
                 .insert(headers::AFTER_SEQ, &after.to_string())
                 .map_err(ClientError::Name)?;
         }
-        if let Some(hook) = &self.config.signing {
+        if let Some(hook) = signing {
             hook.before_send(&mut outgoing)?;
         }
         let reply = self

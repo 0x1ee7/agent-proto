@@ -11,8 +11,12 @@ use crate::error::ClientError;
 /// A user message to send through `SendMessage` or `SendStreamingMessage`.
 #[derive(Debug, Clone)]
 pub struct Outbound {
-    /// Message identifier; retries MUST reuse it (RFC-0005 0005-034).
+    /// Opaque A2A message identifier, forwarded unchanged in `Message.messageId` (RFC-0008
+    /// 0008-082). Retries resend it unchanged (RFC-0005 0005-034).
     pub message_id: MessageId,
+    /// Transport identifier sent as `A2AB-Msg-Id`: a fresh UUIDv7 per outbound message
+    /// (RFC-0002 0002-031). Retries reuse it so the worker can dedupe them.
+    pub(crate) transport_id: MessageId,
     /// Task to continue; `None` creates a new task (RFC-0005 0005-047).
     pub task_id: Option<TaskId>,
     /// Context of the task; required when `task_id` is set (RFC-0005 0005-002).
@@ -33,6 +37,7 @@ impl Outbound {
     pub fn new(parts: Vec<pb::Part>) -> Self {
         Self {
             message_id: MessageId::generate(),
+            transport_id: MessageId::generate(),
             task_id: None,
             context_id: None,
             parts,

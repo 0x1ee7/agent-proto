@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use a2a_client::{Client, Config};
 use a2a_core::envelope::{self, Clock, Inbound, ReplyOptions};
+use a2a_core::headers as hdr;
 use a2a_core::subject::{self, Op};
+use a2a_security::envelope::Envelope;
 use a2a_types::ids::{AgentId, TenantId};
 use bus_api::bus::{Bus, RequestStream};
 use bus_api::capabilities::Capabilities;
@@ -216,8 +218,8 @@ impl Fixture {
         let tenant = TenantId::parse(TENANT).expect("tenant");
         let client_id = AgentId::parse("cli").expect("client id");
         let worker_id = AgentId::parse("worker-a").expect("worker id");
-        let cards = Bucket::new(&tenant, "a2ab-t1-cards").expect("cards bucket");
-        let presence = Bucket::new(&tenant, "a2ab-t1-presence").expect("presence bucket");
+        let cards = Bucket::new(&tenant, "cards").expect("cards bucket");
+        let presence = Bucket::new(&tenant, "presence").expect("presence bucket");
         let rpc_pattern = SubjectPattern::parse("a2a.v1.t1.rpc.>").expect("rpc pattern");
         let worker = Principal::named("worker-a").expect("worker principal");
         // bus-mem authorizes serve by exact pattern equality, so grant each op's subject.
@@ -299,6 +301,19 @@ impl Fixture {
         envelope::receive(&envelope::Config::default(), self.clock.as_ref(), request)
             .expect("worker accepts request")
     }
+    /// Receives one request and decodes it, keeping the signed envelope and payload for
+    /// verification.
+    pub async fn next_signed(
+        &self,
+        requests: &mut <MemBus as Bus>::Requests,
+    ) -> (Inbound, Envelope, Bytes) {
+        let request: Request = requests.next().await.expect("request");
+        let envelope = envelope_of(request.subject.as_str(), &request.headers);
+        let payload = request.payload.clone();
+        let inbound = envelope::receive(&envelope::Config::default(), self.clock.as_ref(), request)
+            .expect("worker accepts request");
+        (inbound, envelope, payload)
+    }
 
     /// Replies to an inbound request with `message`.
     pub fn reply<M: envelope::WireMessage>(&self, inbound: Inbound, message: &M) {
@@ -332,5 +347,34 @@ impl Fixture {
 impl Default for Fixture {
     fn default() -> Self {
         Self::new()
+    }
+}
+/// Rebuilds the security envelope of a received request from its raw headers ([0007-034]).
+fn envelope_of(subject: &str, headers: &Headers) -> Envelope {
+    let value = |name: &str| headers.get(name).unwrap_or_default().to_owned();
+    let block = |name: &str| headers.get(name).map(str::to_owned);
+    Envelope {
+        subject: subject.to_owned(),
+        msg_id: value(hdr::MSG_ID),
+        sender: value(hdr::SENDER),
+        version: value(hdr::A2A_VERSION),
+        extensions: value(hdr::A2A_EXTENSIONS),
+        origin: value(hdr::ORIGIN),
+        ttl_ms: value(hdr::TTL_MS),
+        causation_id: value(hdr::CAUSATION_ID),
+        payload_type: value(hdr::PAYLOAD_TYPE),
+        after_seq: value(hdr::AFTER_SEQ),
+        content_type: value(hdr::CONTENT_TYPE),
+        semantic: headers
+            .iter()
+            .filter_map(|(name, text)| {
+                name.strip_prefix(hdr::SP_PREFIX)
+                    .map(|key| (key.to_owned(), text.to_owned()))
+            })
+            .collect(),
+        kid: block(hdr::KID),
+        ts: block(hdr::TS),
+        nonce: block(hdr::NONCE),
+        signature: block(hdr::SIG),
     }
 }

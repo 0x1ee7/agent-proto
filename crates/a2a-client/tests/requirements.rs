@@ -3,21 +3,32 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use a2a_client::approval::{PendingApproval, allow_once};
+use a2a_client::signing::envelope_hook;
 use a2a_client::{
     ApprovalError, CallOptions, ClientError, Directory, Outbound, Outcome, Presence, PresenceState,
-    Query, SendReply, text,
+    Query, SendReply, SigningHook, text,
 };
 use a2a_core::approval::ALLOW_ONCE_ID;
 use a2a_core::envelope::{ReplyOptions, RequestBody};
 use a2a_core::subject::Op;
-use a2a_security::decision::request_digest;
-use a2a_types::ids::AgentId;
+use a2a_security::clock::Clock as SecurityClock;
+use a2a_security::decision::{
+    ApprovalBook, DecisionOrigin, decision_from_json, request_digest, verify_decision,
+};
+use a2a_security::envelope::{Envelope, MessageClass, VerifyContext, verify_request};
+use a2a_security::identity::{Ed25519Signer, Signer, encode_public_key};
+use a2a_security::mode::{Policy, SigningMode};
+use a2a_security::replay::ReplayCache;
+use a2a_security::trust::TrustStore;
+use a2a_types::ids::{AgentId, TenantId};
 use a2a_types::proto::a2a as pb;
+use a2a_types::proto::a2abus;
 use a2a_types::vocab::ext::APPROVAL;
-use common::{Fixture, NOW_MS};
+use common::{Fixture, NOW_MS, TENANT};
 use pbjson_types::{Struct, Value as PbValue};
 use serde_json::json;
 
@@ -52,8 +63,8 @@ fn approval_task(task_id: &str, expires_at: &str) -> pb::Task {
         "requester": "worker-a",
         "nonce": "0123456789abcdef0123",
         "options": [
-            {"optionId": ALLOW_ONCE_ID, "name": "Allow once"},
-            {"optionId": "reject-once", "name": "Reject once"}
+            {"optionId": ALLOW_ONCE_ID, "name": "Allow once", "kind": "APPROVAL_OPTION_KIND_ALLOW_ONCE"},
+            {"optionId": "reject-once", "name": "Reject once", "kind": "APPROVAL_OPTION_KIND_REJECT_ONCE"}
         ],
         "expiresAt": expires_at
     });
@@ -149,6 +160,36 @@ async fn req_0002_051_reply_reports_last_seq() {
     assert!(matches!(reply.value, SendReply::Task(_)));
 }
 
+// [0008-082] The caller's messageId is forwarded unchanged in the body, while the transport
+// A2AB-Msg-Id stays a fresh UUIDv7 per request (RFC-0002 0002-031).
+#[tokio::test]
+async fn req_0008_082_caller_message_id_is_forwarded_unchanged() {
+    let fx = Fixture::new();
+    let client = fx.client();
+    let mut requests = fx.serve(Op::Send).await;
+    let opaque = "0123456789abcdef0123456789abcdef";
+    let outbound = Outbound::new(vec![text("hello")])
+        .with_message_id(a2a_types::ids::MessageId::parse(opaque).expect("opaque id"));
+    let worker = async {
+        let inbound = fx.next_inbound(&mut requests).await;
+        let transport = &inbound.head.msg_id;
+        assert!(transport.is_uuidv7(), "A2AB-Msg-Id must be a UUIDv7");
+        let RequestBody::SendMessage(send) = &inbound.body else {
+            panic!("expected a SendMessage body");
+        };
+        let forwarded = send.message.as_ref().expect("message").message_id.as_str();
+        assert_eq!(forwarded, opaque);
+        let answer = send_answer(task("t-1", pb::TaskState::Completed));
+        fx.reply(inbound, &answer);
+    };
+    let options = CallOptions::default();
+    let (outcome, ()) = tokio::join!(
+        client.send_and_wait(&fx.worker_id, &outbound, &options),
+        worker
+    );
+    assert!(outcome.is_ok(), "send succeeds with an opaque messageId");
+}
+
 // [0002-050] A call with no worker answering fails with a bus error instead of hanging.
 #[tokio::test]
 async fn req_0002_050_send_without_worker_fails() {
@@ -195,7 +236,10 @@ async fn req_0006_012_decision_continues_task_with_digest() {
     assert_eq!(decision["requestSha256"], pending.digest());
     assert_eq!(decision["optionId"], ALLOW_ONCE_ID);
     assert_eq!(decision["taskId"], "t-approve");
-    assert_eq!(decision["decidedBy"], "cli");
+    assert!(
+        decision["decidedBy"].is_null(),
+        "the worker fills decidedBy from the operator key"
+    );
 }
 
 // [0006-013] An option the request does not offer is refused before anything is sent.
@@ -303,10 +347,9 @@ fn presence_json(state: &str) -> Vec<u8> {
 #[tokio::test]
 async fn req_0004_020_view_is_fresh_for_sixty_seconds() {
     let fx = Fixture::new();
-    fx.kv_put("a2ab-t1-cards", "worker-a", &card_json("1.0.0"))
-        .await;
+    fx.kv_put("cards", "worker-a", &card_json("1.0.0")).await;
     fx.kv_put(
-        "a2ab-t1-presence",
+        "presence",
         "worker-a",
         &presence_json("PRESENCE_STATE_READY"),
     )
@@ -358,8 +401,7 @@ async fn req_0004_020_unsynced_view_is_not_served() {
 #[tokio::test]
 async fn req_0004_021_offline_cards_are_excluded_unless_asked() {
     let fx = Fixture::new();
-    fx.kv_put("a2ab-t1-cards", "worker-a", &card_json("1.0.0"))
-        .await;
+    fx.kv_put("cards", "worker-a", &card_json("1.0.0")).await;
     let client = fx.client();
     let mut directory = Directory::new(&client);
     directory.sync().await.expect("sync");
@@ -372,14 +414,28 @@ async fn req_0004_021_offline_cards_are_excluded_unless_asked() {
     assert!(!everyone[0].is_ready());
 }
 
+// [0004-021] All cards are listed without a query; offline cards still need the flag.
+#[tokio::test]
+async fn req_0004_021_all_lists_cards_without_query() {
+    let fx = Fixture::new();
+    fx.kv_put("cards", "worker-a", &card_json("1.0.0")).await;
+    let client = fx.client();
+    let mut directory = Directory::new(&client);
+    directory.sync().await.expect("sync");
+
+    assert!(directory.all(false).expect("all").is_empty());
+    let everyone = directory.all(true).expect("all");
+    assert_eq!(everyone.len(), 1);
+    assert_eq!(everyone[0].card.agent().as_str(), "worker-a");
+}
+
 // [0004-022] The query form selects agents by skill; a non-matching skill finds nothing.
 #[tokio::test]
 async fn req_0004_022_query_matches_skill_only() {
     let fx = Fixture::new();
-    fx.kv_put("a2ab-t1-cards", "worker-a", &card_json("1.0.0"))
-        .await;
+    fx.kv_put("cards", "worker-a", &card_json("1.0.0")).await;
     fx.kv_put(
-        "a2ab-t1-presence",
+        "presence",
         "worker-a",
         &presence_json("PRESENCE_STATE_READY"),
     )
@@ -402,10 +458,9 @@ async fn req_0004_022_query_matches_skill_only() {
 #[tokio::test]
 async fn req_0004_014_draining_agent_is_not_routable() {
     let fx = Fixture::new();
-    fx.kv_put("a2ab-t1-cards", "worker-a", &card_json("1.0.0"))
-        .await;
+    fx.kv_put("cards", "worker-a", &card_json("1.0.0")).await;
     fx.kv_put(
-        "a2ab-t1-presence",
+        "presence",
         "worker-a",
         &presence_json("PRESENCE_STATE_DRAINING"),
     )
@@ -417,4 +472,218 @@ async fn req_0004_014_draining_agent_is_not_routable() {
         .query(&Query::Skill("echo".to_owned()), false)
         .expect("query");
     assert!(listed.is_empty(), "draining agents are not routed to");
+}
+
+// [0008-094] historyLength passed to get_task_with_history reaches the worker unchanged.
+#[tokio::test]
+async fn req_0008_094_history_length_is_forwarded() {
+    let fx = Fixture::new();
+    let client = fx.client();
+    let mut requests = fx.serve(Op::Get).await;
+    let options = CallOptions::default();
+    let task_id = a2a_types::ids::TaskId::parse("t-h").expect("task id");
+    let worker = async {
+        let inbound = fx.next_inbound(&mut requests).await;
+        let RequestBody::GetTask(get) = &inbound.body else {
+            panic!("expected GetTask");
+        };
+        let seen = get.history_length;
+        fx.reply(inbound, &task("t-h", pb::TaskState::Working));
+        seen
+    };
+    let (result, seen) = tokio::join!(
+        client.get_task_with_history(&fx.worker_id, &task_id, Some(5), &options),
+        worker
+    );
+    result.expect("get_task_with_history");
+    assert_eq!(seen, Some(5));
+}
+/// Operator key of the deployment; its trust entry has role `operator`.
+fn operator_signer() -> Ed25519Signer {
+    Ed25519Signer::from_seed(&AgentId::parse("operator").expect("agent"), &[9; 32])
+}
+
+/// A key under the relay's name that the worker does not trust: an agent-signed decision.
+fn agent_signer() -> Ed25519Signer {
+    Ed25519Signer::from_seed(&AgentId::parse("cli").expect("agent"), &[4; 32])
+}
+
+/// The worker's trust store: the operator key only.
+fn worker_trust() -> TrustStore {
+    let operator = operator_signer();
+    let body = format!(
+        "schema = \"a2abus.trust/1\"\n\
+         [[key]]\nkid = \"{}\"\nagent = \"operator\"\nrole = \"operator\"\ntenants = [\"{TENANT}\"]\npublic_key = \"{}\"\n",
+        operator.kid(),
+        encode_public_key(&operator.public_key()),
+    );
+    TrustStore::parse(&body).expect("trust loads")
+}
+
+fn now_i64() -> i64 {
+    i64::try_from(NOW_MS).expect("clock fits i64")
+}
+
+/// Worker-side approval book with `request` opened, as the worker does on approval.
+fn opened_book(request: &a2abus::ApprovalRequest) -> ApprovalBook {
+    let book = ApprovalBook::default();
+    book.open(request, now_i64()).expect("worker opens request");
+    book
+}
+
+/// Fixed security clock for the worker-side checks.
+struct FixedNow(i64);
+
+impl SecurityClock for FixedNow {
+    fn now_ms(&self) -> i64 {
+        self.0
+    }
+}
+
+/// Worker-side check of a signed decision: the envelope first ([0007-039]), then the decision
+/// against the request it names ([0006-051]).
+fn worker_verifies(
+    trust: &TrustStore,
+    book: &ApprovalBook,
+    envelope: &Envelope,
+    payload: &[u8],
+    wire: &serde_json::Value,
+) -> Result<(), String> {
+    let clock = FixedNow(now_i64());
+    let tenant = TenantId::parse(TENANT).expect("tenant");
+    let ctx = VerifyContext {
+        trust,
+        clock: &clock,
+        policy: Policy {
+            signing: SigningMode::Enabled,
+            ..Policy::default()
+        },
+        tenant: &tenant,
+    };
+    let relay = AgentId::parse("cli").expect("relay");
+    let replay = ReplayCache::new(64);
+    let sender = verify_request(
+        &ctx,
+        MessageClass::OperatorDecision { publisher: &relay },
+        &replay,
+        envelope,
+        payload,
+    )
+    .map_err(|err| format!("envelope refused: {err:?}"))?
+    .ok_or_else(|| "decision unsigned".to_owned())?;
+    let decision =
+        decision_from_json(wire).map_err(|err| format!("decision malformed: {err:?}"))?;
+    verify_decision(&ctx, book, DecisionOrigin::Signed(&sender), &decision)
+        .map(|_| ())
+        .map_err(|err| format!("decision refused: {err:?}"))
+}
+
+/// Sends `pending`'s decision signed by `operator`; the fake worker verifies it against `book`
+/// and replies. Returns the worker's verdict.
+async fn decide_signed_against(
+    fx: &Fixture,
+    operator: &dyn SigningHook,
+    pending: &PendingApproval,
+    option: &str,
+    book: &ApprovalBook,
+    trust: &TrustStore,
+) -> Result<(), String> {
+    let client = fx.client();
+    let mut requests = fx.serve(Op::Send).await;
+    let worker = async {
+        let (inbound, envelope, payload) = fx.next_signed(&mut requests).await;
+        let verdict = worker_verifies(
+            trust,
+            book,
+            &envelope,
+            &payload,
+            &decision_of(&inbound.body),
+        );
+        fx.reply(
+            inbound,
+            &send_answer(task("t-approve", pb::TaskState::Working)),
+        );
+        verdict
+    };
+    let options = CallOptions::default();
+    let (sent, verdict) = tokio::join!(
+        client.decide_signed(&fx.worker_id, pending, option, operator, &options),
+        worker
+    );
+    sent.expect("decide_signed sends");
+    verdict
+}
+
+// [0007-038] [0007-095] An operator-signed decision passes the worker's envelope and decision checks.
+#[tokio::test]
+async fn req_0007_038_operator_signed_decision_is_accepted() {
+    let fx = Fixture::new();
+    let asked = approval_task("t-approve", EXPIRES_AT);
+    let pending = PendingApproval::from_task(&asked)
+        .expect("decode")
+        .expect("approval present");
+    let option = allow_once(&pending).expect("allow-once offered").to_owned();
+    let operator = envelope_hook(Arc::new(operator_signer()), fx.clock.clone());
+    let book = opened_book(pending.request());
+    let verdict = decide_signed_against(
+        &fx,
+        operator.as_ref(),
+        &pending,
+        &option,
+        &book,
+        &worker_trust(),
+    )
+    .await;
+    verdict.expect("worker accepts the operator decision");
+}
+
+// [0007-038] An envelope signed with an agent key is refused for an operator decision.
+#[tokio::test]
+async fn req_0007_038_agent_signed_decision_is_refused() {
+    let fx = Fixture::new();
+    let asked = approval_task("t-approve", EXPIRES_AT);
+    let pending = PendingApproval::from_task(&asked)
+        .expect("decode")
+        .expect("approval present");
+    let option = allow_once(&pending).expect("allow-once offered").to_owned();
+    let signer = envelope_hook(Arc::new(agent_signer()), fx.clock.clone());
+    let book = opened_book(pending.request());
+    let verdict = decide_signed_against(
+        &fx,
+        signer.as_ref(),
+        &pending,
+        &option,
+        &book,
+        &worker_trust(),
+    )
+    .await;
+    assert!(verdict.is_err(), "an agent key must not pass as operator");
+}
+
+// [0006-051] A decision that names another request's digest is refused, even when operator-signed.
+#[tokio::test]
+async fn req_0006_051_decision_for_other_request_is_refused() {
+    let fx = Fixture::new();
+    let asked = approval_task("t-approve", EXPIRES_AT);
+    let pending = PendingApproval::from_task(&asked)
+        .expect("decode")
+        .expect("approval present");
+    let option = allow_once(&pending).expect("allow-once offered").to_owned();
+    let mut other = pending.request().clone();
+    other.nonce = "other-nonce".to_owned();
+    let book = opened_book(&other);
+    let operator = envelope_hook(Arc::new(operator_signer()), fx.clock.clone());
+    let verdict = decide_signed_against(
+        &fx,
+        operator.as_ref(),
+        &pending,
+        &option,
+        &book,
+        &worker_trust(),
+    )
+    .await;
+    assert!(
+        verdict.is_err(),
+        "a digest of another request must be refused"
+    );
 }

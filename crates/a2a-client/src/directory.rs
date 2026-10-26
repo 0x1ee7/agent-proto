@@ -220,13 +220,30 @@ impl<'a, B: Bus> Directory<'a, B> {
         query: &Query,
         include_offline: bool,
     ) -> Result<Vec<Listing<'_>>, ClientError> {
+        self.listings(|record| matches(query, record), include_offline)
+    }
+
+    /// Lists every card joined with presence, without a skill or tag match. Same filters and
+    /// order as [`Directory::query`] ([0004-021], [0004-023]).
+    ///
+    /// # Errors
+    /// Same as [`Directory::card`].
+    pub fn all(&self, include_offline: bool) -> Result<Vec<Listing<'_>>, ClientError> {
+        self.listings(|_| true, include_offline)
+    }
+
+    fn listings(
+        &self,
+        keep: impl Fn(&CardRecord) -> bool,
+        include_offline: bool,
+    ) -> Result<Vec<Listing<'_>>, ClientError> {
         self.fresh()?;
         let require_signature = self.client.config.trust.is_some();
         let mut listings: Vec<Listing<'_>> = self
             .cards
             .values()
             .filter(|record| !require_signature || record.verified)
-            .filter(|record| matches(query, record))
+            .filter(|record| keep(record))
             .map(|record| Listing {
                 card: record,
                 presence: self.presence.get(record.agent.as_str()),
@@ -254,9 +271,10 @@ impl<'a, B: Bus> Directory<'a, B> {
         Ok(())
     }
 
-    fn bucket(&self, kind: &str) -> Result<Bucket, ClientError> {
-        let name = format!("a2ab-{}-{kind}", self.client.tenant.as_str());
-        Bucket::new(&self.client.tenant, &name).map_err(ClientError::Name)
+    /// Builds a logical bucket name such as `cards`. The bus binding adds the tenant's physical
+    /// prefix (RFC-0010), so the client must not add one here.
+    fn bucket(&self, name: &str) -> Result<Bucket, ClientError> {
+        Bucket::new(&self.client.tenant, name).map_err(ClientError::Name)
     }
 
     /// Reads one KV watch up to its end-of-snapshot marker ([0004-019]).

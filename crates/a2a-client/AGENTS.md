@@ -7,12 +7,14 @@ stores, budget and approval messages, and the client-side hooks for signing and 
 
 Provides:
 - `Client<B: Bus>`: `new`, `send`, `send_retrying`, `send_and_wait`, `stream`, `subscribe`,
-  `get_task`, `list_tasks`, `cancel_task`, `extended_card`, `push_*`, `decide`.
+  `get_task`, `list_tasks`, `cancel_task`, `extended_card`, `push_*`, `decide` (config signing hook),
+  `decide_signed` (explicit operator `SigningHook`, RFC-0007 [0007-038]).
 - `Outbound`, `text`: request message builder (`message_id`, task and context ids, parts,
   budget, return-immediately).
 - `CallOptions`, `Config`, `SigningHook`, `VerifyHook`.
+- `signing::envelope_hook(signer, clock)`: signs outgoing requests (RFC-0007 0007-032..040). No verify constructor: `VerifyHook` lacks the subject and replay/trust state that `verify_request` needs.
 - `EventStream`, `Event`, `StreamStart`, `Outcome`, `SendReply`, `Unary`: task event delivery.
-- `Directory`, `Query`, `Listing`, `CardRecord`, `VIEW_MAX_AGE_MS`: discovery view.
+- `Directory`, `Query`, `Listing`, `CardRecord`, `VIEW_MAX_AGE_MS`: discovery view; `query` filters, `all` lists every card (both use the same offline and order rules).
 - `PendingApproval`, `allow_once`: approval request reading.
 - `Presence`, `PresenceState`: presence record decoding.
 - `budget`: budget allowance and loop-chain helpers over `a2a_core::budget`.
