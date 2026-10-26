@@ -43,10 +43,13 @@ def omp_path() -> str:
     return str(Path(p).resolve())
 
 
+AGENT_DIR = [SPIKE / "agent"]  # sc_resume may switch this for the restarted process
+
+
 def child_env() -> dict:
     env = {k: os.environ[k] for k in ENV_ALLOW if k in os.environ}
     env["PI_NO_TITLE"] = "1"
-    env["PI_CODING_AGENT_DIR"] = str(SPIKE / "agent")  # isolated agent dir; ~/.omp is never read
+    env["PI_CODING_AGENT_DIR"] = str(AGENT_DIR[0])  # isolated agent dir; ~/.omp is never read
     return env
 
 
@@ -87,6 +90,8 @@ class Client:
         self.events: list = []
         self.permissions: list = []
         self.unhandled: list = []
+        self.elicitations: list = []
+        self.elicit_policy = None  # callable(params, client) -> result dict; None leaves the request unanswered
         self.policy = policy or (lambda params: {"outcome": {"outcome": "cancelled"}})
         self.lock = threading.Lock()
         self.write_lock = threading.Lock()
@@ -138,6 +143,12 @@ class Client:
             slot[0].set()
 
     def _on_request(self, msg: dict) -> None:
+        if msg["method"] == "elicitation/create" and self.elicit_policy is not None:
+            answer = self.elicit_policy(msg["params"], self)
+            self.elicitations.append({"t": self.stamp(), "request": msg["params"], "answer": answer})
+            if answer is not None:
+                self._write({"jsonrpc": "2.0", "id": msg["id"], "result": answer})
+            return
         if msg["method"] == "session/request_permission":
             answer = self.policy(msg["params"])
             self.permissions.append({"t": self.stamp(), "request": msg["params"], "answer": answer})
@@ -245,13 +256,13 @@ def overlay(mode: str) -> Path:
     return p
 
 
-def omp_args(work: Path, session_dir: Path, mode: str, via: str = "flag") -> list:
+def omp_args(work: Path, session_dir: Path, mode: str, via: str = "flag", config: Path | None = None) -> list:
     args = [omp_path(), "--mode", "acp", "--cwd", str(work), "--session-dir", str(session_dir),
             "--model", MODEL, "--thinking", "off", "--no-title"]
     if via == "flag":
         args += ["--approval-mode", mode]
     else:
-        args += ["--config", str(overlay(mode))]
+        args += ["--config", str(config or overlay(mode))]
     return args
 
 
@@ -449,8 +460,124 @@ def sc_exit(a):
     return finish(c, out)
 
 
+def elicit_for(a):
+    """Q1 to Q5: answer policy for elicitation/create. Client.elicitations records each request and answer."""
+    def _e(params: dict, client: Client):
+        if a.answer == "accept":
+            return {"action": "accept", "content": {"value": a.value}}
+        if a.answer == "decline":
+            return {"action": "decline"}
+        if a.answer == "cancel":
+            return {"action": "cancel"}
+        if a.answer == "cancel-notify":
+            client.notify("session/cancel", {"sessionId": params["sessionId"]})
+            return {"action": "cancel"}
+        if a.answer == "notify-only":
+            client.notify("session/cancel", {"sessionId": params["sessionId"]})
+            return None  # cancel while the elicitation is pending; the elicitation is never answered
+        return None  # cancel-notify-silent: leave the elicitation unanswered, no session/cancel
+    return _e
+
+
+def sc_elicit(a):
+    """Q1 to Q3, Q5: elicitation/create answers for write, read and bash under a given approval mode."""
+    name = f"elicit-{a.mode}-{a.answer}" + (f"-{a.value.replace(' ', '_')}" if a.answer == "accept" else "")
+    if a.perm != "allow":
+        name += f"-perm-{a.perm}"
+    if a.config_yaml:
+        name += "-cfg"
+    work = fresh_dir("work", name)
+    (work / "read-me.txt").write_text("secret-42\n", encoding="utf-8")
+    cfg, via = None, "flag"
+    if a.config_yaml:
+        cfg = SPIKE / "overlays" / f"{name}.yml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(a.config_yaml.replace("\\n", "\n"), encoding="utf-8")
+        via = "config"
+    c = Client(name, omp_args(work, SPIKE / "sessions" / name, a.mode, via, cfg), work)
+    c.elicit_policy = elicit_for(a)
+    c.policy = policy_for(a.perm)
+    out = {"mode": a.mode, "answer": a.answer, "value": a.value, "config_yaml": a.config_yaml}
+    caps = {**INIT_PARAMS["clientCapabilities"], "elicitation": {"form": {}}}
+    out["initialize_ok"] = "result" in c.call("initialize", {**INIT_PARAMS, "clientCapabilities": caps})
+    sid, _ = new_session(c, work)
+    write_text = ("WRITE_FILE: use your file write tool to create written.txt containing exactly: hello . "
+                  "Then reply DONE.")
+    read_text = "READ_FILE: use your file read tool to read read-me.txt, then reply with its content and nothing else."
+    steps = [("write1", write_text), ("read1", read_text),
+             ("bash1", "RUN_ECHO: use your bash tool to run: echo shell-ok . Then reply DONE."),
+             ("write2", write_text), ("read2", read_text)]
+    for key, text in steps:
+        n0 = len(c.events)
+        out[key] = c.call("session/prompt", {"sessionId": sid, "prompt": text_prompt(text)},
+                          timeout=40 if a.answer == "cancel-notify-silent" else 120)
+        out[key + "_updates"] = summarize_updates(c, n0)
+        if a.answer == "cancel-notify-silent":
+            break
+    out["elicitations"] = c.elicitations
+    out["permissions"] = c.permissions
+    out["unhandled_client_calls"] = c.unhandled
+    out["written_txt_exists"] = (work / "written.txt").exists()
+    return finish(c, out)
+
+
+def resume_client(name: str, work: Path, sdir: Path, a) -> Client:
+    """Start omp; with --default-session-dir the --session-dir flag is omitted (omp's default sessions location)."""
+    args = omp_args(work, sdir, "always-ask")
+    if a.default_session_dir:
+        i = args.index("--session-dir")
+        del args[i:i + 2]
+    return Client(name, args, work)
+
+
+def sc_resume(a):
+    """Q6: which conditions let session/load and session/resume succeed after a restart."""
+    name = ("resume-" + ("same-process" if a.same_process else "restart") + "-"
+            + ("close" if a.close_before else "noclose") + "-" + a.load_cwd + "cwd"
+            + ("-list" if a.list_first else "") + ("-defaultdir" if a.default_session_dir else "")
+            + ("-agentdirb" if a.agent_dir_b else ""))
+    work = fresh_dir("work", name)
+    work_b = fresh_dir("work", name + "-b") if a.load_cwd == "other" else work
+    sdir = fresh_dir("sessions", name)
+    c1 = resume_client(name + "-a", work, sdir, a)
+    out = {"variant": {"same_process": a.same_process, "close_before": a.close_before,
+                       "load_cwd": a.load_cwd, "list_first": a.list_first}}
+    out["initialize_a"] = "result" in c1.call("initialize", INIT_PARAMS)
+    sid, new = new_session(c1, work)
+    out["session_new"] = new
+    out["prompt_a"] = c1.call("session/prompt", {"sessionId": sid, "prompt": text_prompt(
+        "Remember this code word for later: PINEAPPLE. Reply with OK.")}, timeout=180)
+    out["persisted_files"] = sorted(str(p.relative_to(sdir)) for p in sdir.rglob("*") if p.is_file())
+    if a.close_before:
+        out["session_close_a"] = c1.call("session/close", {"sessionId": sid})
+    if a.same_process:
+        c2 = c1
+    else:
+        out["close_a"] = c1.close()
+        c1.save()
+        if a.agent_dir_b:
+            agent_b = SPIKE / "agent-b"
+            shutil.rmtree(agent_b, ignore_errors=True)
+            agent_b.mkdir(parents=True)
+            for f in ("models.yml", "config.yml"):
+                shutil.copy(SPIKE / "agent" / f, agent_b / f)
+            AGENT_DIR[0] = agent_b
+        c2 = resume_client(name + "-b", work_b, sdir, a)
+        out["initialize_b"] = "result" in c2.call("initialize", INIT_PARAMS)
+    if a.list_first:
+        out["session_list"] = c2.call("session/list", {"cwd": str(work_b)})
+    out["session_load"] = c2.call("session/load", {"sessionId": sid, "cwd": str(work_b), "mcpServers": []},
+                                  timeout=120)
+    out["session_resume"] = c2.call("session/resume", {"sessionId": sid, "cwd": str(work_b), "mcpServers": []},
+                                    timeout=120)
+    out["prompt_b"] = c2.call("session/prompt", {"sessionId": sid, "prompt": text_prompt(
+        "CODE_WORD: what code word did I ask you to remember? Reply with the word only.")}, timeout=120)
+    return finish(c2, out)
+
+
 SCENARIOS = {"init": sc_init, "prompt": sc_prompt, "approval": sc_approval, "nofs": sc_nofs,
-             "cancel": sc_cancel, "persist": sc_persist, "exit": sc_exit}
+             "cancel": sc_cancel, "persist": sc_persist, "exit": sc_exit, "elicit": sc_elicit,
+             "resume": sc_resume}
 
 
 def main() -> None:
@@ -462,6 +589,22 @@ def main() -> None:
                     help="flag: --approval-mode; config: --config overlay file")
     ap.add_argument("--elicit", action="store_true",
                     help="approval only: advertise clientCapabilities.elicitation.form (probe declines elicitation/create)")
+    ap.add_argument("--answer", default="accept",
+                    choices=["accept", "decline", "cancel", "cancel-notify", "cancel-notify-silent", "notify-only"],
+                    help="elicit scenario: answer to elicitation/create")
+    ap.add_argument("--value", default="Approve", help="elicit scenario: enum value sent on accept")
+    ap.add_argument("--config-yaml", default=None,
+                    help="elicit scenario: overlay YAML (use literal \\n) passed with --config")
+    ap.add_argument("--perm", default="allow", choices=["allow", "reject", "cancel"],
+                    help="elicit scenario: answer to session/request_permission (bash)")
+    ap.add_argument("--same-process", action="store_true", help="resume: load in the same process (no restart)")
+    ap.add_argument("--close-before", action="store_true", help="resume: session/close before restart")
+    ap.add_argument("--load-cwd", default="same", choices=["same", "other"], help="resume: cwd used after restart")
+    ap.add_argument("--list-first", action="store_true", help="resume: session/list before load")
+    ap.add_argument("--default-session-dir", action="store_true",
+                    help="resume: omit --session-dir (omp default sessions location)")
+    ap.add_argument("--agent-dir-b", action="store_true",
+                    help="resume: restarted process uses a second agent dir (copies stub models.yml/config.yml)")
     a = ap.parse_args()
     res = SCENARIOS[a.scenario](a)
     print(json.dumps(res, indent=1, default=str, ensure_ascii=False))
