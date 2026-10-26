@@ -1,0 +1,25 @@
+[package]
+name = "driver-a2a-http"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+a2a-types = { version = "0.1.0", path = "../a2a-types" }
+a2a-worker = { version = "0.1.0", path = "../a2a-worker" }
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+url = "2.5.8"
+uuid = { version = "1.26.1", features = ["v4", "fast-rng"] }
+
+[dev-dependencies]
+a2a-worker = { version = "0.1.0", path = "../a2a-worker", features = ["testkit"] }
+axum = "0.8.4"
