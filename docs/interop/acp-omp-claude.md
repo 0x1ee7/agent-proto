@@ -289,7 +289,7 @@ Driver decision (proposal): advertise no `elicitation` capability in v1 unless i
 ### 4.1 Install and run
 
 - Package: `@agentclientprotocol/claude-agent-acp` (npm). Preview channel: `npm install @agentclientprotocol/claude-agent-acp@preview` (CAA-README). Built on the Claude Agent SDK (CAA-README).
-- Run as an ACP stdio agent: `node dist/index.js` in the repo; the README example uses `node dist/index.js` (CAA-MODEL). `[UNVERIFIED]` the npm bin name; run `npx @agentclientprotocol/claude-agent-acp` as a probe.
+- Run as an ACP stdio agent: `node dist/index.js` in the repo; the README example uses `node dist/index.js` (CAA-MODEL). The npm bin name is `claude-agent-acp` (npm package metadata, v0.97.0, fetched 2026-10-26).
 - Windows: `[UNVERIFIED]` specific install steps. Spawn with `cmd /c npx ...` or direct `node.exe path\to\index.js` from Rust (`std::process::Command`). Note env var names use `CLAUDE_*` (see below).
 - Prerequisite: Claude Code CLI login or API key (see 4.2). `claude auth status --json` is used by the adapter (CAA-AUTH).
 
@@ -303,7 +303,7 @@ Driver decision (proposal): advertise no `elicitation` capability in v1 unless i
 - Bedrock: `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION` (CAA-MODEL example).
 - Claude Code `-p` path (non-ACP) reads `ANTHROPIC_API_KEY`; in `--bare` mode OAuth/keychain are never read (CC-HEADLESS). Adapter auth path itself is `[UNVERIFIED]` beyond CAA-AUTH.
 
-Driver recommendation: set `ANTHROPIC_API_KEY` in the child env for deterministic auth; or require prior `claude` login. `[UNVERIFIED]` whether the adapter advertises ACP `authMethods` for login.
+Driver recommendation: the driver never sets provider key variables for the child, including `ANTHROPIC_API_KEY` (0009-069, M1-10). Auth comes from the agent's own login or configuration. `[UNVERIFIED]` whether the adapter advertises ACP `authMethods` for login.
 
 ### 4.3 Permission modes
 

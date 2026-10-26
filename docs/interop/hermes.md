@@ -21,7 +21,7 @@ Legend: `[SRC]` = confirmed in plugin source; `[DOC]` = only in public docs; `[U
 | D4 | https://hermes-agent.nousresearch.com/docs/getting-started/platform-support |
 | D5 | https://github.com/NousResearch/hermes-agent/tree/v2026.9.24/plugins/platforms/a2a |
 
-Where the docs (D1) and the source (S1–S4) differ, the source wins. The plugin uses only the stdlib (`http.server`, `urllib`, `hmac`, `hashlib`, `uuid`) [S2].
+Where the docs (D1) and the source (S1–S4) differ, the source wins. S1–S4 were fetched 2026-10-26 (S1 `protocol.py`, S2 `adapter.py`, S3 `security.py`, S4 `tools.py`). The plugin uses only the stdlib (`http.server`, `urllib`, `hmac`, `hashlib`, `uuid`) [S2].
 
 ## 1. Wire surface
 
@@ -36,7 +36,7 @@ Where the docs (D1) and the source (S1–S4) differ, the source wins. The plugin
 | GET | `/metrics` | Metrics | S2 |
 | any | other | 404 | S2 |
 
-Tenant-scoped routing exists (`tenant` in `params` and the card). A routed agent name that does not match the tenant returns HTTP 400 with an error mentioning `tenant ... does not match routed agent` [S2, `[UNVERIFIED]` exact text].
+Tenant-scoped routing exists (`tenant` in `params` and the card). A routed agent name that does not match the tenant returns HTTP 400 (JSON-RPC `-32602`) with error text `tenant {tenant!r} does not match routed agent {slug or 'default'}` [S2].
 
 ### 1.2 JSON-RPC methods (`_METHOD_TABLE`, S2)
 
@@ -320,11 +320,11 @@ Not sent: `A2A-Extensions`, metadata, any extension header [S4].
 - Unwraps `result.task` / `result.message`, or a bare result.
 - Reply text: first artifact's text, else `status.message` text, else message parts.
 - The client uses `contextId` from the reply, so multi-turn works.
-- `TASK_STATE_INPUT_REQUIRED` is **not** read from the state enum. See 8.5.
+- `TASK_STATE_INPUT_REQUIRED` is read from the state enum (S1 `STATE_INPUT_REQUIRED`; S4 compares the enum). See 8.5.
 
 ### 8.5 INPUT_REQUIRED / AUTH_REQUIRED
 - Outbound (Hermes server side): if a COMPLETED reply, after strip and uppercase, starts with `[INPUT_REQUIRED]`, `_finalize_task` sets `TASK_STATE_INPUT_REQUIRED` and removes the marker [S2].
-- Hermes client side: `a2a_call` appends `(The peer needs more input — answer by calling a2a_call again with context_id '<ctx>'.)` when it sees the input-needed signal [S4]. The signal is text, not the state enum `[UNVERIFIED]` exactly how it detects it; read `_send_task` before relying on it.
+- Hermes client side: `_send_task` reads the TaskState enum (S1 `STATE_INPUT_REQUIRED`; S4). When the state is `TASK_STATE_INPUT_REQUIRED`, `a2a_call` appends `(The peer needs more input — answer by calling a2a_call again with context_id '<ctx>'.)` [S4]. Text markers are not the detection path on the client.
 - AUTH_REQUIRED: not emitted, not handled. Auth failure is HTTP 401 with `-32050`. The card advertises `bearer` only [S1, S2].
 
 ### 8.6 Error mapping (client, S4)
@@ -380,7 +380,7 @@ Hermes is the client here. For Hermes to call a gateway that fronts omp (`omp --
 | 7 | Reuse `contextId` from the request | Multi-turn; client takes `contextId` from the reply | S4 |
 | 8 | Respond within the caller timeout | Client default `timeout` 120 s; card fetch capped 30 s | S4 |
 | 9 | Do not re-admit retries as new turns | Hermes-side anti-loop counts admissions; this is the gateway's own cap if it forwards | S2 |
-| 10 | Send `[INPUT_REQUIRED]` only as text | Client does not read `TASK_STATE_INPUT_REQUIRED` from the enum `[UNVERIFIED]` exact detection | S4 |
+| 10 | Send `TASK_STATE_INPUT_REQUIRED` in the state field | Client reads the state enum (S1, S4); a text marker is not required | S1, S4 |
 | 11 | Do not emit AUTH_REQUIRED | Hermes has no handling; use HTTP 401 `-32050` | S1, S2 |
 | 12 | `params.tenant` echo | If the card sets `tenant`, the gateway must echo the same value or Hermes' route returns 400 | S2 |
 
@@ -398,10 +398,10 @@ Specific failure modes:
 
 1. Native Windows testing of the A2A plugin.
 2. Exact `hermes gateway` / `hermes gateway setup` flow for A2A on Windows.
-3. Exact INPUT_REQUIRED detection on the Hermes client side (text vs. state enum) in `_send_task`.
+3. Resolved: the Hermes client detects input-required from the TaskState enum in `_send_task` (S1, S4). Text markers are not used.
 4. `A2A_ALLOWED_USERS` interaction with `authorization_is_upstream=True` at the gateway layer.
 5. `gateway.session_a2a.forward_to_owner` (forwarded-profile path, `adapter._forward_to_profile`). Not in this repo's plugin files.
-6. Exact text of the `tenant ... does not match routed agent` error.
+6. Resolved: the exact text is `tenant {tenant!r} does not match routed agent {slug or 'default'}`, returned as HTTP 400 with JSON-RPC `-32602` (S2).
 7. Whether the a2a-sdk interop claim (D1) covers the Python SDK version used in CI.
 8. TLS: the plugin has no TLS code; put a reverse proxy in front `[UNVERIFIED]` for production.
 

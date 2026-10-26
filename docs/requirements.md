@@ -22,6 +22,8 @@ Supersedes v0 and the gRPC handoff schema (see section 1).
 | D13 | Metering from agent usage events, self-report fallback | Hard caps are the backstop. |
 | D14 | Hermes via A2A HTTP only | No kanban coupling. |
 | D15 | Ed25519 per-agent keys + local allowlist for cross-host | Broker-independent; manual rotation. |
+| D16 | A2A-Bus is carried as the custom A2A binding `urn:a2abus:binding:bus:1` (RFC-0002), not as a new data model | Stock A2A clients reach bus agents only through the HTTP gateway (RFC-0008). |
+| D17 | RFC-first: `docs/rfcs` is the normative specification; this document is requirements context | Conflicts are resolved in the RFCs. |
 
 ## 1. What the interop research changed
 
@@ -184,7 +186,7 @@ Non-goals for M1: cross-machine federation, cross-org trust, encrypted payloads 
 - R-I6 Pin and track an A2A spec version; Hermes also accepts pre-1.0 method aliases, gateway should do the same on ingress only.
 
 ### Lifecycle
-- R-L1 States are A2A `TaskState`: SUBMITTED, WORKING, INPUT_REQUIRED, AUTH_REQUIRED, COMPLETED, FAILED, CANCELED, REJECTED. Handoff names map as: QUEUED to SUBMITTED, PROCESSING to WORKING, PENDING_APPROVAL to INPUT_REQUIRED plus approval extension data, SUCCEEDED to COMPLETED.
+- R-L1 States are A2A `TaskState`: SUBMITTED, WORKING, INPUT_REQUIRED, AUTH_REQUIRED, COMPLETED, FAILED, CANCELED, REJECTED. Handoff names map as: QUEUED to SUBMITTED, PROCESSING to WORKING, PENDING_APPROVAL to INPUT_REQUIRED plus approval extension data, SUCCEEDED to COMPLETED. Progress metadata (`urn:a2abus:ext:progress:1`) is optional and never changes state.
 - R-L2 Spec has no EXPIRED; deadline expiry is FAILED with a machine-readable reason.
 - R-L3 Status events carry a per-task monotonic sequence. Terminal states are immutable. Duplicates and reordering are tolerated.
 - R-L4 Every task has a deadline; abandoned tasks reach a terminal state.
@@ -200,7 +202,7 @@ Non-goals for M1: cross-machine federation, cross-org trust, encrypted payloads 
 
 ### Binding / federation
 - R-F1 Logical addressing by agent id and tenant; survives leaf-to-hub hop.
-- R-F2 Cards carry TTL and are re-announced; presence via TTL keys.
+- R-F2 Agent cards carry no TTL; they are re-announced on change. Presence carries a TTL and is refreshed by heartbeat (L6).
 - R-F3 No dependence on synchronized clocks; relative durations with issuer timestamp and skew allowance.
 - R-F4 In-memory reference binding for tests plus NATS binding for M1.
 
