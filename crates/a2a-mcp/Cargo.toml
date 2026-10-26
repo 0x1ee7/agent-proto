@@ -1,0 +1,34 @@
+[package]
+name = "a2a-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "a2abus-mcp-shim"
+path = "src/main.rs"
+required-features = ["runtime"]
+
+[features]
+default = ["runtime"]
+# MCP stdio server, IPC client, endpoint transport (tokio). The worker uses the
+# crate with default features off and needs only `ipc`, `tools` and `mcp`.
+runtime = ["dep:tokio"]
+# In-process fake worker endpoint for tests of this crate and other crates.
+testkit = ["runtime"]
+
+[dependencies]
+base64 = "0.22.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", optional = true, features = ["rt", "io-util", "io-std", "net", "sync", "time", "macros"] }
+
+[dev-dependencies]
+# Enables the testkit for this crate's own integration tests.
+a2a-mcp = { path = ".", features = ["testkit"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "process", "io-util"] }
