@@ -23,6 +23,21 @@ pub const MAX_SKEW_LIMIT_MS: i64 = 3_600_000;
 const DEFAULT_TENANT: &str = "local";
 const MAX_TRUST_BYTES: u64 = 1024 * 1024;
 pub const OPERATOR_AGENT: &str = "operator";
+/// Bus identities that relay operator decisions ([0010-063]). An envelope from one of them is
+/// accepted only under an operator-role key, and the broker must publish it under the same name
+/// ([0007-038]).
+pub const OPERATOR_RELAY_IDS: [&str; 2] = ["tui", "cli"];
+
+/// True when `sender` may carry a message signed by the key of agent `key_agent` ([0007-038]).
+/// The operator key is carried by a relay identity; every other key by its own agent id.
+#[must_use]
+pub fn sender_matches_key(sender: &str, key_agent: &AgentId) -> bool {
+    if key_agent.as_str() == OPERATOR_AGENT {
+        OPERATOR_RELAY_IDS.contains(&sender)
+    } else {
+        sender == key_agent.as_str()
+    }
+}
 
 /// Role of a trust entry ([0007-021]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,7 +404,7 @@ fn parse_optional_instant(text: Option<&str>) -> Result<Option<i64>, &'static st
 mod tests {
     use super::*;
     use crate::identity::{Ed25519Signer, Signer, encode_public_key};
-    use crate::testkit::{agent, file, key_block};
+    use crate::testkit::{agent, file, key_block, key_block_with_role};
 
     #[test]
     fn req_0007_020_schema_line_is_required() {
@@ -483,6 +498,39 @@ mod tests {
             TrustStore::parse(&file(&gateway_role)).is_err(),
             "gateway role on non-gateway"
         );
+    }
+
+    #[test]
+    fn req_0007_006_operator_role_requires_the_operator_agent_and_name() {
+        let ok = key_block_with_role("operator", 7, "operator", "");
+        assert!(TrustStore::parse(&file(&ok)).is_ok());
+        for (name, role) in [
+            ("tui", "operator"),
+            ("cli", "operator"),
+            ("alice", "operator"),
+            ("operator", "agent"),
+            ("operator", "gateway"),
+            ("tui", "agent"),
+        ] {
+            let body = key_block_with_role(name, 7, role, "");
+            assert!(TrustStore::parse(&file(&body)).is_err(), "{name} as {role}");
+        }
+    }
+
+    #[test]
+    fn req_0007_038_relay_identities_match_only_the_operator_key() {
+        let operator = agent("operator");
+        for relay in OPERATOR_RELAY_IDS {
+            assert!(sender_matches_key(relay, &operator), "{relay} relays");
+            assert!(
+                !sender_matches_key(relay, &agent("alice")),
+                "{relay} is not alice"
+            );
+        }
+        assert!(!sender_matches_key("operator", &operator));
+        assert!(!sender_matches_key("alice", &operator));
+        assert!(sender_matches_key("alice", &agent("alice")));
+        assert!(!sender_matches_key("tui", &agent("alice")));
     }
 
     #[test]

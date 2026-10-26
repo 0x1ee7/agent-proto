@@ -14,7 +14,7 @@ use crate::error::{BusError, Reason, SecurityError};
 use crate::identity::{Kid, Signer, Verifier};
 use crate::mode::Policy;
 use crate::replay::ReplayCache;
-use crate::trust::{Role, TrustStore};
+use crate::trust::{OPERATOR_RELAY_IDS, Role, TrustStore, sender_matches_key};
 
 /// Nonce length in bytes ([0007-041]).
 const NONCE_LEN: usize = 16;
@@ -147,8 +147,8 @@ pub fn sign_envelope(
     envelope: &mut Envelope,
     payload: &[u8],
 ) -> Result<(), SecurityError> {
-    if envelope.sender != signer.kid().agent().as_str() {
-        return Err(SecurityError::Invalid("sender is not the signing agent"));
+    if !sender_matches_key(&envelope.sender, signer.kid().agent()) {
+        return Err(SecurityError::Invalid("sender is not the signing identity"));
     }
     if envelope.block_headers_present() != 0 {
         return Err(SecurityError::Invalid("signature block already present"));
@@ -176,8 +176,9 @@ pub fn sign_envelope(
 pub enum MessageClass<'a> {
     /// A message from a peer broker, published under `publisher` ([0007-038]).
     Peer { publisher: &'a AgentId },
-    /// An operator decision on an approval prompt ([0007-095..098]).
-    OperatorDecision,
+    /// An operator decision on an approval prompt, relayed by `publisher` (`tui` or `cli`) under
+    /// an operator-role key ([0007-095..098], [0007-038]).
+    OperatorDecision { publisher: &'a AgentId },
 }
 
 /// Inputs to verification that do not change per message.
@@ -255,7 +256,7 @@ pub fn verify_request(
 
 fn unsigned(ctx: &VerifyContext<'_>, class: MessageClass<'_>) -> Result<(), BusError> {
     match class {
-        MessageClass::OperatorDecision => Ok(()),
+        MessageClass::OperatorDecision { .. } => Ok(()),
         MessageClass::Peer { publisher } => {
             if ctx.policy.requires_signature() || ctx.trust.agent_requires_signature(publisher) {
                 Err(BusError::new(Reason::SignatureMissing))
@@ -297,16 +298,18 @@ fn verify_signed(
     let attach = |reason: Reason| BusError::new(reason).with_kid(kid_text);
     let role_ok = match class {
         MessageClass::Peer { .. } => matches!(entry.role(), Role::Agent | Role::Gateway),
-        MessageClass::OperatorDecision => entry.role() == Role::Operator,
+        MessageClass::OperatorDecision { .. } => entry.role() == Role::Operator,
     };
     if !role_ok {
         return Err(attach(Reason::KeyRoleDenied));
     }
     let publisher_ok = match class {
         MessageClass::Peer { publisher } => publisher == entry.agent(),
-        MessageClass::OperatorDecision => true,
+        MessageClass::OperatorDecision { publisher } => {
+            OPERATOR_RELAY_IDS.contains(&publisher.as_str()) && publisher.as_str() == env.sender
+        }
     };
-    if env.sender != entry.agent().as_str() || !publisher_ok {
+    if !sender_matches_key(&env.sender, entry.agent()) || !publisher_ok {
         return Err(attach(Reason::SignatureIdentityMismatch));
     }
 
@@ -473,6 +476,33 @@ mod tests {
 
     fn kid_of(out: &Result<Option<VerifiedSender>, BusError>) -> Option<String> {
         out.as_ref().err().and_then(|e| e.kid().map(str::to_owned))
+    }
+
+    /// Verifies as an operator decision that `publisher` relayed ([0007-038]).
+    fn verify_relayed(
+        trust: &TrustStore,
+        at: i64,
+        publisher: &str,
+        env: &Envelope,
+    ) -> Result<Option<VerifiedSender>, BusError> {
+        let clock = ManualClock::new(at);
+        let tenant = TenantId::parse("local").expect("tenant id");
+        let ctx = VerifyContext {
+            trust,
+            clock: &clock,
+            policy: Policy::default(),
+            tenant: &tenant,
+        };
+        let publisher = agent(publisher);
+        verify_request(
+            &ctx,
+            MessageClass::OperatorDecision {
+                publisher: &publisher,
+            },
+            &ReplayCache::new(64),
+            env,
+            PAYLOAD,
+        )
     }
 
     #[test]
@@ -895,9 +925,85 @@ mod tests {
     #[test]
     fn req_0007_039_operator_key_cannot_send_peer_traffic() {
         let trust = store(&key_block_with_role("operator", 7, "operator", ""));
-        let out = run(&trust, T0, &signed("operator", 7, T0));
+        let out = run(&trust, T0, &sign_with(sample("tui"), "operator", 7, T0));
         assert_eq!(reason_of(out.clone()), Some(Reason::KeyRoleDenied));
         assert_eq!(kid_of(&out), Some(signer("operator", 7).kid().to_string()));
+    }
+
+    #[test]
+    fn req_0007_038_operator_key_is_carried_only_by_a_relay_identity() {
+        let trust = store(&key_block_with_role("operator", 7, "operator", ""));
+        for relay in ["tui", "cli"] {
+            let env = sign_with(sample(relay), "operator", 7, T0);
+            let verified = verify_relayed(&trust, T0, relay, &env)
+                .expect("relayed decision verifies")
+                .expect("signed envelope yields a sender");
+            assert_eq!(verified.agent().as_str(), "operator");
+            assert_eq!(verified.role(), Role::Operator);
+        }
+    }
+
+    #[test]
+    fn req_0007_038_operator_key_refuses_a_non_relay_sender_or_publisher() {
+        let trust = store(&key_block_with_role("operator", 7, "operator", ""));
+        let op = signer("operator", 7);
+        for sender in ["alice", "operator"] {
+            let mut env = sample(sender);
+            let signed = sign_envelope(&op, &ManualClock::new(T0), &mut env, PAYLOAD);
+            assert!(
+                matches!(signed, Err(SecurityError::Invalid(_))),
+                "signed as {sender}"
+            );
+        }
+        let mut forged = sample("alice");
+        forge(
+            &op,
+            &mut forged,
+            "2025-01-02T03:04:05.006Z",
+            &[3u8; NONCE_LEN],
+            PAYLOAD,
+        );
+        let out = verify_relayed(&trust, T0, "alice", &forged);
+        assert_eq!(
+            reason_of(out.clone()),
+            Some(Reason::SignatureIdentityMismatch)
+        );
+        assert_eq!(kid_of(&out), Some(op.kid().to_string()));
+        let cli_env = sign_with(sample("cli"), "operator", 7, T0);
+        let out = verify_relayed(&trust, T0, "tui", &cli_env);
+        assert_eq!(reason_of(out), Some(Reason::SignatureIdentityMismatch));
+        let tui_env = sign_with(sample("tui"), "operator", 7, T0);
+        let out = verify_relayed(&trust, T0, "gateway", &tui_env);
+        assert_eq!(reason_of(out), Some(Reason::SignatureIdentityMismatch));
+    }
+
+    #[test]
+    fn req_0007_038_agent_key_never_carries_a_relay_sender() {
+        let trust = store(&key_block("alice", 7, ""));
+        let alice = signer("alice", 7);
+        let mut env = sample("tui");
+        let signed = sign_envelope(&alice, &ManualClock::new(T0), &mut env, PAYLOAD);
+        assert!(matches!(signed, Err(SecurityError::Invalid(_))));
+        let mut forged = sample("tui");
+        forge(
+            &alice,
+            &mut forged,
+            "2025-01-02T03:04:05.006Z",
+            &[3u8; NONCE_LEN],
+            PAYLOAD,
+        );
+        let peer = verify(
+            &trust,
+            &ReplayCache::new(64),
+            Policy::default(),
+            T0,
+            "tui",
+            &forged,
+            PAYLOAD,
+        );
+        assert_eq!(reason_of(peer), Some(Reason::SignatureIdentityMismatch));
+        let relayed = verify_relayed(&trust, T0, "tui", &forged);
+        assert_eq!(reason_of(relayed), Some(Reason::KeyRoleDenied));
     }
 
     #[test]

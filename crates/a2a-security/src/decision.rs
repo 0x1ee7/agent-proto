@@ -11,8 +11,10 @@ use pbjson_types::Timestamp;
 use prost::Message;
 
 use crate::canon::{sha256, to_hex};
-use crate::envelope::{VerifiedSender, VerifyContext};
+use crate::clock::Clock;
+use crate::envelope::{Envelope, VerifiedSender, VerifyContext, sign_envelope};
 use crate::error::{BusError, Reason, SecurityError};
+use crate::identity::Signer;
 use crate::mode::SigningMode;
 use crate::trust::{OPERATOR_AGENT, Role};
 
@@ -121,6 +123,52 @@ impl DecisionOutcome {
 #[must_use]
 pub fn request_digest(request: &ApprovalRequest) -> String {
     to_hex(&sha256(&request.encode_to_vec()))
+}
+
+/// Signs an operator decision that chooses `option_id` on `request` ([0006-051], [0007-095]).
+///
+/// The decision carries the request digest, task, and nonce, so a changed request is refused on
+/// verification. The envelope signature covers the encoded decision. `decided_by` names the
+/// operator identity; `decided_at` stays unset because the verifier records its own clock.
+/// Returns the encoded payload that was signed.
+///
+/// # Errors
+///
+/// Returns [`SecurityError::Invalid`] when the key is not the operator key or the request does
+/// not offer `option_id`. Otherwise returns the error from [`sign_envelope`].
+pub fn sign_decision(
+    signer: &dyn Signer,
+    clock: &dyn Clock,
+    envelope: &mut Envelope,
+    request: &ApprovalRequest,
+    option_id: &str,
+) -> Result<Vec<u8>, SecurityError> {
+    if signer.kid().agent().as_str() != OPERATOR_AGENT {
+        return Err(SecurityError::Invalid(
+            "only the operator key signs approval decisions",
+        ));
+    }
+    if !request
+        .options
+        .iter()
+        .any(|option| option.option_id == option_id)
+    {
+        return Err(SecurityError::Invalid(
+            "approval option is not offered by the request",
+        ));
+    }
+    let decision = ApprovalDecision {
+        request_id: request.request_id.clone(),
+        task_id: request.task_id.clone(),
+        option_id: option_id.to_owned(),
+        nonce: request.nonce.clone(),
+        decided_by: OPERATOR_AGENT.to_owned(),
+        decided_at: None,
+        request_sha256: request_digest(request),
+    };
+    let payload = decision.encode_to_vec();
+    sign_envelope(signer, clock, envelope, &payload)?;
+    Ok(payload)
 }
 
 /// Open approval requests owned by one Worker. Entries are dropped at their expiry.
@@ -325,9 +373,11 @@ mod tests {
 
     use super::*;
     use crate::clock::ManualClock;
+    use crate::envelope::{MessageClass, verify_request};
     use crate::identity::Kid;
     use crate::mode::Policy;
-    use crate::testkit::{agent, key_block, store};
+    use crate::replay::ReplayCache;
+    use crate::testkit::{agent, key_block, key_block_with_role, signer, store};
     use crate::trust::TrustStore;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -366,6 +416,8 @@ mod tests {
             ],
             expires_at: Some(ts(NOW + 60_000)),
             nonce: NONCE.to_owned(),
+            working_directory: "/work/app".to_owned(),
+            workspace_mode: "per-task".to_owned(),
         }
     }
 
@@ -816,5 +868,109 @@ mod tests {
             &decision_for("allow-once", &h.digest),
         )
         .expect("untouched decision still accepted");
+    }
+
+    fn envelope_from(sender: &str) -> Envelope {
+        Envelope {
+            subject: "a2a.v1.agent.bob.task.send".to_owned(),
+            msg_id: "01J00000000000000000000002".to_owned(),
+            sender: sender.to_owned(),
+            version: "1.0".to_owned(),
+            payload_type: "a2a.v1.ApprovalDecision".to_owned(),
+            content_type: "application/x-protobuf".to_owned(),
+            ..Envelope::default()
+        }
+    }
+
+    /// Verifies `env` as an operator decision relayed by `publisher` ([0007-038]).
+    fn verify_relayed(
+        h: &Harness,
+        publisher: &str,
+        env: &Envelope,
+        payload: &[u8],
+    ) -> Result<VerifiedSender, BusError> {
+        let ctx = VerifyContext {
+            trust: &h.trust,
+            clock: &h.clock,
+            policy: Policy::default(),
+            tenant: &h.tenant,
+        };
+        let publisher = agent(publisher);
+        verify_request(
+            &ctx,
+            MessageClass::OperatorDecision {
+                publisher: &publisher,
+            },
+            &ReplayCache::new(64),
+            env,
+            payload,
+        )
+        .map(|sender| sender.expect("signed envelope yields a sender"))
+    }
+
+    #[test]
+    fn req_0006_051_signed_decision_verifies_end_to_end() {
+        let h = Harness {
+            trust: store(&key_block_with_role("operator", 7, "operator", "")),
+            ..Harness::new()
+        };
+        let op = signer("operator", 7);
+        let mut env = envelope_from("tui");
+        let payload = sign_decision(&op, &h.clock, &mut env, &request(), "allow-once")
+            .expect("operator key signs a decision");
+        let verified =
+            verify_relayed(&h, "tui", &env, &payload).expect("relayed decision verifies");
+        let decoded = ApprovalDecision::decode(payload.as_slice()).expect("payload decodes");
+        let outcome = h
+            .decide(
+                SigningMode::Enabled,
+                DecisionOrigin::Signed(&verified),
+                &decoded,
+            )
+            .expect("operator decision is accepted");
+        assert_eq!(outcome.decision().decided_by(), OPERATOR_AGENT);
+        assert_eq!(outcome.decision().option_id(), "allow-once");
+        assert!(outcome.decision().allows());
+        assert!(!outcome.duplicate());
+    }
+
+    #[test]
+    fn req_0006_051_sign_decision_refuses_non_operator_and_unoffered_option() {
+        let clock = ManualClock::new(NOW);
+        let alice = signer("alice", 7);
+        let mut env = envelope_from("alice");
+        let refused = sign_decision(&alice, &clock, &mut env, &request(), "allow-once");
+        assert!(matches!(refused, Err(SecurityError::Invalid(_))));
+        assert_eq!(env.kid, None);
+
+        let op = signer("operator", 7);
+        let mut env = envelope_from("tui");
+        let refused = sign_decision(&op, &clock, &mut env, &request(), "maybe");
+        assert!(matches!(refused, Err(SecurityError::Invalid(_))));
+        assert_eq!(env.kid, None);
+    }
+
+    #[test]
+    fn req_0006_051_decision_for_an_altered_request_is_not_applicable() {
+        let h = Harness {
+            trust: store(&key_block_with_role("operator", 7, "operator", "")),
+            ..Harness::new()
+        };
+        let mut altered = request();
+        altered.summary = "run a different command".to_owned();
+        let op = signer("operator", 7);
+        let mut env = envelope_from("tui");
+        let payload = sign_decision(&op, &h.clock, &mut env, &altered, "allow-once")
+            .expect("operator key signs a decision");
+        let verified = verify_relayed(&h, "tui", &env, &payload).expect("envelope verifies");
+        let decoded = ApprovalDecision::decode(payload.as_slice()).expect("payload decodes");
+        let err = h
+            .decide(
+                SigningMode::Enabled,
+                DecisionOrigin::Signed(&verified),
+                &decoded,
+            )
+            .expect_err("digest of the altered request does not match the open request");
+        assert_eq!(err.reason(), Reason::ApprovalNotApplicable);
     }
 }

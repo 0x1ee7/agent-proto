@@ -5,7 +5,7 @@ Layer L2 (RFC-0001). Depends only on `a2a-types`. Implements RFC-0007 in full, p
 ## Owns
 - Ed25519 keys, kids, public-key text encoding (`identity`).
 - JCS canonicalisation, base64url, SHA-256 (`canon`, private).
-- Trust file parsing and validation, key lifecycle, per-agent signing requirement (`trust`).
+- Trust file parsing and validation, key lifecycle, per-agent signing requirement, operator relay rule (`trust`).
 - Key storage and file-mode/ACL checks, Unix and Windows (`storage`).
 - Envelope signing input, signature block, replay cache, verification order (`envelope`, `replay`).
 - Approval book and decision verification (`decision`).
@@ -17,8 +17,9 @@ Layer L2 (RFC-0001). Depends only on `a2a-types`. Implements RFC-0007 in full, p
 ## Provides
 - `Signer` and `Verifier` traits; `Ed25519Signer`; `Kid`.
 - `TrustStore`, `Role`, `KeyStatus`, `TrustEntry`.
+- `OPERATOR_RELAY_IDS`, `load_key_file`, `operator_key_path`.
 - `Envelope`, `sign_envelope`, `verify_request`, `VerifyContext`, `VerifiedSender`, `MessageClass`.
-- `ApprovalBook`, `DecisionOrigin`, `VerifiedDecision`, `DecisionOutcome`, `verify_decision`, `request_digest`.
+- `ApprovalBook`, `DecisionOrigin`, `VerifiedDecision`, `DecisionOutcome`, `verify_decision`, `request_digest`, `sign_decision`.
 - `verify_grant`, `VerifiedGrant`, `issue_root`, `issue_child`, `TokenCache`, `resolve_reference`, `UseLedger`, `GrantCredential`, `check_loopback_bind`.
 - `sign_card`, `verify_card`, `CardOutcome`, `VerifiedCard`.
 - `originate`, `append_hop`, `verify_provenance`, `frame_untrusted`, `redact`.
@@ -42,7 +43,7 @@ Layer L2 (RFC-0001). Depends only on `a2a-types`. Implements RFC-0007 in full, p
 - `canon`: 0007-035, 0007-092.
 - `clock`: 0007-022, 0007-034.
 - `identity`: 0007-001, 0007-002, 0007-003.
-- `trust`: 0007-021, 0007-022, 0007-023, 0007-031, 0007-039.
+- `trust`: 0007-006, 0007-021, 0007-022, 0007-023, 0007-031, 0007-038, 0007-039.
 - `storage`: 0007-010, 0007-011, 0007-012, 0007-013, 0007-014.
 - `envelope`: 0007-030, 0007-031, 0007-032, 0007-033, 0007-034, 0007-035, 0007-036, 0007-038, 0007-039, 0007-040, 0007-041, 0007-046.
 - `replay`: 0007-041.

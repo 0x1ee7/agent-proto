@@ -10,7 +10,7 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, KeypairBytes};
 
 use crate::error::SecurityError;
 use crate::identity::{Ed25519Signer, Kid, Signer, encode_public_key};
-use crate::trust::TrustStore;
+use crate::trust::{KeyStatus, OPERATOR_AGENT, Role, TrustEntry, TrustStore};
 
 const APP_DIR: &str = "a2abus";
 const KEY_DIR: &str = "keys";
@@ -86,6 +86,21 @@ pub fn key_path(config: &Path, kid: &Kid) -> PathBuf {
         kid.agent().as_str(),
         kid.fingerprint()
     ))
+}
+
+/// `creds/operator-<K>.key`: the operator key file in the credentials directory, named by the
+/// kid fingerprint `K` (RFC-0012 open issue 10).
+///
+/// # Errors
+///
+/// Returns [`SecurityError::Invalid`] when `kid` is not an operator-agent kid.
+pub fn operator_key_path(creds_dir: &Path, kid: &Kid) -> Result<PathBuf, SecurityError> {
+    if kid.agent().as_str() != OPERATOR_AGENT {
+        return Err(SecurityError::Invalid(
+            "only an operator kid has an operator key file",
+        ));
+    }
+    Ok(creds_dir.join(format!("operator-{}.key", kid.fingerprint())))
 }
 
 /// Unix rule for key files and the key directory: no group or other bits ([0007-011]).
@@ -246,10 +261,52 @@ pub fn load_signer(
     check_key_dir(&key_dir(config), roots)?;
     check_private_file(&path)?;
     let text = read_limited(&path, MAX_KEY_FILE_BYTES)?;
-    check_pem_label(&text)?;
-    let pair = KeypairBytes::from_pkcs8_pem(&text)
+    let signer = decode_key_text(&text, agent)?;
+    check_matches_entry(&signer, entry)?;
+    Ok(signer)
+}
+
+/// Loads the operator signing key from an explicit owner-only path such as `creds/operator-<id>.key`
+/// ([0012-043], [0012-058]). Applies the same checks as [`load_signer`]: the file lies outside every
+/// workspace root, is owner-only, is an unencrypted PKCS#8 PEM, and its key is an active `operator`-role
+/// entry of the trust file for agent `operator`.
+pub fn load_key_file(
+    path: &Path,
+    trust: &TrustStore,
+    agent: &AgentId,
+    roots: &[PathBuf],
+) -> Result<Ed25519Signer, SecurityError> {
+    if agent.as_str() != OPERATOR_AGENT {
+        return Err(SecurityError::Key(
+            "key file loader serves the operator identity only".to_owned(),
+        ));
+    }
+    refuse_under_roots(path, roots)?;
+    check_private_file(path)?;
+    let text = read_limited(path, MAX_KEY_FILE_BYTES)?;
+    let signer = decode_key_text(&text, agent)?;
+    let entry = trust
+        .entry(&signer.kid().to_string())
+        .ok_or_else(|| SecurityError::Key("key is not in the trust file".to_owned()))?;
+    if !matches!(entry.role(), Role::Operator) || !matches!(entry.status(), KeyStatus::Active) {
+        return Err(SecurityError::Key(
+            "key is not an active operator entry".to_owned(),
+        ));
+    }
+    check_matches_entry(&signer, entry)?;
+    Ok(signer)
+}
+
+/// Decodes an unencrypted PKCS#8 PEM key text into a signer for `agent` ([0007-013]).
+fn decode_key_text(text: &str, agent: &AgentId) -> Result<Ed25519Signer, SecurityError> {
+    check_pem_label(text)?;
+    let pair = KeypairBytes::from_pkcs8_pem(text)
         .map_err(|_| SecurityError::Key("key file does not decode".to_owned()))?;
-    let signer = Ed25519Signer::from_seed(agent, &pair.secret_key);
+    Ok(Ed25519Signer::from_seed(agent, &pair.secret_key))
+}
+
+/// Checks that a loaded key is the one its trust entry names ([0007-013]).
+fn check_matches_entry(signer: &Ed25519Signer, entry: &TrustEntry) -> Result<(), SecurityError> {
     if signer.kid() != entry.kid() {
         return Err(SecurityError::Key(
             "key does not match its trust entry kid".to_owned(),
@@ -260,7 +317,7 @@ pub fn load_signer(
             "key does not match its trust entry".to_owned(),
         ));
     }
-    Ok(signer)
+    Ok(())
 }
 
 /// Accepts only an unencrypted PKCS#8 PEM key, whose first line is the PRIVATE KEY label ([0007-013]).
@@ -460,6 +517,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn req_0007_014_operator_key_path_is_named_by_kid_fingerprint() {
+        let kid = crate::testkit::signer("operator", 7).kid().clone();
+        let dir = Path::new("creds");
+        let path = operator_key_path(dir, &kid).expect("operator kid has a key file");
+        assert_eq!(
+            path,
+            dir.join(format!("operator-{}.key", kid.fingerprint()))
+        );
+        let agent_kid = crate::testkit::signer("alice", 7).kid().clone();
+        assert!(matches!(
+            operator_key_path(dir, &agent_kid),
+            Err(SecurityError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn req_0007_010_windows_config_dir_is_under_local_app_data() {
         let dir = config_dir_from_env(
             Some(OsStr::new("C:\\Users\\x\\AppData\\Local")),
@@ -587,6 +660,14 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn req_0007_014_key_file_loader_serves_only_the_operator_identity() {
+        let trust = crate::testkit::store("");
+        let alpha = AgentId::parse("alpha").expect("id");
+        let refused = load_key_file(Path::new("/no/such/key.pem"), &trust, &alpha, &[]);
+        assert!(matches!(refused, Err(SecurityError::Key(_))));
     }
 
     #[test]
