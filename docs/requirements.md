@@ -24,6 +24,12 @@ Supersedes v0 and the gRPC handoff schema (see section 1).
 | D15 | Ed25519 per-agent keys + local allowlist for cross-host | Broker-independent; manual rotation. |
 | D16 | A2A-Bus is carried as the custom A2A binding `urn:a2abus:binding:bus:1` (RFC-0002), not as a new data model | Stock A2A clients reach bus agents only through the HTTP gateway (RFC-0008). |
 | D17 | RFC-first: `docs/rfcs` is the normative specification; this document is requirements context | Conflicts are resolved in the RFCs. |
+| D18 | Non-git workspace: refuse by default; bounded copy mode (2 GiB / 100000 files) opt-in per agent | RFC-0012 issue 8. |
+| D19 | Local key protection: file permissions only; no passphrase | RFC-0007 issue 4. |
+| D20 | M1 trust boundary is one OS user with documented residual risk; separate OS accounts per agent planned for M2 | RFC-0007 issue 3. |
+| D21 | omp ask-all is not declared until the spike proves every call surfaces a permission request; ask-exec (`always-ask-cached`) meanwhile | RFC-0006 [0006-025], [0006-029]. |
+| D22 | `approval` and `budget` extensions are not `required` on cards in M1; Worker-side policy enforces them regardless of caller | RFC-0003 issue 1. |
+| D23 | No license file for now (proprietary / unlicensed) | Revisit before publishing. |
 
 ## 1. What the interop research changed
 
