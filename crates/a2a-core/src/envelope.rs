@@ -16,7 +16,7 @@ use a2a_types::vocab;
 use bus_api::error::BusError;
 use bus_api::headers::Headers;
 use bus_api::message::{Reply, ReplyHandle, Request as BusRequest};
-use bus_api::name::{InvalidName, Subject};
+use bus_api::name::{InvalidName, Principal, Subject};
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -519,10 +519,17 @@ fn is_stale(now: u64, ts: u64, ttl_ms: u64, skew_ms: u64) -> bool {
     now.saturating_sub(ts) > ttl_ms.saturating_add(skew_ms)
 }
 
+/// Whether the transport principal is the sender ([0002-011], [0011-092]). The binding promises a
+/// principal on every request; a missing or anonymous principal never matches and is refused.
+fn principal_matches(principal: Option<&Principal>, sender: &AgentId) -> bool {
+    principal.and_then(Principal::name) == Some(sender.as_str())
+}
+
 /// Runs the inbound pipeline of RFC-0002 section 4.4 to 4.10 on the subject, headers and payload.
 fn validate(
     config: &Config,
     clock: &dyn Clock,
+    principal: Option<&Principal>,
     subject: &Subject,
     headers: &Headers,
     payload: &Bytes,
@@ -538,6 +545,9 @@ fn validate(
 
     let msg_id = hdr::parse_msg_id(hdr::MSG_ID, hdr::required(headers, hdr::MSG_ID)?)?;
     let sender = hdr::parse_agent_id(hdr::SENDER, hdr::required(headers, hdr::SENDER)?)?;
+    if !principal_matches(principal, &sender) {
+        return Err(WireError::PermissionDenied.into());
+    }
     let ts = hdr::parse_ts(hdr::required(headers, hdr::TS)?)?;
     let ttl_ms = hdr::parse_ttl_ms(hdr::required(headers, hdr::TTL_MS)?)?;
     let payload_type = hdr::required(headers, hdr::PAYLOAD_TYPE)?;
@@ -620,7 +630,8 @@ fn validate(
 /// # Errors
 /// Returns [`Rejection::Dropped`] for foreign or non-request subjects, which get no reply.
 /// Returns [`Rejection::Answer`] for every other failure; the caller sends it with
-/// [`Answer::send`].
+/// [`Answer::send`]. A sender that is not the transport principal gets `PERMISSION_DENIED`
+/// ([0002-011]).
 pub fn receive(
     config: &Config,
     clock: &dyn Clock,
@@ -628,11 +639,19 @@ pub fn receive(
 ) -> Result<Inbound, Rejection> {
     let BusRequest {
         subject,
+        principal,
         headers,
         payload,
         reply,
     } = request;
-    match validate(config, clock, &subject, &headers, &payload) {
+    match validate(
+        config,
+        clock,
+        principal.as_ref(),
+        &subject,
+        &headers,
+        &payload,
+    ) {
         Ok((head, body)) => Ok(Inbound { head, body, reply }),
         Err(Stop::Dropped) => Err(Rejection::Dropped),
         Err(Stop::Error(error, extras)) => {
@@ -956,8 +975,11 @@ impl fmt::Debug for InboundEvent {
 /// Returns [`WireError::MalformedMessage`] for a foreign subject, bad headers, a wrong payload
 /// type, or an undecodable payload. Returns [`WireError::UnsupportedMediaType`] for an unknown
 /// content type.
+/// Returns [`WireError::PermissionDenied`] when the principal is not the owning agent of the
+/// subject ([0002-006], [0002-011]).
 pub fn receive_event(
     config: &Config,
+    principal: Option<&Principal>,
     subject: &Subject,
     headers: &Headers,
     payload: &Bytes,
@@ -966,6 +988,9 @@ pub fn receive_event(
     let Family::Event { agent, task } = address.family else {
         return Err(WireError::MalformedMessage);
     };
+    if !principal_matches(principal, &agent) {
+        return Err(WireError::PermissionDenied);
+    }
     hdr::validate_all(headers)?;
     let msg_id = hdr::parse_msg_id(hdr::MSG_ID, hdr::required(headers, hdr::MSG_ID)?)?;
     if hdr::required(headers, hdr::PAYLOAD_TYPE)? != <pb::StreamResponse as WireMessage>::TYPE_NAME
@@ -1198,8 +1223,13 @@ mod tests {
 
     fn to_request(out: Outgoing) -> (BusRequest, mpsc::Receiver<Reply>) {
         let (reply, rx) = capture();
+        let principal = out
+            .headers
+            .get(hdr::SENDER)
+            .and_then(|name| Principal::named(name).ok());
         let request = BusRequest {
             subject: out.subject,
+            principal,
             headers: out.headers,
             payload: out.payload,
             reply,
@@ -1429,6 +1459,130 @@ mod tests {
         let inbound = accept(&Config::default(), NOW, request)?;
         assert_eq!(inbound.head.origin, "203.0.113.7");
         assert_eq!(inbound.head.sender, AgentId::gateway());
+        Ok(())
+    }
+
+    fn planner() -> Result<Principal, String> {
+        Principal::named("planner").must()
+    }
+
+    fn owner() -> Result<Principal, String> {
+        Principal::named("worker").must()
+    }
+
+    fn as_principal(request: BusRequest, principal: Option<Principal>) -> BusRequest {
+        BusRequest {
+            principal,
+            ..request
+        }
+    }
+
+    #[test]
+    fn req_0002_011_spoofed_sender_header_is_refused() -> TestResult {
+        let (request, _rx) = to_request(encode(request_parts(Op::Send, send_body("acme"))?)?);
+        let spoofed = as_principal(request, Some(Principal::named("mallory").must()?));
+        assert_eq!(
+            rejected(&Config::default(), Some(NOW), spoofed)?,
+            WireError::PermissionDenied
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn req_0002_011_missing_or_anonymous_principal_is_refused() -> TestResult {
+        let (request, _rx) = to_request(encode(request_parts(Op::Send, send_body("acme"))?)?);
+        let missing = as_principal(request, None);
+        assert_eq!(
+            rejected(&Config::default(), Some(NOW), missing)?,
+            WireError::PermissionDenied
+        );
+
+        let (request, _rx) = to_request(encode(request_parts(Op::Send, send_body("acme"))?)?);
+        let anonymous = as_principal(request, Some(Principal::anonymous()));
+        assert_eq!(
+            rejected(&Config::default(), Some(NOW), anonymous)?,
+            WireError::PermissionDenied
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn req_0002_011_matching_principal_is_accepted() -> TestResult {
+        let (request, _rx) = to_request(encode(request_parts(Op::Send, send_body("acme"))?)?);
+        let request = as_principal(request, Some(planner()?));
+        let inbound = accept(&Config::default(), NOW, request)?;
+        assert_eq!(inbound.head.sender.as_str(), "planner");
+        Ok(())
+    }
+
+    #[test]
+    fn req_0002_011_gateway_origin_needs_verified_gateway_principal() -> TestResult {
+        // A worker writing `gateway` into A2AB-Sender is refused, so its origin is never used.
+        let mut parts = request_parts(Op::Send, send_body("acme"))?;
+        parts.sender = AgentId::gateway();
+        parts.origin = Some("203.0.113.7".to_owned());
+        let (request, _rx) = to_request(encode(parts)?);
+        let spoofed = as_principal(request, Some(planner()?));
+        assert_eq!(
+            rejected(&Config::default(), Some(NOW), spoofed)?,
+            WireError::PermissionDenied
+        );
+
+        // Only the gateway's own principal may set the origin ([0002-014]).
+        let mut parts = request_parts(Op::Send, send_body("acme"))?;
+        parts.sender = AgentId::gateway();
+        parts.origin = Some("203.0.113.7".to_owned());
+        let (request, _rx) = to_request(encode(parts)?);
+        let genuine = as_principal(request, Some(Principal::named("gateway").must()?));
+        let inbound = accept(&Config::default(), NOW, genuine)?;
+        assert_eq!(inbound.head.origin, "203.0.113.7");
+        Ok(())
+    }
+
+    #[test]
+    fn req_0002_011_event_principal_must_be_owning_agent() -> TestResult {
+        let out = encode_event(
+            EventParts {
+                tenant: TenantId::parse("acme").must()?,
+                agent: AgentId::parse("worker").must()?,
+                task: TaskId::generate(),
+                msg_id: MessageId::generate(),
+                traceparent: None,
+                tracestate: None,
+                stream_end: false,
+                json: false,
+                event: pb::StreamResponse::default(),
+            },
+            MAX_INLINE_BYTES,
+        )
+        .must()?;
+        let config = Config::default();
+        assert!(
+            receive_event(
+                &config,
+                Some(&owner()?),
+                &out.subject,
+                &out.headers,
+                &out.payload
+            )
+            .is_ok()
+        );
+        let intruder = Principal::named("intruder").must()?;
+        assert_eq!(
+            receive_event(
+                &config,
+                Some(&intruder),
+                &out.subject,
+                &out.headers,
+                &out.payload
+            )
+            .err(),
+            Some(WireError::PermissionDenied)
+        );
+        assert_eq!(
+            receive_event(&config, None, &out.subject, &out.headers, &out.payload).err(),
+            Some(WireError::PermissionDenied)
+        );
         Ok(())
     }
 
@@ -1769,8 +1923,14 @@ mod tests {
         )
         .must()?;
         assert_eq!(out.headers.get(hdr::STREAM_END), Some("true"));
-        let decoded =
-            receive_event(&Config::default(), &out.subject, &out.headers, &out.payload).must()?;
+        let decoded = receive_event(
+            &Config::default(),
+            Some(&owner()?),
+            &out.subject,
+            &out.headers,
+            &out.payload,
+        )
+        .must()?;
         assert!(decoded.stream_end);
         assert_eq!(decoded.task, task);
         assert_eq!(decoded.tenant, tenant);
@@ -1778,8 +1938,14 @@ mod tests {
         assert!(decoded.event == event);
 
         let headers = without(&out.headers, hdr::STREAM_END);
-        let decoded =
-            receive_event(&Config::default(), &out.subject, &headers, &out.payload).must()?;
+        let decoded = receive_event(
+            &Config::default(),
+            Some(&owner()?),
+            &out.subject,
+            &headers,
+            &out.payload,
+        )
+        .must()?;
         assert!(!decoded.stream_end);
         Ok(())
     }
@@ -1803,7 +1969,14 @@ mod tests {
         .must()?;
         let rpc = Subject::parse("a2a.v1.acme.rpc.worker.send").must()?;
         assert_eq!(
-            receive_event(&Config::default(), &rpc, &out.headers, &out.payload).err(),
+            receive_event(
+                &Config::default(),
+                Some(&owner()?),
+                &rpc,
+                &out.headers,
+                &out.payload
+            )
+            .err(),
             Some(WireError::MalformedMessage)
         );
         let headers = {
@@ -1812,7 +1985,14 @@ mod tests {
             headers
         };
         assert_eq!(
-            receive_event(&Config::default(), &out.subject, &headers, &out.payload).err(),
+            receive_event(
+                &Config::default(),
+                Some(&owner()?),
+                &out.subject,
+                &headers,
+                &out.payload
+            )
+            .err(),
             Some(WireError::MalformedMessage)
         );
         Ok(())

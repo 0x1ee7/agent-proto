@@ -55,9 +55,10 @@ Test names carry the requirement ID (`req_0002_NNN_*`).
 - 0002-090, 0002-091, 0002-092, 0002-093, 0002-094, 0002-095, 0002-096: `errors`.
 - 0002-110, 0002-111, 0002-112, 0002-113: `envelope` inline limit and blob references.
 
-Not tested here: 0002-011 principal comparison. It needs the transport principal, which
-`bus_api::message::Request` does not carry. The binding layer must perform it before
-calling `receive`.
+0002-011 is enforced here: `envelope::receive` refuses a request unless its transport principal
+(`Request::principal`) names the `A2AB-Sender` agent; `envelope::receive_event` refuses an event
+unless its principal is the owning agent of the event subject (0002-006). A missing or anonymous
+principal is refused with `PERMISSION_DENIED`. Signatures (RFC-0007) are not implemented here.
 
 ## Deviations from RFC text
 
