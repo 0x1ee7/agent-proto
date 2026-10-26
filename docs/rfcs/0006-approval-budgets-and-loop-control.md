@@ -5,7 +5,7 @@
 | Status | Proposed |
 | Depends on | RFC-0001 (L9, L10, L13, L17; shared vocabulary); RFC-0002 (headers, Message.metadata); RFC-0003 (`approval`, `budget`, `sequence` activation and card keys); RFC-0005 (state transitions, failure codes, deadlines, cancel cascade); RFC-0007 (operator identity, signing, grants); RFC-0009 (Backend permission and usage hooks, stop reasons); RFC-0013 (audit) |
 | Owner area | Worker runtime: approvals, budgets, delegation accounting, loop breaker |
-| Related interop notes | `docs/interop/acp-omp-claude.md` sections 2.8, 2.9, 2.10, 3.3, 4.3, 4.4; `docs/interop/hermes.md` sections 6.2, 8.3, 10; `docs/interop/a2a-spec-notes.md` section 3.3 |
+| Related interop notes | `docs/interop/acp-omp-claude.md` sections 2.8, 2.9, 2.10, 3.3, 4.3, 4.4; `docs/interop/hermes.md` sections 6.2, 8.3, 10; `docs/interop/a2a-spec-notes.md` section 3.3; `docs/spikes/omp-acp.md` (Q4); `docs/spikes/claude-acp.md` (Q4); `docs/spikes/hermes-a2a.md` (Q4) |
 
 ## 1. Summary
 
@@ -51,7 +51,7 @@ Non-goals:
 
   `external` is not an M1 value. A Worker MUST refuse to start with an approval mode it does not implement. Auto-allow is recorded in audit (RFC-0013) but creates no `ApprovalRequest`.
 
-- [0006-004] The default mode for every M1 agent is `ask-all`. The mode in effect MUST be the mode advertised in the agent card (RFC-0003), and a driver MUST NOT run a session in a backend mode more permissive than the card mode (section 4.7).
+- [0006-004] The default mode for every M1 agent is `ask-all`, except omp, whose default is `ask-exec`, because omp cannot enforce `ask-all` (0006-029, RFC-0009 [0009-083]). The mode in effect MUST be the mode advertised in the agent card (RFC-0003), and a driver MUST NOT run a session in a backend mode more permissive than the card mode (section 4.7). A driver MUST NOT declare a mode its backend cannot enforce.
 
 ### 4.2 Approval request
 
@@ -104,11 +104,16 @@ stateDiagram-v2
 
 ### 4.5 Driver and backend mapping
 
-- [0006-025] Omp (`--mode acp`): the driver MUST start every bus session with `tools.approvalMode` set to `always-ask` for mode `ask-all`, or `always-ask-cached` for mode `ask-exec`. It MUST NOT use `write` or `yolo` for a bus session; both are dangerous modes (RFC-0009 [0009-063]). `always-ask-cached` auto-approves `read` without file targets and reads of granted files only; omp documents no automatic approval of `write` or `exec` under it (`acp-omp-claude.md` 3.3). Under `ask-exec` the Worker therefore answers every `write` and `exec` `session/request_permission` itself, and a tool call that proceeds without one is a fault (below). Under `always-ask`, omp auto-approves `read` (`acp-omp-claude.md` 3.3), which the `ask-all` row of 0006-003 does not allow; this deviation is `[UNVERIFIED]` and 0006-029 covers it. The driver MUST NOT rely on omp's default answers. `acp-omp-claude.md` 3.3 records that omp may return default answers when the client does not advertise `elicitation.form`; that is `[UNVERIFIED]`. Until conformance 0006-029 passes, the driver MUST NOT advertise `elicitation.form` and MUST treat any tool call that proceeds without a `session/request_permission` as a fault that fails the task with `BACKEND_CRASHED`.
-- [0006-026] Claude Code (`claude-agent-acp`): the driver MUST set `permissions.defaultMode` to `default`. It MUST NOT set `acceptEdits`, `bypassPermissions` or any other mode that auto-accepts tool calls for a bus session (CAA-MODES, `acp-omp-claude.md` 4.3). A bus session that starts in a stricter mode than the card is acceptable.
+- [0006-025] Omp (`--mode acp`): the driver MUST start every bus session with `tools.approvalMode` set to `always-ask-cached`, the value the operator configures as `ask-exec`. It MUST NOT use `always-ask` (omp's mode for `ask-all`): it auto-approves `read` with no prompt (observed-with-stub, `docs/spikes/omp-acp.md` Q4), so `ask-all` is not declared for omp. It MUST NOT use `write` or `yolo`; both are dangerous modes (RFC-0009 [0009-063]). Under `always-ask-cached` the Worker gates every `write` and `exec` that omp raises, as form elicitation (0006-052) or as `session/request_permission` (omp bash prompt policies, `[UNOBSERVED]`), and each one is an operator decision under 4.1. omp's documented auto-approval of reads under this mode (`acp-omp-claude.md` 3.3) is not relied on: the stub observed `read` failing (Q4), so reads also reach the Worker and the 0006-003 read column decides them. Under the 0006-003 table, `ask-exec` writes would auto-allow; for omp every write is operator-gated regardless (Section 9 issue 12). A tool call that proceeds without an answered approval is a fault that fails the task with `BACKEND_CRASHED`. The driver MUST NOT rely on omp's default answers. The driver advertises `elicitation.form` (RFC-0009 [0009-018]) so that omp sends its approvals as form elicitation. The omp start is refused unless `omp_allow_path_verified` is set (RFC-0009 [0009-083]).
+- [0006-026] Claude Code (`claude-agent-acp`): the supervisor MUST set `permissions.defaultMode` to `default` in `CLAUDE_CONFIG_DIR/settings.json` (RFC-0009 [0009-084]). The `_meta.claudeCode.options.settings` override is ignored by adapter 0.97.0 (observed-with-stub, `docs/spikes/claude-acp.md`) and MUST NOT be relied on. The driver MUST NOT set `acceptEdits`, `bypassPermissions`, `dontAsk` or `auto`, or any mode that auto-accepts tool calls for a bus session (CAA-MODES, `acp-omp-claude.md` 4.3). A bus session that starts in a stricter mode than the card is acceptable.
 - [0006-027] Every `session/request_permission` MUST be answered with `outcome: selected` and an `optionId` offered in that request, or with `outcome: cancelled` (ACP-TOOL). The Worker MUST NOT answer with an option kind it did not authorize (0006-010).
-- [0006-028] On `session/cancel`, the driver MUST answer every pending permission with `cancelled` (`acp-omp-claude.md` 2.9). This answers the backend and closes open requests (0006-018).
-- [0006-029] Conformance gate for omp (see 0006-025): a test with a backend that issues a `read` tool call and a `write` tool call under `ask-all`, with `elicitation.form` not advertised, MUST show that neither tool call proceeds until a Worker decision is made. Until this test passes on the target omp version, `ask-all` MUST NOT be declared for the omp agent card.
+- [0006-028] On `session/cancel`, the driver MUST answer every pending `session/request_permission` with `cancelled` (`acp-omp-claude.md` 2.9) and every pending form elicitation with `{"action":"cancel"}` (0006-053). This answers the backend and closes open requests (0006-018).
+- [0006-029] Conformance gate for omp (see 0006-025): a test with a backend that issues a `read` tool call and a `write` tool call under `always-ask-cached`, with `elicitation.form` not advertised, MUST show that neither tool call proceeds. Observed-with-stub: write is denied and read fails (`docs/spikes/omp-acp.md` Q4). The allow path is not yet observed: a test with `elicitation.form` advertised MUST show that the write proceeds only after an operator `allow-once` through elicitation. Until the allow-path test passes on the target omp version, the omp agent MUST NOT start (RFC-0009 [0009-083]).
+- [0006-052] Form `elicitation/create` (sent only when the driver advertised `elicitation.form`, RFC-0009 [0009-018]) that correlates with a `tool_call` in the same session opens an approval request under 4.2. The Worker MUST take the tool, tier and summary from that `tool_call` (`toolCallId`, title, kind), never from the elicitation `message` or `requestedSchema`. The options offered to the operator are `allow-once` and `reject-once`; `allow-always` is never offered (0006-010). An elicitation with no matching `tool_call` MUST be declined and audited as `ELICITATION_UNCORRELATED`; no request opens.
+- [0006-053] The answer maps as follows. Operator `allow-once` answers `{"action":"accept","content":C}`, where C is built from the schema-declared boolean allow field (shape `[UNVERIFIED]`, Section 9 issue 10). Operator `reject-once` answers `{"action":"decline"}`. Cancel, expiry and session cancel (0006-028) answer `{"action":"cancel"}`. If the schema has no unambiguous allow field, the answer is `decline` and the audit reason is `ELICITATION_SCHEMA_UNSUPPORTED`; the Worker MUST NOT guess a field.
+- [0006-054] An `elicitation/create` with any mode other than `form` MUST be answered `decline` and creates no request. `elicitation/complete` changes no approval state.
+- [0006-055] Permission options are selected by `kind`, not by id. The Worker answers with the offered option whose kind is `allow_once` or `reject_once`; if no option of that kind is offered, the answer is `cancelled`. The Worker MUST NOT select `allow_always` (including Claude's `allow-with-updates`). Claude option ids are passed through unchanged (observed-with-stub, `docs/spikes/claude-acp.md` Q4).
+- [0006-056] When the backend process exits or restarts, every open approval request for it is closed (CLOSED, RFC-0005) and no answer is sent. A later operator decision for a closed request is refused. A recovered agent session never inherits an open approval (RFC-0009 [0009-013]).
 
 ### 4.6 Budget allowance and accounting
 
@@ -124,7 +129,7 @@ stateDiagram-v2
 
 ### 4.7 Metering and enforcement
 
-- [0006-037] Metering sources (D13): the Worker charges `tokens_used` from per-turn token counts reported by the backend (ACP stop data or driver result fields, RFC-0009). If a backend cannot report per-turn tokens, the Worker uses its self-reported count if the backend provides one; if neither exists, `tokens_used` is not advanced and the audit record marks the dimension `unmetered`. `cost_units_used` is charged from a reported cost (ACP `usage_update.cost`, Claude `total_cost_usd`) in integer cost units. `wall_ms_used` is measured by the Worker.
+- [0006-037] Metering sources (D13): the Worker charges `tokens_used` from per-turn token counts reported by the backend (ACP stop data or driver result fields, RFC-0009). If a backend cannot report per-turn tokens, the Worker uses its self-reported count if the backend provides one; if neither exists, `tokens_used` is not advanced and the audit record marks the dimension `unmetered`. `cost_units_used` is charged in integer cost units from a reported cost (ACP `usage_update.cost`, Claude `total_cost_usd`) as the increase over the highest cost sample already charged in the session. The sample is treated as cumulative (stub, RFC-0009 [0009-056]; `[UNVERIFIED]` on the real tier, Section 9 issue 11). Claude prompt usage is a per-turn sum and is charged once per turn (RFC-0009 [0009-086]). `wall_ms_used` is measured by the Worker.
 - [0006-038] The ACP `usage_update` fields `used` and `size` describe context occupancy, not spend (`acp-omp-claude.md` 2.8). The Worker MUST NOT add successive `used` values into `tokens_used`.
 - [0006-039] Enforcement points, each one a hard stop:
   - before each backend turn: every enforced dimension MUST have remaining above zero, and `hops_used` < `max_hops`;
@@ -154,20 +159,20 @@ Stock A2A peer (A2A v1.0 client or server):
 - The budget and sequence metadata keys are ignored by stock peers, as the A2A spec allows for unknown metadata.
 
 Hermes (A2A HTTP client and server, `hermes.md`):
-- Hermes reads interrupted states from a text marker, not from the enum (`hermes.md` 8.5). The gateway renders approval waits as `[INPUT_REQUIRED]` text (RFC-0008); the request text and the decision path are the gateway's concern.
+- Hermes reports interrupted work through the TaskState enum, and strips the `[INPUT_REQUIRED]` text marker (observed-with-stub, `docs/spikes/hermes-a2a.md` Q4). An INPUT_REQUIRED task from Hermes is an input request for the operator, not an `ApprovalRequest`. The gateway renders the wait as `[INPUT_REQUIRED]` text (RFC-0008). A follow-up reuses the namespaced contextId, not `message.taskId` (RFC-0009 [0009-078]).
 - Hermes sends no metadata (`hermes.md` 8.3). A Hermes-originated request therefore receives the root allowance from 0006-031, not a caller budget. The gateway MUST NOT invent a budget from HTTP headers.
 - Hermes counts admissions per contextId for its own cap, default 5 (`hermes.md` 6.2). A decision that resumes a task in the same context is one additional admission on Hermes' side (`hermes.md` 10). Callers that loop should use new contextIds.
 - Hermes' REJECTED result (anti-loop) is mapped as a child that ended REJECTED (0006-047).
 
 ACP agents (omp, claude-agent-acp):
-- They see only `session/request_permission` and `session/cancel`, which are standard ACP. They never see budgets, lineage or fingerprints.
-- The omp risk in 0006-025 is the only place where a default answer could bypass the gate. It is gated by the conformance test in 0006-029 and by the rule that an unanswered tool call is a fault.
+- They see `session/request_permission` for tool permissions, form `elicitation/create` for omp approvals (only when `elicitation.form` is advertised), and `session/cancel`. These are standard ACP. They never see budgets, lineage or fingerprints.
+- The omp risk in 0006-025 is the only place where a default answer could bypass the gate. It is gated by the conformance test in 0006-029, by the refuse-start gate in RFC-0009 [0009-083], and by the rule that an unanswered tool call is a fault.
 - Claude subagents keep running after a session cancel (`acp-omp-claude.md` 4.4). The Worker kills the session process at grace expiry (RFC-0005 [0005-037]), which bounds that spend and the wall time.
 
 ## 6. Security considerations
 
 - T7 (forged or fatigue-driven approval): decisions need an operator identity (0006-014), a fresh nonce (0006-013), single use (0006-015), exact scope (0006-016), a short expiry (0006-006), redacted actual-action summaries (0006-008), coalescing and per-task caps (0006-021, 0006-022) and a decision rate limit (0006-023). ALLOW_ALWAYS is never persistent and is not offered for exec or delete (0006-010).
-- Default deny is the rule everywhere: no answer means cancelled or reject (0006-001, 0006-017, 0006-027).
+- Default deny is the rule everywhere: no answer means cancelled or reject (0006-001, 0006-017, 0006-027), and no elicitation answer means cancel or decline (0006-053, 0006-054).
 - T3 (ping-pong and cost runaway): allowances decrease monotonically (0006-034), each hop enforces locally (0006-039), depth and hops are always enforced (0006-042), and the breaker stops repeated abuse by origin (0006-048).
 - T11 (stale authority in partitions): approval and budget expiries are checked by the owner only, using its local clock; a late decision cannot revive a task (0006-013 step 4, RFC-0005 [0005-035]).
 - Prompt injection: summaries and tool text are untrusted (0006-008). The enforced boundary is scope and approval, not delimiters (R-S7).
@@ -354,7 +359,31 @@ The parent charges these to its reserve and returns the unused part (0006-034).
 
 Stream end: this event carries `A2AB-Stream-End: true`.
 
-### A.6 ACP permission mapping (omp, `ask-all`)
+### A.6 Form elicitation approval (omp, `ask-exec`)
+
+The matching tool call arrives first. Field names beyond `toolCallId`, `title`, `kind` and `status` are `[UNVERIFIED]` for omp's live run.
+
+```json
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"write notes.txt","kind":"edit","status":"pending"}}}
+```
+
+Agent to Worker driver (requires the driver to have advertised `elicitation.form`; RFC-0009 [0009-018]):
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"elicitation/create","params":{
+  "sessionId":"S","mode":"form","message":"Allow tool call?",
+  "requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean"}}}}}
+```
+
+The summary comes from the `tool_call` above, never from `message` or `requestedSchema` (0006-052). After the operator's allow-once decision (A.2), the driver answers (content shape `[UNVERIFIED]`, Section 9 issue 10):
+
+```json
+{"jsonrpc":"2.0","id":7,"result":{"action":"accept","content":{"approve":true}}}
+```
+
+Reject-once answers `{"action":"decline"}`. Expiry or session cancel answers `{"action":"cancel"}` (0006-053).
+
+### A.7 ACP permission mapping (Claude, `default`)
 
 Agent to Worker driver:
 
@@ -362,13 +391,13 @@ Agent to Worker driver:
 {"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{
   "sessionId":"S",
   "toolCall":{"toolCallId":"t1"},
-  "options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}
+  "options":[{"optionId":"allow-once","name":"Yes","kind":"allow_once"},{"optionId":"allow-with-updates","name":"Yes, allow all edits during this session","kind":"allow_always"},{"optionId":"reject","name":"No","kind":"reject_once"}]}}
 ```
 
-After the operator's decision (A.2), the driver answers:
+After the operator's allow-once decision, the driver selects the offered `allow_once` option by kind (0006-055). It never selects `allow-with-updates`:
 
 ```json
-{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}
+{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}
 ```
 
 On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0006-017, 0006-028).
@@ -380,7 +409,7 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-001 | Backend tool call with no Worker answer; the tool call does not run | MUST |
 | 0006-002 | Unknown tool name gets tier exec; MCP tool gets at least write | MUST |
 | 0006-003 | Table test: each mode and tier produces the prompt or auto-allow in the table | MUST |
-| 0006-004 | Start with mode ask-all as default; start with an unimplemented mode and expect refusal | MUST |
+| 0006-004 | Default mode ask-all for non-omp agents; omp starts with ask-exec; an unimplemented mode and ask-all declared for omp are refused | MUST |
 | 0006-005 | Crash after commit and before publish; restart yields one request with one nonce | MUST |
 | 0006-006 | Request fields all present; expiry default 300 s; configured expiry outside 30 to 3600 s rejected | MUST |
 | 0006-007 | Request is INPUT_REQUIRED on the ev subject with A2AB-Stream-End true; no other subject used | MUST |
@@ -401,11 +430,11 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-022 | Fourth open request refused automatically with APPROVAL_FLOOD; task continues | MUST |
 | 0006-023 | Eleventh decision in a minute refused OVERLOADED with detail RATE_LIMITED; no state change | MUST |
 | 0006-024 | UI test: fields shown; no bulk approve; no preselected option | MUST |
-| 0006-025 | Omp session starts with approvalMode always-ask (ask-all) or always-ask-cached (ask-exec); write and yolo never; a write or exec that proceeds without a permission request is BACKEND_CRASHED | MUST |
-| 0006-026 | Claude session starts with defaultMode default; acceptEdits and bypass never set | MUST |
+| 0006-025 | Omp session starts with approvalMode always-ask-cached (configured ask-exec); always-ask, write and yolo never set; omp start refused until omp_allow_path_verified is set (RFC-0009 [0009-083]); a write or exec that proceeds without an answered approval is BACKEND_CRASHED | MUST |
+| 0006-026 | Claude settings file under CLAUDE_CONFIG_DIR has permissions.defaultMode default; acceptEdits, bypassPermissions, dontAsk and auto never set; _meta override not relied on | MUST |
 | 0006-027 | Every request_permission answered with selected (offered id) or cancelled | MUST |
-| 0006-028 | session/cancel with pending permission; driver answers cancelled | MUST |
-| 0006-029 | Omp without elicitation.form; a read call and a write call under ask-all; neither proceeds until a decision | MUST |
+| 0006-028 | session/cancel with a pending permission and a pending form elicitation; driver answers cancelled and cancel | MUST |
+| 0006-029 | Omp under always-ask-cached without elicitation.form: write denied and read not run; with elicitation advertised, write proceeds only after an operator allow (allow path not yet observed; required before omp starts) | MUST |
 | 0006-030 | Delegated message carries budget; receiver does not use a larger allowance than received | MUST |
 | 0006-031 | Root without budget gets configured defaults; with a budget gets the component-wise minimum | MUST |
 | 0006-032 | Zero means none (tool refused); sentinel rejected on non-root hop | MUST |
@@ -413,7 +442,7 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-034 | Parent reserve reduced at creation; child usage charged and unused part returned | MUST |
 | 0006-035 | Child receives message with skewed issuer clock; wall budget unaffected | MUST |
 | 0006-036 | Hops counter increments per backend turn | MUST |
-| 0006-037 | Backend without tokens: tokens dimension marked unmetered; hops and wall still enforced | MUST |
+| 0006-037 | Backend without tokens: tokens dimension marked unmetered; cost charged as the high-water difference of usage_update.cost; hops and wall still enforced | MUST |
 | 0006-038 | Successive usage_update used values are not summed into tokens_used | MUST |
 | 0006-039 | Exhaust each dimension mid-turn; turn cancelled and FAILED BUDGET_EXHAUSTED | MUST |
 | 0006-040 | Trip detail contains only dimension, limit, used; children cancelled | MUST |
@@ -428,11 +457,16 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-049 | Required child FAILED; parent FAILED CHILD_FAILED with child id and code | MUST |
 | 0006-050 | Budget or loop trip cancels children; breaker trip leaves running tasks untouched | MUST |
 | 0006-051 | Decision with missing or different request_sha256 refused APPROVAL_NOT_APPLICABLE with no state change; matching digest honored | MUST |
+| 0006-052 | Form elicitation with a matching tool_call opens a request; summary and tier come from the tool_call; no matching call gives decline with ELICITATION_UNCORRELATED; no allow_always offered | MUST |
+| 0006-053 | Operator allow-once gives accept with content from the schema allow field; reject-once gives decline; cancel, expiry and session cancel give cancel; no unambiguous allow field gives decline with ELICITATION_SCHEMA_UNSUPPORTED | MUST |
+| 0006-054 | Elicitation in any mode other than form is declined with no request; elicitation/complete changes no approval state | MUST |
+| 0006-055 | Permission answer selects the offered option by kind (allow_once or reject_once); no option of that kind gives cancelled; allow_always never selected; Claude ids passed through | MUST |
+| 0006-056 | Backend exit or restart closes open requests with no answer sent; later decision for a closed request refused; recovered session holds no open approval | MUST |
 
 ## 9. Open issues
 
 1. **Integrator request: new transition.** `(create) -> FAILED` with LOOP_DETECTED (0006-045) is not in the original RFC-0005 table. Default: LifecycleAuthor added the row to RFC-0005 Table 4.2; integrator to confirm.
-2. **Omp elicitation behaviour.** Default: as 0006-025 and 0006-029. Until the conformance test passes, `ask-all` is not declared for omp. Owner: RFC-0009 driver.
+2. **Omp approval path.** Observed-with-stub (`docs/spikes/omp-acp.md` Q4): without `elicitation.form`, omp denies `write` outright and fails `read` under `always-ask-cached`; `always-ask` auto-approves `read`. Not observed: a successful allow through elicitation, omp's elicitation cancel answer, and the omp error code for an undeclared method. Default: as 0006-025, 0006-029 and RFC-0009 [0009-083] (omp refuse-start gate). Owner: RFC-0009 driver.
 3. **Approval expiry default.** Default: 300 seconds (0006-006). Operator-tunable within 30 to 3600 seconds.
 4. **Fatigue thresholds.** Defaults: 3 open requests per task, 10 decisions per minute per tenant, 30 s coalescing. Tune after M1 measurement.
 5. **Breaker thresholds.** Defaults: 3 failures in 10 minutes, open for 10 minutes (0006-048). Breaker state location: RFC-0005 store.
@@ -440,3 +474,6 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 7. **Token metering per backend.** Default: per-turn counts from the backend where available; otherwise unmetered and enforced only by wall, hops and depth (0006-037). RFC-0009 owns the per-backend source table.
 8. **Operator identity format.** Default: owned by RFC-0007. This RFC requires only that decided_by be the verified identity string.
 9. **Minted grant token not bound to the decision.** Default: not bound in M1. The decision binds the grant through `request_sha256` (0006-051), the operator signature, and the fields tool, tier, summary, chain and expiry. The root grant token bytes are not in `ApprovalRequest`, so a token digest is not checked. Owner: RFC-0007 token minting. Revisit if a token digest field is required in the request or decision.
+10. **Accept content shape.** `[UNVERIFIED]`: the `content` object for `accept` is built from the schema's boolean allow field (0006-053). No allow answer has been observed. Default: decline with `ELICITATION_SCHEMA_UNSUPPORTED` when the allow field is absent or not boolean. A live allow run decides the shape. Owner: RFC-0009 driver.
+11. **Cost cumulative per session.** Stub: `usage_update.cost` reads as a cumulative sample (RFC-0009 [0009-056]). Whether it is cumulative per session on the real tier is `[UNOBSERVED]`. Default: charge high-water differences (0006-037); a decreasing sample charges nothing and records a fault.
+12. **Ask-exec write column.** The 0006-003 table shows write auto-allow under `ask-exec`, but observed omp denial without elicitation (Q4) shows omp writes are gated. Default: 0006-025 governs omp (every omp write is operator-gated). Whether the table row changes for other backends is for RFC-0003 and the integrator.

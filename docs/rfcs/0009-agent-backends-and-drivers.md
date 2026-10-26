@@ -5,7 +5,7 @@
 | Status | Proposed |
 | Depends on | RFC-0001, RFC-0003, RFC-0005, RFC-0006, RFC-0007, RFC-0008, RFC-0011, RFC-0012, RFC-0013 |
 | Owner area | Agent drivers: `Backend` seam, `driver-acp`, `driver-a2a-http`, usage metering |
-| Related interop notes | `docs/interop/acp-omp-claude.md`, `docs/interop/hermes.md`, `docs/interop/a2a-spec-notes.md` |
+| Related interop notes | `docs/interop/acp-omp-claude.md`, `docs/interop/hermes.md`, `docs/interop/a2a-spec-notes.md`, `docs/spikes/omp-acp.md`, `docs/spikes/claude-acp.md`, `docs/spikes/hermes-a2a.md` |
 
 Normative language: BCP 14 (RFC 2119, RFC 8174): MUST, MUST NOT, SHOULD, MAY in capitals.
 
@@ -121,7 +121,7 @@ Worked example (language-neutral JSON form of a driver event, omp turn 3):
 ### 4.4 Agent sessions and restore
 
 - [0009-012] The driver MUST key agent sessions by A2A `context_id`: one agent session per `context_id` per driver instance. The driver reports the agent session handle in a `Status` event of kind `SessionBound`. The worker persists the mapping in its state directory (RFC-0012 owns the directory).
-- [0009-013] On `Start` with a `context_id` that has a stored handle, the driver MUST try restore in this order: `session/load` if `agentCapabilities.loadSession` is true; else `session/resume` if `sessionCapabilities.resume` is present; else a new session. When restore fails, the driver MUST emit a `Status` notice that prior context was not restored, and MUST NOT let the worker report restored context.
+- [0009-013] On `Start` with a `context_id` that has a stored handle, the driver MUST try restore in this order: `session/load` if `agentCapabilities.loadSession` is true; else `session/resume` if `sessionCapabilities.resume` is present; else a new session. When restore fails, or the agent answers `ACP session not found` to `session/load` or `session/resume` (omp does this after a completed turn in a new process; observed-with-stub), the driver MUST treat the session as new, MUST emit a `Status` notice that prior context was not restored, and MUST NOT let the worker report restored context. The worker then rebuilds the context from the Worker task history on the bus and MUST NOT assume resume.
 - [0009-014] A turn that was in flight at a crash MUST NOT be replayed on restore. It ends with `Failed` `BACKEND_CRASHED` (Section 4.11).
 
 ### 4.5 driver-acp
@@ -130,7 +130,7 @@ Worked example (language-neutral JSON form of a driver event, omp turn 3):
 
 - [0009-015] `driver-acp` MUST act as an ACP client using JSON-RPC 2.0 over the agent child process stdio with ACP stdio framing.
 - [0009-016] The driver MUST negotiate `protocolVersion` 1 during `initialize`. If the agent returns any other version, the driver MUST close the connection, emit `Fault`, and MUST NOT start a turn. ACP v2 is not used in M1.
-- [0009-017] Paths sent to an agent MUST be absolute. `session/new` MUST send `cwd` set to the worker's workspace root (RFC-0012, L16) and `mcpServers` as an array. The array is empty unless RFC-0007 provides MCP entries, because ACP sessions do not discover MCP servers on disk.
+- [0009-017] Paths sent to an agent MUST be absolute. `session/new` MUST send `cwd` set to the worker's workspace root (RFC-0012, L16) and `mcpServers` as an array. The array is empty unless RFC-0007 provides MCP entries, because ACP sessions do not discover MCP servers on disk. An MCP entry counts as available only after a probe call confirms its tools: omp returned success from `session/new` for an MCP server whose command did not exist (observed-with-stub).
 
 Worked example (ACP requests from driver to omp; fields abbreviated):
 
@@ -138,7 +138,8 @@ Worked example (ACP requests from driver to omp; fields abbreviated):
 {"jsonrpc":"2.0","id":1,"method":"initialize",
  "params":{"protocolVersion":1,
    "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},
-                         "terminal":false,"auth":{"terminal":false}}}}
+                         "terminal":false,"auth":{"terminal":false},
+                         "elicitation":{"form":{}}}}}
 ```
 
 ```json
@@ -148,11 +149,11 @@ Worked example (ACP requests from driver to omp; fields abbreviated):
 
 #### 4.5.2 Client capabilities
 
-- [0009-018] `clientCapabilities` MUST declare `fs.readTextFile` false, `fs.writeTextFile` false, `terminal` false, and `auth.terminal` false. The driver MUST NOT declare an elicitation capability.
+- [0009-018] `clientCapabilities` MUST declare `fs.readTextFile` false, `fs.writeTextFile` false, `terminal` false, and `auth.terminal` false. It MUST declare `elicitation` with `form` (an empty object), because omp sends generic approvals only as form elicitation when that capability is present (`docs/spikes/omp-acp.md` Q4). It MUST NOT declare `elicitation.url` or any other elicitation mode.
 
-The consequence is deliberate: agents use their own file and shell tools, and the approval gate covers only what an agent raises through `session/request_permission`. Section 6 records this as a trade-off.
+The consequence is deliberate: agents use their own file and shell tools. The approval gate covers permissions an agent raises through `session/request_permission` (Claude; omp bash `prompt` policies are `[UNOBSERVED]`) and form elicitations (omp write and exec approvals, 0009-082). Section 6 records this as a trade-off.
 
-- [0009-019] If an agent calls a client method that was not declared (file, terminal, elicitation, or any unlisted client method), the driver MUST reply with a JSON-RPC error and MUST NOT perform the operation. The error code is -32601 (method not found), which is `[UNVERIFIED]` against what the agents expect (Section 9).
+- [0009-019] If an agent calls a client method that was not declared (file, terminal, or any unlisted client method other than `elicitation/create`), the driver MUST reply with a JSON-RPC error and MUST NOT perform the operation. `elicitation/create` is answered under 0009-082. The error code is -32601 (method not found), which is `[UNVERIFIED]` against omp's own error (Section 9 issue 4).
 
 #### 4.5.3 Turn lifecycle and stop reasons
 
@@ -200,9 +201,9 @@ The driver emits `ArtifactDelta` with `text` "Running tests..." and `append` tru
 
 #### 4.5.5 Permissions
 
-- [0009-032] `session/request_permission` MUST map to `PermissionRequest`. The driver assigns a `request_id` unique within the driver instance. The event carries a redacted tool summary (kind and title) and the offered options with `option_id` and kind (`allow_once`, `allow_always`, `reject_once`, `reject_always`).
+- [0009-032] `session/request_permission` MUST map to `PermissionRequest`. The driver assigns a `request_id` unique within the driver instance. The event carries a redacted tool summary (kind and title) and the offered options with `option_id` and `kind` as the agent sent them (`allow_once`, `allow_always`, `reject_once`, `reject_always`). Claude sends ids `allow-once`, `allow-with-updates`, and `reject` (observed-with-stub); the driver MUST NOT depend on the ids, and the worker selects by kind (RFC-0006 0006-055).
 - [0009-033] Each permission request MUST be answered exactly once, by one of two sources: a `ResolvePermission` command, or the driver's own permission timeout (`permission_timeout`, default 300 seconds). The driver MUST NOT answer a permission request on its own choice. The driver answers `selected` only with an `option_id` that was in the offered list; otherwise it answers `cancelled`.
-- [0009-034] The driver MUST NOT select `allow_always` or `reject_always` by default. A choice of such an option MUST come from a `ResolvePermission` that the worker issued after an operator decision (RFC-0006, RFC-0007 signed decisions).
+- [0009-034] The driver MUST NOT select `allow_always` or `reject_always` by default. A choice of such an option MUST come from a `ResolvePermission` that the worker issued after an operator decision (RFC-0006, RFC-0007 signed decisions). Claude's `allow-with-updates` is `allow_always`.
 
 Worked example (approval flow on the agent wire):
 
@@ -211,7 +212,7 @@ Worked example (approval flow on the agent wire):
  "params":{"sessionId":"sess_01",
    "toolCall":{"toolCallId":"tc_9","title":"bash: cargo test","kind":"execute","status":"pending"},
    "options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},
-              {"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
+              {"optionId":"reject","name":"Reject","kind":"reject_once"}]}}
 ```
 
 After the worker's approval decision arrives as `ResolvePermission(option_id = "allow-once")`, the driver answers:
@@ -225,9 +226,31 @@ On timeout or cancel, the answer is `{"outcome":{"outcome":"cancelled"}}`.
 
 The worker turns the `PermissionRequest` into `INPUT_REQUIRED` plus the approval extension (RFC-0005, RFC-0006, L7, L10). The approval extension schema belongs to RFC-0006.
 
+- [0009-082] `elicitation/create` with `mode` `form` MUST map to `PermissionRequest` (Section 4.5.5) with a `request_id`, a kind of `form-elicitation`, and an empty tool summary. The worker takes the summary from the matching `tool_call` (RFC-0006 0006-052). The driver MUST NOT use the elicitation `message` or `requestedSchema` text as an approval summary. The driver answers only after `ResolvePermission` or its permission timeout (0009-033). A `ResolvePermission` naming `allow-once` gives an `accept` result whose content is built as RFC-0006 0006-053 defines; `reject-once` gives `decline`; `cancelled`, including a session cancel (0009-035), gives `cancel`. If the schema has no unambiguous allow field, the driver answers `decline` and raises `Fault` `elicitation-schema-unsupported`. An `elicitation/create` with any mode other than `form` MUST be answered `decline` with no `PermissionRequest` (RFC-0006 0006-054). `elicitation/complete` changes no state.
+
+Worked example (form elicitation from omp; field names beyond `mode` and `message` are `[UNVERIFIED]`):
+
+```json
+{"jsonrpc":"2.0","id":"e-1","method":"elicitation/create",
+ "params":{"sessionId":"sess_01","mode":"form","message":"Allow tool call tc_9?",
+   "requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean"}}}}}}
+```
+
+The worker's `allow-once` decision produces (accept content shape `[UNVERIFIED]`, RFC-0006 issue 10):
+
+```json
+{"jsonrpc":"2.0","id":"e-1","result":{"action":"accept","content":{"approve":true}}}
+```
+
+After `reject-once`:
+
+```json
+{"jsonrpc":"2.0","id":"e-1","result":{"action":"decline"}}
+```
+
 #### 4.5.6 Cancel
 
-- [0009-035] On `Cancel`, the driver MUST send a `session/cancel` notification for the session. It MUST answer every pending permission request with `cancelled`. It MUST emit `Status` `Progress` for each open tool call with status `failed` and detail `canceled`, because ACP has no cancelled tool status. It MUST then await the `stopReason` of the pending prompt.
+- [0009-035] On `Cancel`, the driver MUST send a `session/cancel` notification for the session. It MUST answer every pending `session/request_permission` with `cancelled` and every pending form elicitation with `cancel` (0009-082). It MUST emit `Status` `Progress` for each open tool call with status `failed` and detail `canceled`, because ACP has no cancelled tool status. It MUST then await the `stopReason` of the pending prompt. Claude returned `cancelled` within about 30 ms even with an unanswered permission request (observed-with-stub).
 - [0009-036] If the pending prompt does not return within `cancel_grace` (default 10 seconds), the driver MUST terminate the agent process tree (Section 4.8), emit `Terminal` `Canceled`, and apply the restart policy. A `Canceled` terminal MUST be emitted in all cases, so the turn ends within the bound (M1-8).
 
 Worked example (cancel on the wire):
@@ -241,17 +264,23 @@ The agent then returns `{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelle
 #### 4.5.7 Launch
 
 - [0009-037] The driver MUST spawn agent executables by absolute path without a shell. Shell strings, `cmd /c`, and shell interpolation MUST NOT be used.
-- [0009-038] On Windows, claude-agent-acp MUST be launched as `node <absolute path to the package entry>` rather than through `cmd /c npx`. The bin name is `claude-agent-acp` (verified against the published package, v0.97.0). The package entry is `dist/index.js` in the notes' example; the Windows install path is `[UNVERIFIED]` (Section 9).
-- [0009-039] omp MUST be launched as `omp --mode acp` (or `omp acp` when an `--config` file is needed), with `--cwd` set to the workspace root. The driver MUST pass `--approval-mode` explicitly on every launch and MUST NOT rely on the schema default.
+- [0009-038] On Windows, claude-agent-acp MUST be launched as `node <absolute path to the package entry>` rather than through `cmd /c npx`. This launch form was observed with the stub (`docs/spikes/claude-acp.md`). The bin name is `claude-agent-acp` (verified against the published package, v0.97.0). The package entry is `dist/index.js` in the notes' example; the Windows install path is `[UNVERIFIED]` (Section 9).
+- [0009-039] omp MUST be launched as `omp --mode acp --cwd <workspace root> --session-dir <dir> --approval-mode ask-exec` (or `omp acp` with `--config` when an overlay file is needed). The driver MUST pass `--approval-mode` explicitly on every launch and MUST NOT rely on the schema default. Under ACP, write and exec approvals arrive as form elicitation (0009-082); `session/request_permission` covers only bash `prompt` policies, which are `[UNOBSERVED]`.
 
 ### 4.6 driver-a2a-http
 
 - [0009-040] `driver-a2a-http` MUST send `A2A-Version: 1.0` on every request. It MUST NOT send `A2A-Extensions`, and MUST NOT send any `urn:a2abus:` metadata or `A2AB-*` header to the peer. Budget and provenance are enforced locally at every hop (L9). Hermes sends none of these, and unknown fields may be rejected by the peer.
 - [0009-041] Discovery is best-effort. The driver MUST fetch `/.well-known/agent-card.json`, fall back to `agent.json` on 404, and use a timeout of `min(timeout, 30)` seconds. A failed fetch MUST NOT be fatal. The RPC URL is the card `supportedInterfaces` entry with `protocolBinding` `JSONRPC`, else the card `url`, else the configured base URL.
-- [0009-042] When the card or peer config sets a `tenant`, the driver MUST send that value in `params.tenant`. Hermes returns 400 on a tenant mismatch (hermes.md sections 1.1 and 1.7).
-- [0009-043] The driver MUST send `SendMessage` by default. It MUST use `SendStreamingMessage` only when the peer card advertises `capabilities.streaming` true and the peer config enables streaming. The `contextId` MUST be the A2A `contextId` from `Start` and MUST NOT be replaced.
+- [0009-042] When the card or peer config sets a `tenant`, the driver MUST send that value in `params.tenant`. Hermes accepted a mismatched tenant in the Hermes spike (observed-with-stub), which contradicts the Hermes 400 described in `docs/interop/hermes.md` sections 1.1 and 1.7; the driver MUST NOT rely on the tenant for isolation (0009-080).
+- [0009-043] The driver MUST send `SendMessage` by default. It MUST use `SendStreamingMessage` only when the peer card advertises `capabilities.streaming` true and the peer config enables streaming. The `contextId` MUST be the namespaced peer context id of 0009-076, derived from the A2A `contextId` in `Start`, and MUST NOT be replaced by any other value.
 - [0009-044] Outbound text MUST pass through the redaction function (R-S5) before it is sent.
 - [0009-045] A resend after a connection failure, where no response was received, MUST reuse the original `messageId`. A new `messageId` would count as a new admission against the peer's anti-loop cap (hermes.md sections 4 and 6.2).
+- [0009-076] The driver MUST apply the per-origin contextId namespacing of RFC-0008 [0008-097] to every request it sends; the raw bus `context_id` MUST NOT be sent to the peer. Hermes shares model history across peers that reuse a `contextId` (observed-with-stub, `docs/spikes/hermes-a2a.md` Q6).
+- [0009-077] The driver MUST send `GetTask`, `SubscribeToTask`, and `CancelTask` only for task ids it received in a reply to its own `SendMessage` for the same origin and context. It MUST NOT send `ListTasks` to the peer, and MUST NOT forward a request that would reach a task created under another origin (RFC-0005 [0005-052]). Hermes returns other origins' tasks from `GetTask`, `CancelTask`, and `ListTasks` (observed-with-stub, Q6).
+- [0009-078] A follow-up to a peer task in `INPUT_REQUIRED` MUST reuse the namespaced `contextId` (RFC-0008 [0008-096]). The driver MUST NOT rely on `message.taskId` to continue the task: Hermes ignores it and creates a new task (observed-with-stub, Q4). The driver MUST NOT require the `[INPUT_REQUIRED]` text marker: Hermes strips it, and the state enum decides (0009-048).
+- [0009-079] The driver MUST tolerate the Hermes error deviations listed in RFC-0008 [0008-098]. It MUST NOT require `error.data` (ErrorInfo) and MUST classify by JSON-RPC `error.code` and HTTP status. On `GetTask` or `SubscribeToTask`, Hermes `-32002` and `-32001` MUST map to `Failed` `BACKEND_LOST_TASK` (Hermes uses `-32002` for a cross-origin cancel, observed-with-stub Q5; the bus-facing `TaskNotFound` mapping is RFC-0005 [0005-051]). Hermes `-32602` (invalid version or non-object body, where the spec gives -32009 and -32600) MUST map to `Failed` `BACKEND_ERROR`.
+- [0009-080] Hermes does not enforce `params.tenant` (observed-with-stub: a mismatched value was accepted). The driver MUST send only the tenant configured for the peer and MUST NOT treat the tenant as an isolation boundary; origin namespacing (0009-076) and visibility (0009-077) are the isolation mechanism.
+- [0009-081] The driver MUST ingest the peer card under 0009-041 and MUST NOT pass the peer card-level `security` field, tool names, or toolset tags to the bus. The bus card is built from A2A fields only with coarse skills (RFC-0008 [0008-099]; RFC-0003 [0003-050] to [0003-052]). Hermes exposes 33 toolset-derived skills, each tagged with tool names, and a card-level `security` entry (observed-with-stub, Q2).
 
 Worked example (Hermes, `SendMessage`, card-resolved RPC URL):
 
@@ -289,9 +318,10 @@ Hermes replies with a bare Task or a `{"task":...}` wrapper. The driver accepts 
 
 - [0009-054] Each `Usage` event MUST carry `source`, one of `acp-usage`, `a2a-peer`, or `driver-counted`, and only the fields that source provides. Counters are `turns`, `wall_ms`, `tokens_in`, `tokens_out`, and `cost` (amount with ISO 4217 currency). The worker sums counters. Gauges are reported separately.
 - [0009-055] The driver MUST count `turns` and `wall_ms` for every turn, with source `driver-counted`. The worker enforces turn and wall-time caps (RFC-0006, D13 backstop). The driver does not enforce them.
-- [0009-056] For ACP, `usage_update.used` and `usage_update.size` MUST be reported as a gauge, never summed, and MUST NOT be treated as billing tokens. `usage_update.cost`, when present, MUST be reported as the `cost` counter.
+- [0009-056] For ACP, `usage_update.used` and `usage_update.size` MUST be reported as gauges, never summed, and MUST NOT be treated as billing tokens. `usage_update.cost`, when present, is a cumulative sample: the driver MUST report it as the `cost` counter without summing it, and the worker charges the difference from the highest sample already charged (RFC-0006 0006-037).
 - [0009-057] The driver MUST NOT estimate tokens from text length, model output, or any other proxy. When no agent reports tokens, token meters stay absent. This is the D13 self-report fallback as this RFC reads it (Section 9).
 - [0009-058] Operator option `require_token_metering` (default false) MUST cause the worker to stop the agent and report a configuration failure when the first completed turn produced no `acp-usage` sample. The driver emits the `Usage` events that let the worker decide.
+- [0009-086] For Claude, the prompt result `usage` (observed-with-stub: `inputTokens`, `outputTokens`, `totalTokens`) MUST be emitted as one `Usage` event with source `acp-usage` for the turn, mapping input and output to `tokens_in` and `tokens_out`. The value is already the sum over the turn's model calls, so the driver MUST NOT add per-call figures again. A cancelled turn reports zero usage. `_meta.quota` and `model_usage` are not mapped in M1.
 
 Worked example (ACP usage sample, driver output, counters and gauge together):
 
@@ -304,7 +334,7 @@ Worked example (ACP usage sample, driver output, counters and gauge together):
 ### 4.8 Supervision
 
 - [0009-059] The driver MUST expose its spawn spec, liveness (child exit notification), and a graceful `Shutdown` to the supervisor (RFC-0012). The supervisor owns process-tree termination: a Windows job object or a Linux process group.
-- [0009-060] No agent process may outlive its worker (M1-1). When a worker exits, the driver MUST run `Shutdown`: close the agent's stdin, wait `shutdown_grace` (default 5 seconds), then kill the process tree.
+- [0009-060] No agent process may outlive its worker (M1-1). When a worker exits, the driver MUST run `Shutdown`: close the agent's stdin (RFC-0012 [0012-061]), wait `shutdown_grace` (default 5 seconds), then kill the process tree (RFC-0012 [0012-018] Windows job object and [0012-021] stale run records). On Windows, closing stdin is observed to end claude-agent-acp and omp cleanly (Section 9 issue 7).
 - [0009-061] Restart policy: after an unexpected exit, the driver restarts the agent after 1 second, then 2 seconds, then 4 seconds, with the delay capped at 60 seconds. When 5 unexpected exits occur within 10 minutes, the driver MUST enter the Unhealthy state and MUST NOT restart until the operator restarts it (RFC-0012 command).
 - [0009-062] A restart MUST restore contexts as Section 4.4 requires. It MUST NOT replay any input from an earlier turn.
 
@@ -326,11 +356,12 @@ stateDiagram-v2
 
 ### 4.9 Approval modes
 
-- [0009-063] Allowed canonical modes are: omp `always-ask` and `always-ask-cached`; claude `default` and `plan`. Dangerous canonical modes are: omp `write` and `yolo`; claude `acceptEdits`, `bypassPermissions`, `dontAsk`, and `auto`. Claude alias `bypass` MUST be canonicalized to `bypassPermissions` before any check.
+- [0009-063] Allowed canonical modes are: omp `always-ask-cached` (configured as `ask-exec`); claude `default` and `plan`. Dangerous canonical modes are: omp `write` and `yolo`; claude `acceptEdits`, `bypassPermissions`, `dontAsk`, and `auto`. Claude alias `bypass` MUST be canonicalized to `bypassPermissions` before any check. Any mode in neither list, including omp `always-ask` (under which omp auto-approves read; observed-with-stub), MUST be refused as `config-refused`.
 - [0009-064] `Start` of an agent whose configured mode is not in the allowed set MUST be refused. The refusal is a `Fault` of kind `config-refused`. The only exception is an operator config that names the exact dangerous mode and sets `acknowledge_dangerous` true.
 - [0009-065] The mode MUST come from operator config only. The driver MUST NOT set a mode from an agent card, a peer request, or task content. Cards are not trusted for this (RFC-0007).
 - [0009-066] The resolved canonical mode MUST be recorded on the card as the `approvalMode` parameter of the `urn:a2abus:ext:approval:1` entry (written by the supervisor), and in every `PermissionRequest` the driver emits. The card field shape is for RFC-0003 and RFC-0006 to confirm (Section 9).
 - [0009-067] If the agent switches into a dangerous mode during a session (ACP `switch_mode` tool kind, or any mode notification into the dangerous set), the driver MUST refuse the switch, cancel the turn (Section 4.5.6), and emit `Fault` of kind `config-refused`.
+- [0009-083] The driver MUST refuse to start an omp agent (`Fault` `config-refused`) unless the operator config sets `omp_allow_path_verified` true. The operator sets it only after the omp allow-path case of RFC-0006 0006-029 has passed on the omp version in use and the result is recorded in the lab record. The default is false. Until then the omp card carries no `approvalMode`. This keeps an omp card from claiming an approval gate whose allow path is unobserved.
 
 Worked example (card extension entry, shape proposed):
 
@@ -340,10 +371,12 @@ Worked example (card extension entry, shape proposed):
 
 ### 4.10 Environment and credentials
 
-- [0009-068] The child environment MUST be built from a fixed allowlist of non-secret names: at least `PATH`, `SYSTEMROOT`, `USERPROFILE`, `HOME`, `TEMP`, `TMP`, `LANG`, and `PI_NO_TITLE` for omp. The operator config MAY add non-secret names. Nothing else from the worker environment is inherited.
-- [0009-069] The driver MUST NOT read, copy, log, or forward any provider credential value (keys, tokens, OAuth material). Provider credentials stay in each agent's own configuration (T5, M1-10). The driver MUST NOT set provider key variables for the child, including `ANTHROPIC_API_KEY`.
+- [0009-068] The child environment MUST be built from a fixed allowlist of non-secret names: at least `PATH`, `SYSTEMROOT`, `USERPROFILE`, `HOME`, `TEMP`, `TMP`, `LANG`, and `PI_NO_TITLE` for omp. The supervisor MAY add `CLAUDE_CONFIG_DIR` (0009-084). The operator config MAY add non-secret names. Nothing else from the worker environment is inherited (RFC-0012 [0012-062]).
+- [0009-069] The driver MUST NOT read, copy, log, or forward any provider credential value (keys, tokens, OAuth material). Provider credentials stay in each agent's own configuration (T5, M1-10). The supervisor MUST strip provider key variables, including `ANTHROPIC_API_KEY`, from the child environment unless the operator config names that variable or configures the child to inherit the environment untouched (RFC-0012 [0012-062]). The driver itself MUST NOT set provider key variables.
 - [0009-070] Credential-shaped values MUST NOT appear in `Backend` events, `Fault` details, logs, or envelopes. Detail strings MUST pass redaction (R-S5, RFC-0013 owns the rules).
 - [0009-071] The driver MUST NOT pass peer bearer tokens or operator tokens to an ACP agent. Peer tokens for `driver-a2a-http` come from operator config and are sent only in the `Authorization` header to the configured peer.
+- [0009-084] For `claude-agent-acp`, the supervisor MUST set `CLAUDE_CONFIG_DIR` to a directory it owns and write `settings.json` there as RFC-0012 [0012-063] requires, with `permissions.defaultMode` set to the canonical mode (`default` in M1). The driver MUST NOT rely on the `_meta.claudeCode.options.settings` override, which the adapter ignored for `defaultMode` in v0.97.0 (observed-with-stub). The supervisor MUST NOT write `acceptEdits`, `bypassPermissions`, `dontAsk`, or `auto` (0009-063).
+- [0009-085] The first `_auth/status_update` after `initialize` is non-authoritative. Its reported auth kind can change with inherited provider keys (observed-with-stub: `api_key` with an inherited `ANTHROPIC_API_KEY`, `none` with the key stripped, while `claude auth status --json` reported logged in; Section 9 issue 18). The driver and the worker MUST NOT use it for any decision, and MUST NOT read or log credentials to resolve the discrepancy.
 
 ### 4.11 Failure outcomes
 
@@ -355,7 +388,7 @@ The driver produces the reason tokens below. Reason tokens are carried in the `a
 | `BACKEND_UNAVAILABLE` | `driver-acp` | Agent process could not be spawned, or `initialize` failed. |
 | `BACKEND_ERROR` | both | JSON-RPC error on prompt or peer call; unknown stop reason; reply context mismatch; peer `AUTH_REQUIRED`; peer auth failure. |
 | `BACKEND_TIMEOUT` | both | Turn idle timeout; peer reply-timeout marker; client timeout. |
-| `BACKEND_LOST_TASK` | `driver-a2a-http` | `-32001` on `GetTask` or `SubscribeToTask`. |
+| `BACKEND_LOST_TASK` | `driver-a2a-http` | `-32001` on `GetTask` or `SubscribeToTask`; Hermes `-32002` on the same calls (0009-079). |
 | `AGENT_LIMIT` | `driver-acp` | `stopReason` `max_tokens` or `max_turn_requests`. |
 | `AGENT_REFUSED` | both | `stopReason` `refusal`; peer `REJECTED`. |
 | `RATE_LIMITED` | `driver-a2a-http` | Peer HTTP 429 or `-32051`. |
@@ -365,7 +398,7 @@ The driver produces the reason tokens below. Reason tokens are carried in the `a
 ### 4.12 Contract suite and mock backend
 
 - [0009-073] The `Backend` contract suite MUST live in `a2a-conformance` and MUST run against any `Backend` implementation. It drives a deterministic scripted mock backend, and runs the same cases against each real driver where the case applies.
-- [0009-074] The mock MUST be able to inject: a crash mid-turn; duplicate events; a delayed permission request; a cancel race; a restart with load; an unsupported `protocolVersion`; unknown `sessionUpdate` kinds and unknown enum strings (which MUST be ignored); stdout end-of-file; a JSON-RPC error on prompt; and a peer returning `REJECTED` or `FAILED`.
+- [0009-074] The mock MUST be able to inject: a crash mid-turn; duplicate events; a delayed permission request; a cancel race; a restart with load; an unsupported `protocolVersion`; unknown `sessionUpdate` kinds and unknown enum strings (which MUST be ignored); stdout end-of-file; a JSON-RPC error on prompt; a peer returning `REJECTED` or `FAILED`; a form `elicitation/create` with a matching tool call; an `ACP session not found` answer to load or resume; and a task id from another origin.
 - [0009-075] For every case, the suite MUST assert: `event_no` is strictly increasing per turn; exactly one `Terminal` per turn; no event after `Terminal`; `Cancel` produces `Canceled` within `cancel_grace`; and the reason token is in Section 4.11.
 
 ## 5. Interoperability
@@ -375,24 +408,24 @@ What each peer sees from this design.
 | Peer | Sees | Lost or changed | How the design avoids breaking it |
 |---|---|---|---|
 | Stock A2A v1.0 client | Nothing of the drivers. It talks to the gateway (RFC-0008) and sees standard A2A states and artifacts. | Tool-call detail is status metadata only. | Drivers never emit A2A-invalid shapes. Extension data lives only under extension URIs (RFC-0001). |
-| Hermes (as A2A peer) | `driver-a2a-http` is a standard A2A HTTP client: `SendMessage`, `A2A-Version: 1.0`, `ROLE_USER` text parts, a stable `contextId`, and `GetTask` or `SubscribeToTask` on reattach. | No `A2A-Extensions` header, no bus metadata, no budget or provenance sent. | Matches the body and headers recorded in `docs/interop/hermes.md` section 8.3. Peer-side budgets are enforced locally (L9). Anti-loop cap is respected by reusing `messageId` on resend (0009-045). |
+| Hermes (as A2A peer) | `driver-a2a-http` is a standard A2A HTTP client: `SendMessage`, `A2A-Version: 1.0`, `ROLE_USER` text parts, a contextId namespaced per bus origin (0009-076), and `GetTask` or `SubscribeToTask` only for tasks it created (0009-077). | No `A2A-Extensions` header, no bus metadata, no budget or provenance sent. Peer sees a derived contextId, not the bus context id. | Matches the body and headers recorded in `docs/interop/hermes.md` section 8.3. Peer-side budgets are enforced locally (L9). Anti-loop cap is respected by reusing `messageId` on resend (0009-045). Peer error shapes are tolerated (0009-079). |
 | Hermes (as A2A server, reached through gateway) | Not applicable. The driver is the client. | Not applicable. | See RFC-0008 for the server-side profile. |
-| omp (ACP agent) | An ACP client on protocol version 1 with no fs, terminal, or elicitation capability, `cwd` set to the workspace, and `mcpServers` from RFC-0007 only. | omp's own file and shell tools run without client mediation. The approval gate covers only `session/request_permission`. | Explicit `--approval-mode` (0009-039). Refuse-start for dangerous modes (0009-064). Cancel path ends every turn (0009-035). |
-| claude-agent-acp (ACP agent) | The same ACP client profile as omp. | Same as omp. Background subagents keep running after `session/cancel` in the notes (`docs/interop/acp-omp-claude.md`); the driver cannot stop them through ACP. | The worker's turn deadline and the supervisor's process-tree kill (0009-036, 0009-060) bound them. Open issue in Section 9. |
+| omp (ACP agent) | An ACP client on protocol version 1 that declares `elicitation.form` and no fs, terminal, or auth terminal capability; `cwd` set to the workspace; `mcpServers` from RFC-0007 only, after a probe call (0009-017). | omp's own file and shell tools run without client mediation. Write and exec approvals arrive as form elicitation; bash `prompt` policies use `session/request_permission` (`[UNOBSERVED]`). | Explicit `--approval-mode ask-exec` (0009-039). omp refused until the allow path is recorded (0009-083). Refuse-start for dangerous modes (0009-064). Cancel path ends every turn (0009-035). |
+| claude-agent-acp (ACP agent) | The same ACP client profile as omp, with `session/request_permission` for approvals. Default mode is set in the supervisor-owned settings file (0009-084). | Same as omp for file and shell tools. Background subagents keep running after `session/cancel` in the notes (`docs/interop/acp-omp-claude.md`); the driver cannot stop them through ACP. | The worker's turn deadline and the supervisor's process-tree kill (0009-036, 0009-060) bound them. Open issue in Section 9. |
 
-Notes on what each ACP agent may do with an unknown client method: it may fail its own operation (0009-019). That is the expected result of declaring no client capabilities and is recorded in the trade-offs.
+Notes on what each ACP agent may do with an unknown client method: it may fail its own operation (0009-019). That is the expected result of declaring no fs or terminal capability and is recorded in the trade-offs. `elicitation/create` in form mode is answered under 0009-082, not refused.
 
 ## 6. Security considerations
 
 | Threat (`docs/requirements.md` section 8) | Addressed by |
 |---|---|
-| T1 prompt injection through agent or peer output | Untrusted-content marking (0009-031). No text rewriting beyond redaction. Thought chunks off by default (0009-026). Peer text never parsed for control state (0009-048). |
+| T1 prompt injection through agent or peer output | Untrusted-content marking (0009-031). No text rewriting beyond redaction. Thought chunks off by default (0009-026). Peer text never parsed for control state (0009-048). Elicitation text is untrusted and never an approval summary (0009-082). Hermes card text sanitized before publication (0009-081). |
 | T3 cost runaway | Turn and wall-time counters from the driver (0009-055). Caps are enforced by the worker (RFC-0006). Token caps only where tokens are metered (0009-057, 0009-058). |
-| T5 credential leakage | Fixed environment allowlist (0009-068). No provider keys read or forwarded (0009-069). Redaction of events and errors (0009-070). Bearer tokens refused over cleartext (0009-052). |
-| T14 driver as confused deputy | One driver per agent (0009-003). No shared state (0009-004). Child runs as the same OS user, with no widened privileges (0009-037). A driver answers permissions only from `ResolvePermission` or its own timeout (0009-033). |
-| T15 approval bypass through agent-native modes | Allowed and dangerous mode lists (0009-063). Refuse-start (0009-064). Mode from operator config only (0009-065). Mid-session switch into a dangerous mode refused (0009-067). Explicit `--approval-mode` (0009-039). Recorded mode on the card and in every permission event (0009-066). |
+| T5 credential leakage | Fixed environment allowlist (0009-068). Supervisor strips provider key variables unless the operator allows them (0009-069). Driver never reads key values. Redaction of events and errors (0009-070). Bearer tokens refused over cleartext (0009-052). First auth status is non-authoritative (0009-085). |
+| T14 driver as confused deputy | One driver per agent (0009-003). No shared state (0009-004). Child runs as the same OS user, with no widened privileges (0009-037). A driver answers permissions and elicitations only from `ResolvePermission` or its own timeout (0009-033, 0009-082). |
+| T15 approval bypass through agent-native modes | Allowed and dangerous mode lists (0009-063). Refuse-start (0009-064). Mode from operator config only (0009-065). Mid-session switch into a dangerous mode refused (0009-067). Explicit `--approval-mode` (0009-039). omp refused until the allow path is recorded (0009-083). Claude default mode set in the supervisor-owned settings file (0009-084). Recorded mode on the card and in every permission event (0009-066). |
 | M1-1 no orphan processes | Shutdown on worker exit (0009-060). Job object or process group (0009-059). |
-| M1-6 permission flow, default deny | Exactly-once answer, default cancelled on timeout (0009-033). No default `allow_always` (0009-034). |
+| M1-6 permission flow, default deny | Exactly-once answer, default cancelled on timeout (0009-033). No default `allow_always` (0009-034). Form elicitation answered from the same path (0009-082). |
 | M1-8 cancel ends the turn | Cancel path and grace bound (0009-035, 0009-036). |
 | M1-9 crash yields FAILED within a bounded time | Terminal at detection (0009-023). In-flight turns not replayed (0009-014). |
 | M1-10 provider keys stay in each agent's config | Section 4.10 as a whole. |
@@ -402,8 +435,10 @@ Attack classes, described without payloads:
 - An agent could try to switch its own mode to a dangerous one mid-session. Refused and cancelled (0009-067).
 - An agent could call a client method it was never offered, hoping the driver performs a file or shell operation. The driver refuses (0009-019).
 - A peer could return a reply whose context identifier differs from the one sent, to inject into another conversation. Rejected (0009-046).
+- An agent could send an elicitation whose text misstates the tool it asks about. The driver forwards no elicitation text as an approval summary; the worker takes the summary from the matching tool call (0009-082, RFC-0006 0006-052).
+- A peer could read or cancel another origin's task through a shared Hermes context. Rejected by 0009-076 and 0009-077.
 
-Trade-off recorded deliberately: declaring no client capabilities (0009-018) means agents use their own tools. The gate covers only permission requests the agent raises. This is a weaker gate than mediating file and terminal calls, and it is accepted for M1 because mediated calls would require a much larger client surface. The conformance suite must test that unadvertised methods are refused (Section 8).
+Trade-off recorded deliberately: declaring no fs or terminal capability (0009-018) means agents use their own file and shell tools. The gate covers the permission requests an agent raises through `session/request_permission` and form elicitations (0009-082). This is a weaker gate than mediating file and terminal calls, and it is accepted for M1 because mediated calls would require a much larger client surface. The conformance suite must test that unadvertised methods are refused (Section 8).
 
 ## 7. Rationale and alternatives considered
 
@@ -415,6 +450,8 @@ Trade-off recorded deliberately: declaring no client capabilities (0009-018) mea
 - **Usage counters from the driver, caps from the worker.** The driver reports what it can measure. Enforcement sits in one place (RFC-0006), so a driver bug cannot widen a budget.
 - **Headless claude as a fallback driver was rejected for M1.** Its stop behavior on Windows is unverified (`docs/interop/acp-omp-claude.md`), and it adds a second claude path with its own permissions. See Section 9.
 - **Token estimation was rejected.** An estimate would look like a meter and would be wrong. D13 requires metering from agent usage events.
+- **Form elicitation for omp approvals.** omp sends generic write and exec approvals only as form elicitation when the client advertises `elicitation.form` (`docs/spikes/omp-acp.md` Q4). Declaring it is the only route to an approval gate on omp short of `yolo`, which removes the gate and is refused (0009-063).
+- **Namespacing and visibility in the bridge.** Hermes shares model history by contextId and returns other origins' tasks (`docs/spikes/hermes-a2a.md` Q6). Relying on Hermes isolation would fail, so the bridge enforces it (0009-076, 0009-077).
 
 ## 8. Conformance
 
@@ -434,13 +471,13 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-010 | `ResolvePermission` with an unknown id; no event emitted. | contract |
 | 0009-011 | `Capabilities` returns all six fields for each driver. | contract |
 | 0009-012 | Two `Start` calls on one `context_id` reuse one session; `SessionBound` persisted. | contract |
-| 0009-013 | Restore order: stub agent with `loadSession` true uses `session/load`; with only `resume` uses `session/resume`; with neither, a notice is emitted. | contract |
+| 0009-013 | Restore order: `loadSession` true uses `session/load`; only `resume` uses `session/resume`; neither gives a new session with a notice. `ACP session not found` on load or resume gives a new session with a notice and no restored-context claim. | contract |
 | 0009-014 | Crash mid-turn after restart; the in-flight turn is `Failed` `BACKEND_CRASHED`, not replayed. | driver |
 | 0009-015 | Frame parser test with split and joined messages on stdio. | contract |
 | 0009-016 | Stub agent answers `protocolVersion` 2; driver closes and emits `Fault`. | contract |
-| 0009-017 | `session/new` request has absolute `cwd` and array `mcpServers`. | contract |
-| 0009-018 | `initialize` request fields match exactly; no elicitation capability. | contract |
-| 0009-019 | Stub agent calls `fs/read_text_file` and an elicitation method; driver replies with an error and performs no operation. | contract |
+| 0009-017 | `session/new` request has absolute `cwd` and array `mcpServers`; a configured MCP entry is used only after a probe call confirms its tools. | contract |
+| 0009-018 | `initialize` request has `fs` false, `terminal` false, `auth.terminal` false, and `elicitation.form` present; no `elicitation.url`. | contract |
+| 0009-019 | Stub agent calls `fs/read_text_file` and an undeclared `terminal/create`; driver replies with an error and performs no operation. `elicitation/create` is covered by 0009-082. | contract |
 | 0009-020 | Second `Start` while a prompt is open is rejected by the driver. | contract |
 | 0009-021 | Each `stopReason` in the table maps to the listed outcome; an unknown string maps to `BACKEND_ERROR`. | contract |
 | 0009-022 | JSON-RPC error on prompt maps to `BACKEND_ERROR`; detail is redacted. | contract |
@@ -453,18 +490,18 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-029 | Usage and notice updates map to `Usage` and `Status` `Notice`. | contract |
 | 0009-030 | Unknown `sessionUpdate` kinds and unknown enum strings are dropped and counted; turn completes. | contract |
 | 0009-031 | Agent text containing control-like content is passed unchanged except redaction; events carry agent-originated marking. | contract |
-| 0009-032 | Permission request maps to `PermissionRequest` with unique `request_id` and redacted tool summary. | contract |
+| 0009-032 | Permission request maps to `PermissionRequest` with a unique `request_id`, a redacted tool summary, and options with the agent's ids and kinds; Claude ids `allow-once`, `allow-with-updates`, `reject` are passed as received. | contract |
 | 0009-033 | Permission with no resolution is answered `cancelled` at `permission_timeout`; an option not offered is answered `cancelled`. | contract |
 | 0009-034 | No `allow_always` chosen without a `ResolvePermission` that names it. | contract |
-| 0009-035 | Cancel with an open permission and open tool call; `cancelled` answer sent, failed tool status emitted, `session/cancel` sent. | contract |
+| 0009-035 | Cancel with an open permission, an open form elicitation, and an open tool call; `cancelled` and `cancel` answers sent, failed tool status emitted, `session/cancel` sent. | contract |
 | 0009-036 | Agent ignores cancel; driver kills tree after `cancel_grace` and emits `Canceled`. | contract |
 | 0009-037 | Launch spec with a shell string is rejected at config load. | contract |
 | 0009-038 | Windows launch uses `node` with an absolute entry path; no `cmd /c`. | driver |
-| 0009-039 | Launch argv includes explicit `--approval-mode` and `--cwd`. | contract |
+| 0009-039 | Launch argv for omp includes `--mode acp`, `--cwd`, `--session-dir`, and `--approval-mode ask-exec`. | contract |
 | 0009-040 | Hermes request carries `A2A-Version: 1.0`; no `A2A-Extensions` or `urn:a2abus:` metadata appears on the wire. | contract |
 | 0009-041 | Card fetch with 404 on the primary path falls back to `agent.json`; card failure does not abort the turn. | contract |
-| 0009-042 | Tenant from card is echoed in `params.tenant`. | contract |
-| 0009-043 | Default request is `SendMessage`; streaming used only when the card advertises it; `contextId` unchanged. | driver |
+| 0009-042 | Configured tenant is sent in `params.tenant`; a mismatched echo is not treated as isolation (0009-080). | contract |
+| 0009-043 | Default request is `SendMessage`; streaming used only when the card advertises it; `contextId` is the namespaced id (0009-076). | driver |
 | 0009-044 | Outbound text with credential-shaped content is redacted before send. | contract |
 | 0009-045 | Simulated connection drop before response; resend reuses `messageId`. | contract |
 | 0009-046 | Reply with a different `contextId` yields `Fault` and `BACKEND_ERROR`; reply text order follows the rule. | contract |
@@ -477,38 +514,49 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-053 | Default client timeout is 330 seconds; timeout sends `CancelTask` and emits `BACKEND_TIMEOUT`. | contract |
 | 0009-054 | `Usage` events carry `source`; sums are over counters only. | contract |
 | 0009-055 | Every turn produces `turns` and `wall_ms` with source `driver-counted`. | contract |
-| 0009-056 | `usage_update` values are gauges; `cost` maps to the counter; no summation. | contract |
+| 0009-056 | `usage_update` `used` and `size` are gauges; `cost` is a cumulative sample and is never summed by the driver. | contract |
 | 0009-057 | Turn with no usage source produces no token fields; no estimate present. | contract |
 | 0009-058 | With `require_token_metering` true and no `acp-usage` sample, the worker stops the agent and reports a configuration failure. | integration |
 | 0009-059 | Stop on supervisor: job object or process group contains the whole tree. | integration |
 | 0009-060 | Kill the worker process; no agent process remains after `shutdown_grace`. | integration |
 | 0009-061 | Repeated crash injection; delays are 1, 2, 4, then capped at 60 seconds; the fifth crash in 10 minutes enters Unhealthy. | contract |
 | 0009-062 | After restart, the driver sends no prior-turn input. | contract |
-| 0009-063 | Mode canonicalization: `bypass` resolves to `bypassPermissions`; each listed mode is classified as allowed or dangerous. | contract |
-| 0009-064 | Start with a dangerous mode and no acknowledgement is refused with `config-refused`. | contract |
+| 0009-063 | Mode canonicalization: `bypass` resolves to `bypassPermissions`; each listed mode is classified as allowed or dangerous; a mode in neither list, including omp `always-ask`, is refused. | contract |
+| 0009-064 | Start with a dangerous mode and no acknowledgement is refused with `config-refused`; omp Start with `ask-exec` is refused until 0009-083 holds. | contract |
 | 0009-065 | Mode supplied by an agent card or task content is ignored. | contract |
 | 0009-066 | Card approval entry carries `approvalMode`; each permission event carries the same mode. | integration |
 | 0009-067 | Stub agent issues a `switch_mode` into a dangerous mode; switch refused, turn cancelled, `config-refused` fault. | contract |
-| 0009-068 | Child environment contains only allowlisted names; a planted non-allowlisted name is absent. | contract |
-| 0009-069 | Child environment contains no provider key variables; driver never reads key values. | contract |
+| 0009-068 | Child environment contains only allowlisted names and the supervisor-set `CLAUDE_CONFIG_DIR`; a planted non-allowlisted name is absent. | contract |
+| 0009-069 | Provider key variables, including `ANTHROPIC_API_KEY`, are absent from the child environment unless the operator config names them or configures inheritance; the driver never reads key values. | contract |
 | 0009-070 | Events, faults and logs scanned for credential-shaped values; none found. | contract |
 | 0009-071 | Peer bearer token absent from every ACP child environment and every ACP message. | contract |
 | 0009-072 | Each failure path produces a token from Section 4.11; no token outside the table; `health_class` values absent from bus metadata. | contract |
 | 0009-073 | Contract suite runs against the mock and each real driver; results recorded. | contract |
-| 0009-074 | Each listed fault injection is exercised in the mock and produces the asserted outcome. | contract |
+| 0009-074 | Each listed fault injection is exercised in the mock and produces the asserted outcome. The list also includes a form elicitation (0009-082), an `ACP session not found` answer to load or resume (0009-013), and a task id from another origin (0009-077). | contract |
 | 0009-075 | Suite assertions (event order, one terminal, cancel bound, reason tokens) run on every case. | contract |
+| 0009-076 | Two bus origins start a turn on the same bus `context_id`; the peer sees different `contextId` values and no shared history. | driver |
+| 0009-077 | A task id from origin A sent with `GetTask`, `CancelTask`, or `SubscribeToTask` for origin B is not forwarded; `ListTasks` is never sent. | contract |
+| 0009-078 | A follow-up to an `INPUT_REQUIRED` task reuses the namespaced `contextId`; `message.taskId` alone never continues it; the marker-stripped reply maps by state enum only. | contract |
+| 0009-079 | Hermes `-32002` on `GetTask` or `SubscribeToTask` maps to `BACKEND_LOST_TASK`; `-32602` maps to `BACKEND_ERROR`; a peer error with no `error.data` is handled. | contract |
+| 0009-080 | A mismatched `params.tenant` echo is not treated as isolation; the driver sends only the configured tenant. | contract |
+| 0009-081 | An ingested Hermes card with card-level `security` and tool-name tags yields a bus card with no `security` and one coarse skill; the gateway HTTP view is unchanged (RFC-0008). | contract |
+| 0009-082 | Stub agent sends a form `elicitation/create` with a matching `tool_call`; `allow-once` answers `accept` with content per RFC-0006 0006-053, `reject-once` answers `decline`, cancel answers `cancel`; a non-form mode is declined with no event. | contract |
+| 0009-083 | omp `Start` with `omp_allow_path_verified` unset is refused with `config-refused`; the omp card carries no `approvalMode`. | contract |
+| 0009-084 | Claude launch sets `CLAUDE_CONFIG_DIR`; the settings file contains `permissions.defaultMode` `default`; the `_meta` override is not relied on. | driver |
+| 0009-085 | An initialize-time `_auth/status_update` that disagrees with later state changes no driver or worker decision. | contract |
+| 0009-086 | Claude prompt usage is counted once per turn; a cancelled turn reports zero; `cost` samples are cumulative and the worker charges high-water differences (RFC-0006 0006-037). | contract |
 
 ## 9. Open issues
 
 Each issue has a default. The default applies until a lab run or a revision changes it.
 
-1. **omp elicitation fallback.** Whether omp falls back to `session/request_permission` when no elicitation form is supported is `[UNVERIFIED]`. Default: the driver never advertises elicitation and answers elicitation requests with a JSON-RPC error (0009-019). Fail closed.
-2. **`session/resume` on claude v1.** The notes mark claude v1 resume support `[UNVERIFIED]`. Default: `session/load` first, then `session/resume`, then a new session with a notice (0009-013).
-3. **omp `--no-ui` in ACP.** The behavior under ACP is `[UNVERIFIED]`. Default: the driver does not pass `--no-ui`; the gate relies on `always-ask` (0009-039).
-4. **ACP error code for an unadvertised method.** The expected code is `[UNVERIFIED]`. Default: -32601 (0009-019). A lab run decides whether any agent needs another code.
-5. **claude-agent-acp bin name and Windows install.** The bin name `claude-agent-acp` is verified against the published package v0.97.0. The Windows install path is `[UNVERIFIED]`. Default: resolve `dist/index.js` from the installed package root, and run `node` on that absolute path (0009-038).
-6. **claude usage sub-fields.** Which `usage_update` fields claude sends is `[UNVERIFIED]`. Default: map `used`, `size`, and `cost` if present, and nothing else (0009-056).
-7. **Windows signal semantics for claude stop.** Headless claude is not in M1. Default: no headless driver. If one is added, stop is close stdin then kill the job object (0009-060).
+1. **omp approvals.** Resolved for the stub tier: omp sends write and exec approvals as form elicitation when the client advertises `elicitation.form` (observed-with-stub, `docs/spikes/omp-acp.md` Q4), and denies outright without it. Still `[UNVERIFIED]`: a successful allow through elicitation and the accepted content shape (RFC-0006 issue 10); bash `prompt` policies through `session/request_permission`. Default: the driver advertises `elicitation.form` (0009-018), maps form elicitation to `PermissionRequest` (0009-082), and refuses to start omp until the allow path is recorded (0009-083).
+2. **Session restore on claude and omp.** Stub tier: claude `session/load` and `session/resume` both restore after restart, and an unknown id returns `-32002` (`docs/spikes/claude-acp.md` Q7). omp `session/load` and `session/resume` return `ACP session not found` after a completed turn in a new process (`docs/spikes/omp-acp.md` Q7; cause `[UNVERIFIED]`). Live resume is `[UNOBSERVED]` for both. Default: `session/load`, then `session/resume`, then a new session with a notice; `not found` always means a new session (0009-013).
+3. **omp `--no-ui` in ACP.** The behavior under ACP is `[UNVERIFIED]`. Default: the driver does not pass `--no-ui`; the gate relies on `--approval-mode ask-exec` and form elicitation (0009-039, 0009-082).
+4. **ACP error code for an unadvertised method.** omp's own error code is `[UNVERIFIED]`; the -32601 seen in the omp spike was the probe's answer, not omp's. Default: -32601 (0009-019). A lab run decides whether any agent needs another code.
+5. **claude-agent-acp bin name and Windows install.** The bin name `claude-agent-acp` is verified against the published package v0.97.0. Launch as `node <absolute entry>` on Windows is observed with the stub (`docs/spikes/claude-acp.md`). The Windows install path is `[UNVERIFIED]`. Default: resolve `dist/index.js` from the installed package root, and run `node` on that absolute path (0009-038).
+6. **claude usage sub-fields.** Stub tier (`docs/spikes/claude-acp.md` Q5): the prompt result `usage` has `inputTokens`, `outputTokens`, and `totalTokens`; `usage_update` has `used`, `size`, and `cost` (later updates only). Real values are `[UNOBSERVED]`. Default: map these fields as 0009-056 and 0009-086, and nothing else.
+7. **Windows stop semantics.** Observed on Windows with claude-agent-acp and omp (`docs/spikes/claude-acp.md`, `docs/spikes/omp-acp.md` Q8): closing stdin exits 0 within 0.02 to 0.1 s with no surviving child; `Popen.terminate`, `kill`, and `taskkill /T /F` exit 1; CTRL_BREAK exits 3221225786; no child survived 3 s in any variant. The mechanism is `[UNOBSERVED]`. Headless claude is not in M1. Default: close stdin, then kill the process tree (0009-060).
 8. **Hermes `INPUT_REQUIRED` detection.** Resolved: the Hermes client reads the TaskState enum (`protocol.py` `STATE_INPUT_REQUIRED`; `tools.py`; hermes.md section 8.5). Default: rely on the state enum only (0009-048).
 9. **Hermes intermediate statuses.** Whether Hermes streams progress beyond the documented frames is `[UNVERIFIED]`. Default: rely on SSE status frames when streaming is enabled, else none (0009-043).
 10. **Turn idle timeout and permission timeout values.** The defaults of 600 and 300 seconds are proposals, not measured. Default: keep them, and make them operator config (0009-024, 0009-033).
@@ -519,6 +567,11 @@ Each issue has a default. The default applies until a lab run or a revision chan
 15. **Background agent subagents after cancel.** claude background children keep running after `session/cancel` (`docs/interop/acp-omp-claude.md`). Default: the process-tree kill (0009-036) bounds them, and the supervisor reports leftover processes in the audit trail (RFC-0013).
 16. **Retry policy for peer rate limits.** Default: no automatic retry; the worker decides under RFC-0006 (0009-051).
 17. **Backend error tokens in RFC-0005.** Resolved: `BACKEND_ERROR`, `BACKEND_TIMEOUT`, `BACKEND_LOST_TASK` and `BACKEND_UNAVAILABLE` are registered in RFC-0005 section 4.9 as FAILED. Section 4.11 matches the registry.
+18. **Claude auth status discrepancy.** With an inherited `ANTHROPIC_API_KEY`, the first `_auth/status_update` reported kind `api_key`; with the key stripped it reported `none`, while `claude auth status --json` reported logged in (real, `docs/spikes/claude-acp.md` Q3). The cause is `[UNVERIFIED]`. Default: the first `_auth/status_update` is non-authoritative and no decision uses it (0009-085).
+19. **Claude config directory and login state.** Whether a supervisor-owned `CLAUDE_CONFIG_DIR` (0009-084) still finds the operator's existing Claude login is `[UNOBSERVED]`. Default: the operator config names the directory; if login is lost, the operator points `CLAUDE_CONFIG_DIR` at the existing login directory. The driver never copies credentials (0009-069).
+20. **Hermes cross-peer state.** Shared contextId history and cross-peer task visibility were observed on Hermes v0.22.5 (stub, `docs/spikes/hermes-a2a.md` Q6). Default: bridge namespacing and visibility rules (0009-076, 0009-077). Re-run Hermes Q6 after any Hermes upgrade.
+21. **Hermes error shapes not observed.** The HTTP 413 body (request above 1 MiB, where the client saw WinError 10053), the JSON-RPC body code for HTTP 429, HTTP 403, and `WWW-Authenticate` are `[UNOBSERVED]`. Default: map by HTTP status and JSON-RPC code under 0009-051 and 0009-079; any unlisted case is `BACKEND_ERROR`.
+22. **Hermes SSE keepalive and cancel of non-terminal tasks.** Keepalive over long turns and cancel of a non-terminal task are `[UNOBSERVED]` (the Hermes spike streamed for 0.21 s only). Default: reattach and poll per 0009-049; cancel is best effort (0009-053).
 
 ## Appendix A. Rust trait sketch (non-normative)
 
