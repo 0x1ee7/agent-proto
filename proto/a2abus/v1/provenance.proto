@@ -1,0 +1,61 @@
+// Owner: RFC-0007 (identity, signing and trust; provenance and untrusted content).
+// Extension URI: urn:a2abus:ext:provenance:1
+// Attached to Message and Artifact metadata. Text parts are never rewritten
+// to carry provenance; this message is the only carrier. See RFC-0007 [0007-120].
+syntax = "proto3";
+
+package a2abus.v1;
+
+// Origin class of content. Anything other than OPERATOR is untrusted input
+// for model-facing components (RFC-0007 [0007-124]).
+enum TrustClass {
+  TRUST_CLASS_UNSPECIFIED = 0;
+  // Signed by an operator key (approval decision, root grant).
+  TRUST_CLASS_OPERATOR = 1;
+  // Produced by an agent on this host, broker-authenticated.
+  TRUST_CLASS_LOCAL_AGENT = 2;
+  // Produced by a peer that reached this host through a gateway.
+  TRUST_CLASS_REMOTE_PEER = 3;
+  // Arrived on HTTP ingress without a verified peer identity.
+  TRUST_CLASS_EXTERNAL_HTTP = 4;
+  // Returned by a tool or MCP server.
+  TRUST_CLASS_TOOL_OUTPUT = 5;
+  // Artifact produced by an agent, relayed to another agent.
+  TRUST_CLASS_ARTIFACT = 6;
+}
+
+enum ReceivedVia {
+  RECEIVED_VIA_UNSPECIFIED = 0;
+  // Published on the bus by the origin agent's driver.
+  RECEIVED_VIA_BUS = 1;
+  // Entered through the HTTP gateway (RFC-0008).
+  RECEIVED_VIA_GATEWAY = 2;
+}
+
+// One forwarding or production step. Appended by each agent that relays
+// content; existing entries are never removed or edited.
+message HopRecord {
+  // Agent id of the hop.
+  string agent = 1;
+  // Allowlist kid used to sign the hop, empty if the hop was unsigned (M1).
+  string kid = 2;
+  // Issuer timestamp, RFC 3339 UTC, millisecond precision.
+  string ts = 3;
+  // Task the hop belongs to.
+  string task_id = 4;
+}
+
+// Metadata value under urn:a2abus:ext:provenance:1.
+message Provenance {
+  // Agent id that first produced the content (or the gateway-mapped peer id).
+  string origin_agent = 1;
+  // Kid of the origin signature, empty if unsigned.
+  string origin_kid = 2;
+  TrustClass trust_class = 3;
+  ReceivedVia received_via = 4;
+  // "sha-256:" + base64url (no padding) over the JCS bytes of the message
+  // `parts` array as received, before any model-facing framing.
+  string content_digest = 5;
+  // Oldest first. Verifiers reject more than 8 hops (RFC-0007 [0007-122]).
+  repeated HopRecord hops = 6;
+}

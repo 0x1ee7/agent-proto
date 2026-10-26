@@ -1,0 +1,88 @@
+// Owner: RFC-0007 (identity, signing and trust; delegation extension).
+// Extension URI: urn:a2abus:ext:delegation:1
+// Signing: the canonical form is RFC 8785 (JCS) of the received proto3 JSON
+// object with the `signature` field removed. See RFC-0007 [0007-090].
+syntax = "proto3";
+
+package a2abus.v1;
+
+import "google/protobuf/struct.proto";
+
+// Mode for an MCP resource. Applies only to scope entries whose resource
+// starts with "mcp:".
+enum McpMode {
+  MCP_MODE_UNSPECIFIED = 0;
+  // Recipient reaches the MCP server only through a proxy run by the
+  // delegator's supervisor. Default. Cross-host use is denied in M1 in
+  // both modes ([0007-119]); PROXY is the only mode that may be allowed
+  // cross-host in a later profile.
+  MCP_MODE_PROXY = 1;
+  // Recipient receives a direct, scope-limited, expiring upstream credential.
+  // Allowed only when the recipient's allowlist entry sets mcp_direct = true.
+  MCP_MODE_DIRECT = 2;
+}
+
+// One permitted resource and the actions allowed on it.
+message ScopeEntry {
+  // "<kind>:<name>", e.g. "mcp:docs", "skill:summarize", "workspace:task".
+  string resource = 1;
+  // Actions, e.g. "tools/call", "read", "write", "exec".
+  repeated string actions = 2;
+  // Narrowing constraints, e.g. {"tools": ["search"]}. Child tokens MUST NOT
+  // widen any constraint of the parent.
+  google.protobuf.Struct constraints = 3;
+  // Meaningful only for "mcp:" resources.
+  McpMode mcp_mode = 4;
+}
+
+// Signed, task-bound, attenuated grant. Contains no secrets: no provider
+// keys, no bus credentials, no upstream MCP credentials.
+message CapabilityToken {
+  // UUIDv7, lowercase canonical string form.
+  string token_id = 1;
+  // Agent id of the issuer, or "operator" for root grants signed by the
+  // operator key.
+  string issuer = 2;
+  // Allowlist kid of the key that produced `signature`.
+  string issuer_kid = 3;
+  // Agent id allowed to redeem the token.
+  string audience = 4;
+  // Task the grant is bound to. A token MUST NOT be used on another task.
+  string task_id = 5;
+  // Context the task belongs to.
+  string context_id = 6;
+  // Permitted scope. Must be a subset of the parent's scope when depth > 0.
+  repeated ScopeEntry scope = 7;
+  // RFC 3339 UTC, issuer clock, millisecond precision.
+  string issued_at = 8;
+  // Validity in milliseconds from issued_at. Relative: no clock sync needed
+  // to evaluate it beyond the skew rule in RFC-0007.
+  uint64 ttl_ms = 9;
+  // Redemptions allowed. Senders MUST set 1 or more; default use is 1.
+  uint32 max_uses = 10;
+  // Chain root-first, each element a complete signed token. Empty when
+  // depth = 0. Verifiers check every element.
+  repeated CapabilityToken ancestors = 11;
+  // Position in the chain. Root = 0. Maximum 3 (RFC-0007 default).
+  uint32 depth = 12;
+  // Base64url (no padding) Ed25519 signature over the JCS bytes of this
+  // object with this field removed.
+  string signature = 13;
+}
+
+// Metadata value under urn:a2abus:ext:delegation:1 on a Message.
+message DelegationRef {
+  // Token being exercised by this message.
+  string token_id = 1;
+  // "sha-256:" + base64url (no padding) over the JCS bytes of the full token
+  // including its signature. Pins the exact token the delegator issued.
+  string token_digest = 2;
+  // Agent id that issued the delegation to the sender of this message.
+  string delegator = 3;
+  // Task id; MUST equal the envelope task id.
+  string task_id = 4;
+  // Full token. Present on the first message that uses a token; later
+  // messages on the same task MAY omit it and rely on the recipient cache
+  // keyed by token_id (RFC-0007 [0007-101]).
+  CapabilityToken token = 5;
+}
