@@ -67,7 +67,7 @@ A cache option lets a later call of the same tool run without a prompt; the Work
 ### 4.2 Approval request
 
 - [0006-005] A gated call MUST create an open approval request. The owner Worker commits the request (with its nonce, expiry and options) before it publishes the event in [0006-007]. Each request has a fresh request id (UUIDv7) and a nonce of at least 128 random bits.
-- [0006-006] Each request MUST carry all fields of `ApprovalRequest` (approval.proto): `request_id`, `task_id`, `tool`, `tier`, `summary`, `requester`, `chain`, `options`, `expires_at`, `nonce`. The default expiry is 300 seconds after creation. A deployment MAY set expiry between 30 seconds and 3600 seconds.
+- [0006-006] Each request MUST carry all fields of `ApprovalRequest` (approval.proto): `request_id`, `task_id`, `tool`, `tier`, `summary`, `requester`, `chain`, `options`, `expires_at`, `nonce`, `working_directory` and `workspace_mode`. `working_directory` MUST be the canonical path of the gated call's working directory, and `workspace_mode` MUST be the owner agent's `workspace.mode` (`per-session` or `per-task`, RFC-0012). The default expiry is 300 seconds after creation. A deployment MAY set expiry between 30 seconds and 3600 seconds.
 - [0006-007] The request is published as a TaskStatusUpdateEvent with state `TASK_STATE_INPUT_REQUIRED` on `a2a.v1.<tenant>.ev.<agent>.<task_id>`, with `ApprovalRequest` in `status.message.metadata["urn:a2abus:ext:approval:1"]` and header `A2AB-Stream-End: true` (RFC-0005 [0005-018]). No separate subject is used (agreed with BindingAuthor).
 - [0006-008] `summary` MUST be built by the Worker from the structured tool call fields (tool name, redacted argument summary, working directory, target paths), never from free text the backend wrote. Redaction follows RFC-0013; the summary is truncated to 512 characters. The summary is untrusted data (R-S7) and the UI MUST render it as data, without interpretation.
 - [0006-009] `options` MUST include at least one option of kind `APPROVAL_OPTION_KIND_ALLOW_ONCE` and one of kind `APPROVAL_OPTION_KIND_REJECT_ONCE`. Option ids MUST be unique within a request. The kinds mirror ACP `allow_once`, `allow_always`, `reject_once` and `reject_always`.
@@ -111,7 +111,7 @@ stateDiagram-v2
 - [0006-021] Coalescing: a gated call whose (task id, tool, tier, summary digest) equals an open request's within 30 seconds MUST join that request (same request id, same options). Coalesced calls are answered with the same decision.
 - [0006-022] Open requests per task: at most 3. A fourth gated call while three are open for the same task is answered with the reject option automatically, audited as `APPROVAL_FLOOD`, and the backend turn continues. This is a refusal of the call, not a task failure. `APPROVAL_FLOOD` is an audit reason only; it is not a task failure code and is not in the RFC-0005 registry. This cap is per task. RFC-0007 [0007-099] separately caps pending operator prompts per agent across its tasks (default 3); the two caps apply independently.
 - [0006-023] Decision rate: an operator identity may submit at most 10 decisions per minute per tenant. Excess decisions are refused with bus-level `OVERLOADED` (RFC-0002, domain `a2abus.v1`, with `google.rpc.RetryInfo`), `ErrorInfo.metadata.detail` `RATE_LIMITED`, and change no state.
-- [0006-024] The operator surface (RFC-0012) MUST show, before a decision: the action (tool and tier), the summary, the working directory, the requester and the full chain, and the expiry time. It MUST NOT offer bulk approval, and it MUST NOT pre-select an option.
+- [0006-024] The operator surface (RFC-0012) MUST show, before a decision: the action (tool and tier), the summary, the working directory, the requester and the full chain, and the expiry time. It MUST NOT offer bulk approval, and it MUST NOT pre-select an option. The `ApprovalDecision` has no note field: a note the operator types stays local to the console and is never sent on the bus.
 
 ### 4.5 Driver and backend mapping
 
@@ -172,7 +172,7 @@ Stock A2A peer (A2A v1.0 client or server):
 
 Hermes (A2A HTTP client and server, `hermes.md`):
 - Hermes reports interrupted work through the TaskState enum, and strips the `[INPUT_REQUIRED]` text marker (observed-with-stub, `docs/spikes/hermes-a2a.md` Q4). An INPUT_REQUIRED task from Hermes is an input request for the operator, not an `ApprovalRequest`. The gateway renders the wait as `[INPUT_REQUIRED]` text (RFC-0008). A follow-up reuses the namespaced contextId, not `message.taskId` (RFC-0009 [0009-078]).
-- Hermes sends no metadata (`hermes.md` 8.3). A Hermes-originated request therefore receives the root allowance from 0006-031, not a caller budget. The gateway MUST NOT invent a budget from HTTP headers.
+- [0006-058] Hermes sends no metadata (`hermes.md` 8.3). A Hermes-originated request therefore receives the root allowance from 0006-031, not a caller budget. The gateway MUST NOT invent a budget from HTTP headers.
 - Hermes counts admissions per contextId for its own cap, default 5 (`hermes.md` 6.2). A decision that resumes a task in the same context is one additional admission on Hermes' side (`hermes.md` 10). Callers that loop should use new contextIds.
 - Hermes' REJECTED result (anti-loop) is mapped as a child that ended REJECTED (0006-047).
 
@@ -241,7 +241,9 @@ Body (proto-JSON, TaskStatusUpdateEvent):
             {"optionId": "deny", "name": "Reject once", "kind": "APPROVAL_OPTION_KIND_REJECT_ONCE"}
           ],
           "expiresAt": "2025-06-01T10:20:00Z",
-          "nonce": "nZ3vQe7Lw8Kq1x0RkJ2aYg=="
+          "nonce": "nZ3vQe7Lw8Kq1x0RkJ2aYg==",
+          "workingDirectory": "/work/claude-1",
+          "workspaceMode": "per-task"
         }
       }
     }
@@ -420,7 +422,7 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-003 | Table test: each mode and tier, in the generic table and the omp table, produces the prompt or auto-allow shown | MUST |
 | 0006-004 | Default mode ask-all for non-omp agents; omp starts with ask-exec; ask-all declared for omp is refused; an unimplemented mode is refused | MUST |
 | 0006-005 | Crash after commit and before publish; restart yields one request with one nonce | MUST |
-| 0006-006 | Request fields all present; expiry default 300 s; configured expiry outside 30 to 3600 s rejected | MUST |
+| 0006-006 | Request fields all present, including `working_directory` and `workspace_mode`; expiry default 300 s; configured expiry outside 30 to 3600 s rejected | MUST |
 | 0006-007 | Request is INPUT_REQUIRED on the ev subject with A2AB-Stream-End true; no other subject used | MUST |
 | 0006-008 | Summary built from structured fields; prompt-injection text in backend output does not appear as instruction | MUST |
 | 0006-009 | Request with no reject option; expect the Worker to refuse to publish | MUST |
@@ -472,6 +474,7 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-055 | Permission answer selects the offered option by kind (allow_once or reject_once); no option of that kind gives cancelled; allow_always never selected; Claude ids passed through | MUST |
 | 0006-056 | Backend exit or restart closes open requests with no answer sent; later decision for a closed request refused; recovered session holds no open approval | MUST |
 | 0006-057 | In ask-all, and for exec or delete_or_move, only allow-once and reject-once are offered; no allow_always or cache label is sent | MUST |
+| 0006-058 | The gateway derives no budget from HTTP headers; a Hermes-originated request takes the root allowance (0006-031), not a caller budget | MUST |
 
 ## 9. Open issues
 

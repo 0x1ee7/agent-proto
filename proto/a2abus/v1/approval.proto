@@ -62,6 +62,10 @@ message ApprovalRequest {
   google.protobuf.Timestamp expires_at = 9;
   // Random nonce bound to this request. The decision MUST echo it.
   string nonce = 10;
+  // Canonical working directory of the gated call (RFC-0006 [0006-006]).
+  string working_directory = 11;
+  // Workspace mode of the owner agent: per-session or per-task (RFC-0006 [0006-006], RFC-0012 workspace.mode).
+  string workspace_mode = 12;
 }
 
 message ApprovalDecision {

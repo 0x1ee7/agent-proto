@@ -261,7 +261,7 @@ Patch files are local to the host. Peers on other hosts receive the summary only
 
 `a2a-tui` is a bus client built on `a2a-client` and `a2a-audit` (RFC-0001 crate table). It runs in the operator's terminal and is not started by the supervisor.
 
-- [0012-043] MUST sign every approval decision with the operator key (RFC-0007). Without a valid operator key in the allowlist, the TUI MUST show the Approvals screen read-only and disable decision actions. The TUI MUST NOT hold provider API keys.
+- [0012-043] MUST sign every approval decision with the operator key (RFC-0007 [0007-006]) when signing is enabled for the tenant (RFC-0007 [0007-095]); the key is `creds/operator-<K>.key` (sec 9 item 10). When signing is enabled and no valid operator key is in the allowlist, the TUI MUST show the Approvals screen read-only and disable decision actions. When signing is disabled (M1 default), decisions are unsigned: the TUI MUST show `unsigned` on each approval card and state that decisions are not signed. The TUI MUST NOT hold provider API keys.
 - [0012-044] MUST show every field of the approval card in table 4.10.1 for each pending request. Fields missing from a request MUST be shown as `missing`, never omitted.
 - [0012-045] MUST treat expiry as deny. A request whose expiry passes without an operator decision is recorded as denied with reason `expired` (M1-6). The default expiry is 300 seconds from issue, set by RFC-0006.
 - [0012-046] MUST NOT accept an approve action unless the approval card's detail view has been open for at least 2 seconds. Deny actions have no dwell requirement.
@@ -282,13 +282,13 @@ Table 4.10.1: approval card fields (all required in the view; values come from t
 | Task chain | RFC-0006 delegation chain, root to leaf (`agent/task`) | Confused deputy (T2, T14) |
 | Tool name | RFC-0006 | What runs |
 | Argument summary | RFC-0006, redacted and normalized, max 512 characters | Shows the real action (T7) |
-| Working directory | `local`, canonical workspace path | Where it runs (T13) |
-| Workspace mode | `local` (per-session or per-task, worktree or copy) | Isolation |
+| Working directory | RFC-0006 `working_directory`, canonical workspace path | Where it runs (T13) |
+| Workspace mode | RFC-0006 `workspace_mode` (`per-session` or `per-task`, the agent's `workspace.mode`) | Isolation |
 | Risk tier | RFC-0006 (`read`, `write`, `exec`, `delete_or_move`; `APPROVAL_TIER_*`, [0006-002]) | Severity |
 | Budget remaining at this hop | RFC-0006 budget extension | Cost (T3) |
 | Requested scope | RFC-0006 option kind: `once` is `APPROVAL_OPTION_KIND_ALLOW_ONCE`; `task` is `APPROVAL_OPTION_KIND_ALLOW_ALWAYS`, scoped to the task and its chain ([0006-010]) | Limits grant |
 | Expiry time (`expires_at`) | RFC-0006 ([0006-006]) | Default deny (T7) |
-| Signature status | RFC-0007 verification result | Impersonation (T6) |
+| Signature status | `local`: RFC-0007 verification result; `unsigned` when signing is disabled for the tenant (043) | Impersonation (T6) |
 
 Table 4.10.2: TUI keybindings (advisory names; keys are normative for M1).
 
@@ -321,11 +321,11 @@ Disconnected behavior is in 050. On reconnect, the TUI re-fetches pending approv
 
 ### 4.11 `a2a` CLI
 
-- [0012-054] MUST provide these commands: `a2a discover`, `a2a send <agent> <text|->` (with `--context <id>` and `--wait`), `a2a watch <task_id>`, `a2a cancel <task_id>`, `a2a approvals list [--pending]`, `a2a approvals approve <request_id> [--scope once|task]`, `a2a approvals deny <request_id> [--note <text>]`, `a2a start <agent>`, `a2a stop [<agent>]`, `a2a audit verify <file>` (RFC-0013 [0013-028]). Commands that take an agent id MUST validate it against RFC-0001 pattern before use.
+- [0012-054] MUST provide these commands: `a2a discover`, `a2a send <agent> <text|->` (with `--context <id>` and `--wait`), `a2a watch <task_id>`, `a2a cancel <task_id>`, `a2a approvals list [--pending]`, `a2a approvals approve <request_id> [--scope once|task]`, `a2a approvals deny <request_id> [--note <text>]`, `a2a start <agent>`, `a2a stop [<agent>]`, `a2a audit verify <file>` (RFC-0013 [0013-028]). Commands that take an agent id MUST validate it against RFC-0001 pattern before use. `--note` text is never sent in the decision; it stays local to the operator's console (RFC-0006 [0006-024]).
 - [0012-055] MUST use these exit codes: 0 success; 1 generic failure; 2 usage error; 3 not found; 4 rejected or denied; 5 timeout; 6 supervisor lock held or bus unavailable.
 - [0012-056] MUST emit `--json` output as proto-JSON of existing A2A or A2A-Bus messages. The CLI MUST NOT define a new output schema.
 - [0012-057] MUST, for `approvals approve` and `deny`, print the approval card fields (4.10.1) before deciding. In a non-interactive session (stdin not a TTY) the command MUST require `--yes`; in an interactive session it asks for confirmation of the card.
-- [0012-058] MUST NOT read provider API keys. The CLI uses the operator key of 4.10 for signing decisions.
+- [0012-058] MUST NOT read provider API keys. The CLI signs decisions with the operator key of 4.10 under the rule of 0012-043 when signing is enabled for the tenant; with signing disabled the decision is unsigned and the CLI prints `unsigned` before deciding.
 - [0012-059] SHOULD print ANSI color only when the console supports VT sequences, and MUST honor `--no-color`.
 
 ### 4.12 Normative and advisory split
@@ -411,7 +411,7 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 | 0012-040 | Patch equals `git diff --binary` plus untracked list for a fixture repo | Integration |
 | 0012-041 | Patch over 16 MiB is truncated with marker; `truncated = true` | Unit |
 | 0012-042 | Summary contains sha256 and relative path only; no absolute path (grep test) | Unit |
-| 0012-043 | Read-only Approvals screen when operator key absent; decision action disabled | Integration |
+| 0012-043 | Signing enabled, operator key absent: Approvals screen read-only and decision disabled; signing disabled: card shows `unsigned` | Integration |
 | 0012-044 | Card renders all table 4.10.1 fields; missing field renders `missing` | Unit |
 | 0012-045 | Request past expiry is recorded as denied with reason `expired` | Integration |
 | 0012-046 | Approve key ignored before 2 s dwell; accepted after | Unit |
@@ -426,7 +426,7 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 | 0012-055 | Each failure class maps to the listed exit code | Unit |
 | 0012-056 | `--json` output validates against the proto-JSON of the A2A message type | Unit |
 | 0012-057 | Non-TTY approve without `--yes` exits 2; card printed before decision | Integration |
-| 0012-058 | CLI source and binary contain no reads of provider key names | Unit |
+| 0012-058 | CLI source and binary contain no reads of provider key names; with signing enabled the CLI decision verifies under its operator kid | Unit |
 | 0012-059 | `--no-color` removes all ANSI sequences; VT detection path tested | Unit (Windows and Linux) |
 | 0012-060 | `a2ad` builds with `deny(unsafe_code)` outside `platform`; `unsafe` appears only in that module (grep and compile check) | Integration (Windows and Linux) |
 | 0012-061 | ACP child fixture (omp and claude stubs) exits 0 on stdin close before any signal | Integration (Windows and Linux) |
@@ -455,5 +455,5 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 7. **Retention numbers** (14 days, 20 GiB) and **copy-mode limits** (2 GiB, 100000 files): defaults chosen for M1 developer hosts; configurable under `[paths]` in a later revision.
 8. **Non-git default**: `refuse`. Alternative `copy` is opt-in per agent.
 9. **Approval field names**: closed. Table 4.10.1 uses the `ApprovalRequest` field names of RFC-0006 (`approval.proto`, [0006-006]); a rename there requires a change here.
-10. **Operator key storage**: default same owner-only rules as agent seeds (024, 025), under `creds/operator-<id>.key`.
+10. **Operator key storage**: `creds/operator-<K>.key` in the supervisor state dir, where K is the part of the kid after `operator:`. One file per operator-role trust-entry kid, so a rotation overlap keeps both files. Owner-only rules as for agent seeds (024, 025). This is the exception to 0007-010 for the location of private keys.
 11. **Copy source is not a git repository.** Resolved by 0012-074: built-in secret denylist and operator `copy_exclude`; the excluded-file count is audited in `WORKSPACE_CREATED`.

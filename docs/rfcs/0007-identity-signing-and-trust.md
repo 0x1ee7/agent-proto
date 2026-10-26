@@ -60,14 +60,14 @@ Terms below are not defined in RFC-0001.
 - [0007-003] Public keys MUST be encoded as the raw 32-byte value in base64url without padding (43 characters). Other encodings are rejected.
 - [0007-004] The only accepted signature algorithm is EdDSA over Ed25519. Any other `alg` value, including `none`, MUST be rejected.
 - [0007-005] Key pairs MUST be generated on the host by the supervisor (RFC-0012) at first start of an agent id. Private keys MUST NOT leave the host, be published on the bus, or appear in envelopes, Cards, logs, traces, audit events, error details, process arguments or environment variables.
-- [0007-006] The operator key MUST have role `operator` and agent id `operator`. Its private key MUST be held only by the operator UI process (RFC-0012). No key with role `agent` or `gateway` MAY be an operator key.
+- [0007-006] The operator key MUST have role `operator` and agent id `operator`. Its private key MUST be held only by the operator UI process (RFC-0012). No key with role `agent` or `gateway` MAY be an operator key. An operator-role kid is the single exception to agent-equals-sender: its sender identity is `tui` or `cli` (038, 039(d)), never `operator`.
 - [0007-007] Keys MUST NOT be trusted in-band. A message or card that carries key material (`jwk`, `jku`, `x5c`, `x5u`, or a public key field) gains no trust from it. Trust comes only from the trust file (4.3).
 - [0007-008] Rotation is manual (D15). The operator adds an entry with a new kid and status `active`, and sets the old entry to status `retired` with `not_after`. Both kids are accepted during the overlap. The default overlap is 24 hours; the operator MAY set up to 30 days.
 - [0007-009] A revoked kid (status `revoked`, or entry removed) MUST fail verification for every envelope, card and token, regardless of any issued or signed timestamp. Revocation fails closed.
 
 ### 4.2 Key storage
 
-- [0007-010] Per-user configuration lives in `%LOCALAPPDATA%\a2abus\` on Windows and in `$XDG_CONFIG_HOME/a2abus/` (default `~/.config/a2abus/`) on Linux. Private keys live in `keys/` under it, one file per kid, named `<agent-id>.<K>.key.pem` (no `:` in file names, so Windows and Linux paths are identical in form).
+- [0007-010] Per-user configuration lives in `%LOCALAPPDATA%\a2abus\` on Windows and in `$XDG_CONFIG_HOME/a2abus/` (default `~/.config/a2abus/`) on Linux. Private keys live in `keys/` under it, one file per kid, named `<agent-id>.<K>.key.pem` (no `:` in file names, so Windows and Linux paths are identical in form). The operator key (006) is the one exception: it lives at `creds/operator-<K>.key` in the supervisor state dir (RFC-0012 sec 9 item 10), with the same file mode and ACL rules (011, 012).
 - [0007-011] On Linux the `keys/` directory MUST be mode `0700` and key files `0600`. The loader MUST refuse a key file with any group or other permission bit set.
 - [0007-012] On Windows a key file MUST have a discretionary ACL granting access only to the current user's SID, with inherited ACEs removed. The loader MUST check the ACL and refuse a file that fails the check. The trust file ACL MUST grant write access only to the current user. Exact checks are implementation detail [INFERENCE: to be verified on Windows during implementation].
 - [0007-013] Private keys MUST be stored as unencrypted PKCS#8 PEM (RFC 8410). Protection at rest is the file permission rule above; passphrase protection is an Open issue.
@@ -112,8 +112,8 @@ Header values are the exact bytes transmitted. An absent optional header contrib
 - [0007-035] `Payload-SHA256` MUST be the base64url (no padding) SHA-256 of the payload bytes exactly as published. Verifiers hash the received bytes and MUST NOT re-serialize them.
 - [0007-036] `A2AB-Sig` MUST be the base64url (no padding) encoding of the 64-byte Ed25519 signature over the signing input.
 - [0007-037] Senders MUST emit `A2A-Extensions` in the canonical order defined by RFC-0003 before signing, so the signed string is unambiguous. Verifiers verify the header bytes as received and MUST NOT reorder them.
-- [0007-038] `A2AB-Sender` MUST equal the agent id of the entry for `A2AB-Kid`, and MUST equal the publisher identity the broker established (RFC-0010). A mismatch is rejected with SIGNATURE_IDENTITY_MISMATCH.
-- [0007-039] At verification the signing key is checked in this order: (a) the kid is in the allowlist and its entry serves the tenant (026); otherwise reject with SIGNATURE_KEY_UNKNOWN; (b) the status is `active`, or `retired` with now before `not_after`, and now is not before `not_before`; otherwise reject with SIGNATURE_KEY_INACTIVE; a `revoked` entry is rejected with SIGNATURE_KEY_REVOKED; (c) the role is `agent` or `gateway` for peer messages and `operator` for decisions (095, 098); otherwise reject with KEY_ROLE_DENIED; (d) the entry's agent id equals `A2AB-Sender` (038); otherwise reject with SIGNATURE_IDENTITY_MISMATCH.
+- [0007-038] `A2AB-Sender` MUST equal the agent id of the entry for `A2AB-Kid`, and MUST equal the publisher identity the broker established (RFC-0010). The one exception is an operator-role kid (006), whose entry agent id is `operator`: for such a kid `A2AB-Sender` and the broker publisher MUST be `tui` or `cli` (RFC-0010 [0010-063]), and a sender owned by an agent or gateway identity is rejected. A mismatch is rejected with SIGNATURE_IDENTITY_MISMATCH.
+- [0007-039] At verification the signing key is checked in this order: (a) the kid is in the allowlist and its entry serves the tenant (026); otherwise reject with SIGNATURE_KEY_UNKNOWN; (b) the status is `active`, or `retired` with now before `not_after`, and now is not before `not_before`; otherwise reject with SIGNATURE_KEY_INACTIVE; a `revoked` entry is rejected with SIGNATURE_KEY_REVOKED; (c) the role is `agent` or `gateway` for peer messages and `operator` for decisions (095, 098); otherwise reject with KEY_ROLE_DENIED; (d) the entry's agent id equals `A2AB-Sender` (038), or, for an operator-role entry, the sender is `tui` or `cli` (038); otherwise reject with SIGNATURE_IDENTITY_MISMATCH.
 - [0007-040] `A2AB-Ts` MUST be RFC 3339 UTC with millisecond precision. It MUST lie within `max_skew_ms` of the receiver's clock; otherwise reject with SIGNATURE_TIMESTAMP_SKEW. This check bounds only the signature replay window and does not extend any other window. `A2AB-Ts` is also the reference for message staleness (RFC-0002 [0002-072]) and submission age (RFC-0005 [0005-027]); those rules alone decide staleness and age.
 - [0007-041] A receiver MUST store each `(kid, nonce)` for at least twice `max_skew_ms` and reject a repeat with SIGNATURE_REPLAYED. A full store MUST also reject a new envelope with SIGNATURE_REPLAYED (fail closed): it MUST NOT evict live entries and MUST NOT change state. `A2AB-Nonce` is 16 random bytes, base64url encoded.
 - [0007-042] Message dedupe on `A2AB-Msg-Id` (RFC-0005) applies in addition to the nonce check. Neither replaces the other. The dedupe store MUST retain each `A2AB-Msg-Id` for at least the staleness horizon of RFC-0002 [0002-072] (maximum TTL 3600000 ms plus 30 s, that is 3630 s), as RFC-0010 [0010-026] does for the event stream.
@@ -464,11 +464,11 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 | 0007-003 | Public key in non-raw or padded base64url rejected at load | MUST |
 | 0007-004 | Token or envelope with `alg` other than EdDSA (including none) rejected | MUST |
 | 0007-005 | Grep logs, traces, audit, errors, argv and env for key bytes after a run: none | MUST |
-| 0007-006 | Operator-role entry with agent other than operator fails load; operator key absent from agent processes | MUST |
+| 0007-006 | Operator-role entry with agent other than operator fails load; operator-role kid from sender `tui` or `cli` accepted, from an agent identity rejected; operator key absent from agent processes | MUST |
 | 0007-007 | Message carrying an inline public key does not verify unless the kid is allowlisted | MUST |
 | 0007-008 | Rotate key with overlap: both kids verify; after `not_after` old kid fails | MUST |
 | 0007-009 | Revoke kid; old envelopes and cards with old timestamps fail | MUST |
-| 0007-010 | Key file path resolves per OS; file naming has no `:` | MUST |
+| 0007-010 | Key file path resolves per OS; file naming has no `:`; operator key file is `creds/operator-<K>.key` | MUST |
 | 0007-011 | Linux: key file with mode 0644 refused; dir 0755 refused | MUST |
 | 0007-012 | Windows: key file ACL with an extra user SID refused | MUST |
 | 0007-013 | Key file not PKCS#8 PEM refused | MUST |
@@ -488,7 +488,7 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 | 0007-035 | Modify one body byte: Payload-SHA256 mismatch rejects | MUST |
 | 0007-036 | Signature over wrong input rejected; 64-byte length enforced | MUST |
 | 0007-037 | Sender with unsorted A2A-Extensions produces failing vector; sorted order passes; verifier verifies received header bytes unchanged | MUST |
-| 0007-038 | Sender header differs from broker identity: SIGNATURE_IDENTITY_MISMATCH | MUST |
+| 0007-038 | Sender header differs from broker identity: SIGNATURE_IDENTITY_MISMATCH; operator-role kid with sender `tui` or `cli` accepted, any other sender for it rejected | MUST |
 | 0007-039 | Each check (a)-(d) has a failing fixture: unknown or wrong-tenant kid SIGNATURE_KEY_UNKNOWN; retired past not_after or not yet valid SIGNATURE_KEY_INACTIVE; revoked SIGNATURE_KEY_REVOKED; operator-role key on a peer message KEY_ROLE_DENIED; agent id mismatch SIGNATURE_IDENTITY_MISMATCH | MUST |
 | 0007-040 | Timestamp outside skew rejected; inside skew accepted; deadlines unaffected | MUST |
 | 0007-041 | Same (kid, nonce) twice: second rejected SIGNATURE_REPLAYED; entry kept for 2x skew; full store rejects a new envelope SIGNATURE_REPLAYED and evicts no live entry | MUST |

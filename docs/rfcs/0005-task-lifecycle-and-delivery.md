@@ -273,7 +273,7 @@ ACP agents (omp `--mode acp`, `claude-agent-acp`, `acp-omp-claude.md`):
 - T11 (stale authority): deadlines and approval expiry are enforced by the owner only, and a late decision cannot revive a task ([0005-035]). Failures are closed (FAILED), never open.
 - Visibility: invisible tasks return TaskNotFoundError ([0005-004]), so ids cannot be probed.
 - Only the owner publishes on its ev subject ([0005-003]). The NATS permission model (RFC-0010) must enforce this; the rule is stated here so that RFC-0010 can test it.
-- Redaction (R-S5): event payloads and failure details are redacted before commit. Raw prompts, raw tool arguments and file content MUST NOT appear in failure detail or audit records (L17).
+- Redaction (R-S5): event payloads and failure details are redacted before commit (RFC-0013 [0013-022]). Raw prompts, raw tool arguments and file content never appear in failure detail or audit records (L17; RFC-0013 [0013-023]).
 - Overload ([0005-028]) returns REJECTED with a code and no backend call; it never drops silently (R-S6).
 - The worker never re-runs an in-flight turn ([0005-031]), which prevents duplicate side effects after a crash.
 

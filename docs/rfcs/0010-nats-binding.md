@@ -295,9 +295,10 @@ The consumer handles max-delivery exhaustion through the advisory subject `$JS.E
   - `allow_responses` with `max` 1 (0010-061).
 - [0010-061] Each rpc request is answered by exactly one reply. Responders MUST use `allow_responses` with `max` 1 and a short `expires`. A reply count above one is a permission violation. Operations that need more are owned by RFC-0002 and require an erratum.
 - [0010-062] Role `gateway`: publish `a2a.v1.local.rpc.*.*`; read bundle as for `agent`; publish own card, presence and audit (`<self>` = `gateway`); subscribe `_INBOX.gateway.>`; no event-stream writes.
-- [0010-063] Role `operator` (identities `tui`, `cli`): publish `a2a.v1.local.rpc.*.*`; read-only KV (no writes to cards, presence or claims); read bundle for audit view; publish own audit (`audit.tui`, `audit.cli`); subscribe `_INBOX.<self>.>`.
+- [0010-063] Role `operator` (identities `tui`, `cli`, which hold the operator role of RFC-0007 [0007-038]): publish `a2a.v1.local.rpc.*.*`; read-only KV (no writes to cards, presence or claims); read bundle for audit view; publish own audit (`audit.tui`, `audit.cli`); subscribe `_INBOX.<self>.>`.
 - [0010-064] Role `supervisor` (identity `supervisor`): stream create/update/info for the names in sections 4.5-4.7 only; durable archiver API (`$JS.API.CONSUMER.*` for `A2A_AUDIT_local.audit-archiver`), `$JS.API.CONSUMER.MSG.NEXT.A2A_AUDIT_local.audit-archiver`, `$JS.ACK.>`; reaper publish on `a2a.v1.local.ev.*.>` for FAILED events of dead workers (`bus-outage` or `worker-lost`, owned by RFC-0005); subscribe `$JS.EVENT.ADVISORY.>`; subscribe `_INBOX.supervisor.>`.
 - [0010-065] Permission violations MUST be logged by a2ad and mapped to the bus error FORBIDDEN (ErrorInfo domain `a2abus.v1`) in the audit stream (RFC-0013); no request is silently dropped.
+- [0010-079] When signing is enabled for the tenant (RFC-0007 [0007-095]), a decision from broker identity `tui` or `cli` MUST be accepted only when signed by an operator-role kid. An unsigned decision is refused with SIGNATURE_MISSING, and a signature from a kid of another role with KEY_ROLE_DENIED (RFC-0007 [0007-039]). With signing disabled (M1 default), decisions are accepted only from the supervisor's local operator channel (RFC-0007 [0007-095]).
 
 Example expansion for `omp` (publish and subscribe excerpts; the full list is generated from the roles above):
 
@@ -449,6 +450,7 @@ These requirements apply only when the post-M1 federation work is accepted. They
 | 0010-063 | Operator role cannot write cards, presence or claims | M1 |
 | 0010-064 | Supervisor role limited to listed streams and archiver consumer | M1 |
 | 0010-065 | Violation logged and audited as FORBIDDEN | M1 |
+| 0010-079 | Decision from `tui` or `cli` with signing enabled: accepted only with an operator-kid signature; unsigned refused SIGNATURE_MISSING; other role KEY_ROLE_DENIED; signing disabled: accepted only from the local operator channel | M1 |
 | 0010-066 | Client inbox prefix is `_INBOX.<identity>.`; other inboxes not received | M1 |
 | 0010-067 | Fallback inbox mode recorded as known gap | M1 |
 | 0010-078 | Delivered principal equals the identity in the sender's inbox prefix; a request whose principal cannot be derived is not delivered; identity on fallback inbox is not served | M1 |
