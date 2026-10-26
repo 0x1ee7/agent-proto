@@ -9,12 +9,11 @@ use a2a_types::proto::a2abus::{
 };
 use pbjson_types::Timestamp;
 use prost::Message;
+use serde::Deserialize;
 
 use crate::canon::{sha256, to_hex};
-use crate::clock::Clock;
-use crate::envelope::{Envelope, VerifiedSender, VerifyContext, sign_envelope};
+use crate::envelope::{VerifiedSender, VerifyContext};
 use crate::error::{BusError, Reason, SecurityError};
-use crate::identity::Signer;
 use crate::mode::SigningMode;
 use crate::trust::{OPERATOR_AGENT, Role};
 
@@ -125,29 +124,20 @@ pub fn request_digest(request: &ApprovalRequest) -> String {
     to_hex(&sha256(&request.encode_to_vec()))
 }
 
-/// Signs an operator decision that chooses `option_id` on `request` ([0006-051], [0007-095]).
+/// Builds the operator decision that chooses `option_id` on `request` ([0006-051], [0007-095]).
 ///
 /// The decision carries the request digest, task, and nonce, so a changed request is refused on
-/// verification. The envelope signature covers the encoded decision. `decided_by` names the
-/// operator identity; `decided_at` stays unset because the verifier records its own clock.
-/// Returns the encoded payload that was signed.
+/// verification. `decided_by` names the operator identity; `decided_at` stays unset because the
+/// verifier records its own clock. The caller sends the decision as proto-JSON in `Part.data` of
+/// the message, and the operator key signs that message's envelope with [`sign_envelope`].
 ///
 /// # Errors
 ///
-/// Returns [`SecurityError::Invalid`] when the key is not the operator key or the request does
-/// not offer `option_id`. Otherwise returns the error from [`sign_envelope`].
-pub fn sign_decision(
-    signer: &dyn Signer,
-    clock: &dyn Clock,
-    envelope: &mut Envelope,
+/// Returns [`SecurityError::Invalid`] when the request does not offer `option_id`.
+pub fn build_decision(
     request: &ApprovalRequest,
     option_id: &str,
-) -> Result<Vec<u8>, SecurityError> {
-    if signer.kid().agent().as_str() != OPERATOR_AGENT {
-        return Err(SecurityError::Invalid(
-            "only the operator key signs approval decisions",
-        ));
-    }
+) -> Result<ApprovalDecision, SecurityError> {
     if !request
         .options
         .iter()
@@ -157,7 +147,7 @@ pub fn sign_decision(
             "approval option is not offered by the request",
         ));
     }
-    let decision = ApprovalDecision {
+    Ok(ApprovalDecision {
         request_id: request.request_id.clone(),
         task_id: request.task_id.clone(),
         option_id: option_id.to_owned(),
@@ -165,10 +155,19 @@ pub fn sign_decision(
         decided_by: OPERATOR_AGENT.to_owned(),
         decided_at: None,
         request_sha256: request_digest(request),
-    };
-    let payload = decision.encode_to_vec();
-    sign_envelope(signer, clock, envelope, &payload)?;
-    Ok(payload)
+    })
+}
+
+/// Parses an approval decision from its proto-JSON form, the `Part.data` of a decision message
+/// ([0006-051]). The envelope signature covers the whole message, so the caller verifies the
+/// origin before it trusts the parsed fields.
+///
+/// # Errors
+///
+/// Returns [`SecurityError::Invalid`] when the value is not a proto-JSON `ApprovalDecision`.
+pub fn decision_from_json(value: &serde_json::Value) -> Result<ApprovalDecision, SecurityError> {
+    ApprovalDecision::deserialize(value)
+        .map_err(|_| SecurityError::Invalid("approval decision is malformed"))
 }
 
 /// Open approval requests owned by one Worker. Entries are dropped at their expiry.
@@ -373,7 +372,7 @@ mod tests {
 
     use super::*;
     use crate::clock::ManualClock;
-    use crate::envelope::{MessageClass, verify_request};
+    use crate::envelope::{Envelope, MessageClass, sign_envelope, verify_request};
     use crate::identity::Kid;
     use crate::mode::Policy;
     use crate::replay::ReplayCache;
@@ -915,12 +914,14 @@ mod tests {
             ..Harness::new()
         };
         let op = signer("operator", 7);
+        let decision = build_decision(&request(), "allow-once").expect("offered option");
+        let body = serde_json::to_vec(&decision).expect("decision serializes");
         let mut env = envelope_from("tui");
-        let payload = sign_decision(&op, &h.clock, &mut env, &request(), "allow-once")
-            .expect("operator key signs a decision");
-        let verified =
-            verify_relayed(&h, "tui", &env, &payload).expect("relayed decision verifies");
-        let decoded = ApprovalDecision::decode(payload.as_slice()).expect("payload decodes");
+        sign_envelope(&op, &h.clock, &mut env, &body).expect("operator key signs the message");
+        let verified = verify_relayed(&h, "tui", &env, &body).expect("relayed decision verifies");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("body is JSON");
+        let decoded = decision_from_json(&value).expect("decision parses");
+        assert_eq!(decoded, decision);
         let outcome = h
             .decide(
                 SigningMode::Enabled,
@@ -935,19 +936,23 @@ mod tests {
     }
 
     #[test]
-    fn req_0006_051_sign_decision_refuses_non_operator_and_unoffered_option() {
-        let clock = ManualClock::new(NOW);
-        let alice = signer("alice", 7);
-        let mut env = envelope_from("alice");
-        let refused = sign_decision(&alice, &clock, &mut env, &request(), "allow-once");
+    fn req_0006_051_build_decision_refuses_unoffered_option() {
+        let refused = build_decision(&request(), "maybe");
         assert!(matches!(refused, Err(SecurityError::Invalid(_))));
-        assert_eq!(env.kid, None);
+    }
 
-        let op = signer("operator", 7);
-        let mut env = envelope_from("tui");
-        let refused = sign_decision(&op, &clock, &mut env, &request(), "maybe");
-        assert!(matches!(refused, Err(SecurityError::Invalid(_))));
-        assert_eq!(env.kid, None);
+    #[test]
+    fn req_0006_051_decision_from_json_refuses_malformed_values() {
+        let wrong_type = serde_json::json!({ "requestId": 7 });
+        assert!(matches!(
+            decision_from_json(&wrong_type),
+            Err(SecurityError::Invalid(_))
+        ));
+        let not_an_object = serde_json::json!("allow-once");
+        assert!(matches!(
+            decision_from_json(&not_an_object),
+            Err(SecurityError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -959,11 +964,13 @@ mod tests {
         let mut altered = request();
         altered.summary = "run a different command".to_owned();
         let op = signer("operator", 7);
+        let decision = build_decision(&altered, "allow-once").expect("offered option");
+        let body = serde_json::to_vec(&decision).expect("decision serializes");
         let mut env = envelope_from("tui");
-        let payload = sign_decision(&op, &h.clock, &mut env, &altered, "allow-once")
-            .expect("operator key signs a decision");
-        let verified = verify_relayed(&h, "tui", &env, &payload).expect("envelope verifies");
-        let decoded = ApprovalDecision::decode(payload.as_slice()).expect("payload decodes");
+        sign_envelope(&op, &h.clock, &mut env, &body).expect("operator key signs the message");
+        let verified = verify_relayed(&h, "tui", &env, &body).expect("envelope verifies");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("body is JSON");
+        let decoded = decision_from_json(&value).expect("decision parses");
         let err = h
             .decide(
                 SigningMode::Enabled,

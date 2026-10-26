@@ -19,7 +19,7 @@ Layer L2 (RFC-0001). Depends only on `a2a-types`. Implements RFC-0007 in full, p
 - `TrustStore`, `Role`, `KeyStatus`, `TrustEntry`.
 - `OPERATOR_RELAY_IDS`, `load_key_file`, `operator_key_path`.
 - `Envelope`, `sign_envelope`, `verify_request`, `VerifyContext`, `VerifiedSender`, `MessageClass`.
-- `ApprovalBook`, `DecisionOrigin`, `VerifiedDecision`, `DecisionOutcome`, `verify_decision`, `request_digest`, `sign_decision`.
+- `ApprovalBook`, `DecisionOrigin`, `VerifiedDecision`, `DecisionOutcome`, `verify_decision`, `request_digest`, `build_decision`, `decision_from_json`.
 - `verify_grant`, `VerifiedGrant`, `issue_root`, `issue_child`, `TokenCache`, `resolve_reference`, `UseLedger`, `GrantCredential`, `check_loopback_bind`.
 - `sign_card`, `verify_card`, `CardOutcome`, `VerifiedCard`.
 - `originate`, `append_hop`, `verify_provenance`, `frame_untrusted`, `redact`.
