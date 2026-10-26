@@ -4,6 +4,7 @@
 //! `impl Future + Send` instead of boxing, so bindings add no allocation of their
 //! own beyond what they need.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use a2a_types::ids::TenantId;
@@ -156,6 +157,155 @@ pub trait Bus: Send + Sync {
 
     /// Closes the binding. Unsettled deliveries stay pending for redelivery.
     fn close(&self) -> impl Future<Output = Result<(), BusError>> + Send;
+}
+
+/// A shared handle is a binding: `Arc<B>` forwards every operation to the inner bus.
+/// One connection can then serve several users, such as a worker and a client in one
+/// process.
+impl<B: Bus + ?Sized> Bus for Arc<B> {
+    type Requests = B::Requests;
+    type Consumer = B::Consumer;
+    type Watch = B::Watch;
+
+    fn capabilities(&self) -> &Capabilities {
+        (**self).capabilities()
+    }
+
+    fn publish(
+        &self,
+        who: &Principal,
+        subject: &Subject,
+        headers: &Headers,
+        payload: Bytes,
+    ) -> impl Future<Output = Result<PublishAck, BusError>> + Send {
+        (**self).publish(who, subject, headers, payload)
+    }
+
+    fn request(
+        &self,
+        who: &Principal,
+        subject: &Subject,
+        headers: &Headers,
+        payload: Bytes,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Reply, BusError>> + Send {
+        (**self).request(who, subject, headers, payload, timeout)
+    }
+
+    fn serve(
+        &self,
+        who: &Principal,
+        pattern: &SubjectPattern,
+    ) -> impl Future<Output = Result<Self::Requests, BusError>> + Send {
+        (**self).serve(who, pattern)
+    }
+
+    fn append(
+        &self,
+        who: &Principal,
+        stream: &StreamName,
+        subject: &Subject,
+        headers: &Headers,
+        payload: Bytes,
+        msg_id: &MsgId,
+    ) -> impl Future<Output = Result<PublishAck, BusError>> + Send {
+        (**self).append(who, stream, subject, headers, payload, msg_id)
+    }
+
+    fn consume(
+        &self,
+        who: &Principal,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+        filter: &SubjectPattern,
+        start: StartPosition,
+    ) -> impl Future<Output = Result<Self::Consumer, BusError>> + Send {
+        (**self).consume(who, stream, consumer, filter, start)
+    }
+
+    fn kv_put(
+        &self,
+        who: &Principal,
+        bucket: &Bucket,
+        key: &Key,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> impl Future<Output = Result<Revision, BusError>> + Send {
+        (**self).kv_put(who, bucket, key, value, ttl)
+    }
+
+    fn kv_get(
+        &self,
+        who: &Principal,
+        bucket: &Bucket,
+        key: &Key,
+    ) -> impl Future<Output = Result<Entry, BusError>> + Send {
+        (**self).kv_get(who, bucket, key)
+    }
+
+    fn kv_create(
+        &self,
+        who: &Principal,
+        bucket: &Bucket,
+        key: &Key,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> impl Future<Output = Result<Revision, BusError>> + Send {
+        (**self).kv_create(who, bucket, key, value, ttl)
+    }
+
+    fn kv_update(
+        &self,
+        who: &Principal,
+        bucket: &Bucket,
+        key: &Key,
+        value: Bytes,
+        expected: Revision,
+        ttl: Option<Duration>,
+    ) -> impl Future<Output = Result<Revision, BusError>> + Send {
+        (**self).kv_update(who, bucket, key, value, expected, ttl)
+    }
+
+    fn kv_delete(
+        &self,
+        who: &Principal,
+        bucket: &Bucket,
+        key: &Key,
+        expected: Option<Revision>,
+    ) -> impl Future<Output = Result<Revision, BusError>> + Send {
+        (**self).kv_delete(who, bucket, key, expected)
+    }
+
+    fn kv_watch(
+        &self,
+        who: &Principal,
+        bucket: &Bucket,
+        prefix: &KeyPrefix,
+    ) -> impl Future<Output = Result<Self::Watch, BusError>> + Send {
+        (**self).kv_watch(who, bucket, prefix)
+    }
+
+    fn blob_put(
+        &self,
+        who: &Principal,
+        tenant: &TenantId,
+        bytes: Bytes,
+    ) -> impl Future<Output = Result<Digest, BusError>> + Send {
+        (**self).blob_put(who, tenant, bytes)
+    }
+
+    fn blob_get(
+        &self,
+        who: &Principal,
+        tenant: &TenantId,
+        digest: &Digest,
+    ) -> impl Future<Output = Result<Bytes, BusError>> + Send {
+        (**self).blob_get(who, tenant, digest)
+    }
+
+    fn close(&self) -> impl Future<Output = Result<(), BusError>> + Send {
+        (**self).close()
+    }
 }
 
 /// Requests received through [`Bus::serve`].

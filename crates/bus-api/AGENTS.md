@@ -7,6 +7,8 @@ and the `BusControl` trait used by simulators and tests.
 Provides:
 - `bus::{Bus, RequestStream, Consumer, Watch}`: the seam. Methods take the caller's
   `Principal` and return `impl Future + Send`.
+- `impl Bus for Arc<B>` (blanket, `B: Bus + ?Sized`): forwards every method and the
+  `Requests`, `Consumer` and `Watch` associated types, so one connection can be shared.
 - `name::{StreamName, ConsumerName, Key, KeyPrefix, MsgId, Subject, SubjectPattern,
   Bucket, Principal, InvalidName}`: validated names.
 - `value::{StreamSeq, Revision, Digest, InvalidDigest}`; `headers::Headers`.

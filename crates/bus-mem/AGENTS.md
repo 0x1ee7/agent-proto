@@ -23,6 +23,9 @@ dev-dependency to run the suite against this binding.
   `ack_wait` are deadlines on that clock.
 - `MemControl` supports every `BusControl` operation, so its methods always return `Ok`
   and never `Unsupported`. The suite runs it with `Clock::Virtual` (`BusFactory::clock`).
+- `serve` grants match by exact equality with the pattern passed to `open_server`. A grant
+  of `a2a.v1.t1.rpc.>` does not permit serving `rpc.send`; grant each served subject
+  pattern exactly.
 - Faults draw from one generator seeded by `MemConfig::seed`. A fault draws only when
   its switch is installed. `fault_trace()` records drop, duplicate, partition,
   reorder, delay, restart and crash decisions in order.
@@ -45,6 +48,8 @@ dev-dependency to run the suite against this binding.
 - 0011-061 `req_0011_061_same_seed_same_sequence` (rng): seeded generator is repeatable.
 - 0011-071 `req_0011_071_pending_bound_stops_new_candidates` (state) and
   `req_0011_071_zero_max_pending_refused` (`tests/conformance.rs`).
+- 0011-014 `req_0011_014_shared_handle_publishes_are_visible_to_other_user`
+  (`tests/shared_handle.rs`): two users of one `Arc<MemBus>` see each other's publishes.
 - `tests/conformance.rs` runs the full RFC-0011 suite from `a2a-conformance`:
   - 0011-080 `req_0011_080_suite_runs_offline_against_bus_mem`
   - 0011-081 `req_0011_081_report_reproducible_from_seed`

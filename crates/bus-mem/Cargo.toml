@@ -18,3 +18,4 @@ tokio = { version = "1.54.1", features = ["sync"] }
 
 [dev-dependencies]
 a2a-conformance = { path = "../a2a-conformance" }
+tokio = { version = "1.54.1", features = ["rt", "macros"] }

@@ -56,7 +56,8 @@ pub struct Grant {
     pub tenant: TenantId,
     /// Subject patterns this principal may publish and request on.
     pub publish: Vec<SubjectPattern>,
-    /// Exact subject patterns this principal may serve.
+    /// Exact subject patterns this principal may serve. `open_server` matches by
+    /// equality, not coverage: a grant of `a.>` does not allow serving `a.b`.
     pub serve: Vec<SubjectPattern>,
     /// Streams this principal may consume from and append to.
     pub streams: Vec<StreamName>,
