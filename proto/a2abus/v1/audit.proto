@@ -1,0 +1,150 @@
+// Owner: RFC-0013 (Observability and Audit).
+//
+// A2A-Bus audit event model. Published on a2a.v1.<tenant>.audit.<emitter>
+// as protobuf binary (RFC-0013 [0013-001]); the JSONL sink stores the
+// proto3 JSON canonical form (JCS-ordered) per [0013-018].
+//
+// Compatibility: field numbers are append-only. Never reuse a number.
+// Reserve the number and name of any removed field.
+//
+// This file defines no A2A types. A2A messages (tasks, messages, states)
+// are referenced by string in details (for example TASK_STATE_* names) so
+// that this file does not depend on the upstream lf.a2a.v1 package.
+
+syntax = "proto3";
+
+package a2abus.v1;
+
+import "google/protobuf/struct.proto";
+
+// Kind of component that produced the event. RFC-0013 sec 4.1.
+enum EmitterKind {
+  EMITTER_KIND_UNSPECIFIED = 0;
+  EMITTER_KIND_SUPERVISOR = 1;  // a2ad supervisor (emitter id "supervisor")
+  EMITTER_KIND_WORKER = 2;      // a2a-worker instance (emitter id = agent id)
+  EMITTER_KIND_GATEWAY = 3;     // A2A HTTP gateway (emitter id = agent id "gateway")
+  EMITTER_KIND_OPERATOR = 4;    // TUI or CLI (emitter id "tui" or "cli")
+}
+
+// Event types. Table 4.2 of RFC-0013 lists the emitter and details keys
+// for each value. Values are append-only.
+enum AuditEventType {
+  AUDIT_EVENT_TYPE_UNSPECIFIED = 0;
+  AUDIT_EVENT_TYPE_AGENT_STARTED = 1;
+  AUDIT_EVENT_TYPE_AGENT_STOPPED = 2;
+  AUDIT_EVENT_TYPE_AGENT_RESTARTED = 3;
+  AUDIT_EVENT_TYPE_AGENT_ABANDONED = 4;
+  AUDIT_EVENT_TYPE_AGENT_PRESENCE_CHANGED = 5;
+  AUDIT_EVENT_TYPE_DANGEROUS_MODE_ACTIVE = 6;
+  AUDIT_EVENT_TYPE_START_REFUSED = 7;
+  AUDIT_EVENT_TYPE_TASK_SUBMITTED = 8;
+  AUDIT_EVENT_TYPE_TASK_STATE_CHANGED = 9;
+  AUDIT_EVENT_TYPE_TASK_CANCEL_REQUESTED = 10;
+  AUDIT_EVENT_TYPE_DELEGATION_ISSUED = 11;
+  AUDIT_EVENT_TYPE_APPROVAL_REQUESTED = 12;
+  AUDIT_EVENT_TYPE_APPROVAL_DECIDED = 13;
+  AUDIT_EVENT_TYPE_BUDGET_DEBITED = 14;
+  AUDIT_EVENT_TYPE_BUDGET_TRIPPED = 15;
+  AUDIT_EVENT_TYPE_LOOP_TRIPPED = 16;
+  AUDIT_EVENT_TYPE_SIGNATURE_FAILED = 17;
+  AUDIT_EVENT_TYPE_PEER_REJECTED = 18;
+  AUDIT_EVENT_TYPE_WORKSPACE_CREATED = 19;
+  AUDIT_EVENT_TYPE_WORKSPACE_RETAINED = 20;
+  AUDIT_EVENT_TYPE_WORKSPACE_REMOVED = 21;
+  AUDIT_EVENT_TYPE_WORKSPACE_REFUSED = 22;
+  AUDIT_EVENT_TYPE_OPERATOR_ACTION = 23;
+  AUDIT_EVENT_TYPE_REDACTION_APPLIED = 24;
+  AUDIT_EVENT_TYPE_AUDIT_GAP = 25;
+  AUDIT_EVENT_TYPE_AUDIT_CHECKPOINT = 26;
+  AUDIT_EVENT_TYPE_CARD_DECOMMISSIONED = 27;
+  AUDIT_EVENT_TYPE_TASK_TRANSITION_REFUSED = 28;
+  AUDIT_EVENT_TYPE_LATE_OUTPUT_DROPPED = 29;
+  AUDIT_EVENT_TYPE_SUBMISSION_DROPPED = 30;
+  AUDIT_EVENT_TYPE_APPROVAL_FLOOD = 31;
+  AUDIT_EVENT_TYPE_APPROVAL_NOT_APPLICABLE = 32;
+  AUDIT_EVENT_TYPE_APPROVAL_AUTO_ALLOWED = 33;
+  AUDIT_EVENT_TYPE_TRUST_RELOAD_REJECTED = 34;
+  AUDIT_EVENT_TYPE_MESSAGE_REJECTED = 35;
+  AUDIT_EVENT_TYPE_PERMISSION_VIOLATION = 36;
+  AUDIT_EVENT_TYPE_PROCESS_LEFTOVER = 37;
+}
+
+// Owner: RFC-0013. One hop of a delegation chain, root to leaf (shape from RFC-0006).
+message ChainHop {
+  string agent_id = 1;  // [a-z0-9][a-z0-9-]{0,47}
+  string task_id = 2;   // UUIDv7 (RFC-0001 id rule)
+}
+
+// One audit fact. Owner: RFC-0013 sec 4.1 to 4.6.
+message AuditEvent {
+  // UUIDv7. Dedupe key: published as Nats-Msg-Id ([0013-004], [0013-010]).
+  string event_id = 1;
+
+  // RFC 3339 UTC with milliseconds and trailing Z ([0013-005]).
+  string time = 2;
+
+  // Per-emitter sequence, starting at 1, +1 per event ([0013-003]).
+  uint64 seq = 3;
+
+  // Tenant token, for example "local" ([0013-009]).
+  string tenant = 4;
+
+  // Emitter token: agent id, "supervisor", "tui", or "cli".
+  string emitter = 5;
+
+  EmitterKind emitter_kind = 6;
+
+  AuditEventType type = 7;
+
+  // Agent the fact is about. May differ from emitter (for example a
+  // supervisor event about an agent). Empty when not applicable.
+  string agent_id = 8;
+
+  // A2A context id (UUIDv7), when known.
+  string context_id = 9;
+
+  // A2A task id (UUIDv7), when known.
+  string task_id = 10;
+
+  // Value of A2AB-Msg-Id for the message that caused the fact, when known.
+  string message_id = 11;
+
+  // W3C traceparent, carried unchanged (L2, [0013-030], [0013-031]).
+  string traceparent = 12;
+
+  // Root-to-leaf delegation chain ([0013-030]).
+  repeated ChainHop chain = 13;
+
+  // RFC-0012 workspace short id, when known. Never an absolute path.
+  string workspace_id = 14;
+
+  // Machine-readable reason code from a fixed list (for example
+  // "shared_checkout", "credential_acl", "expired"). Empty when unused.
+  string reason = 15;
+
+  // Type-specific, redacted details; keys per RFC-0013 table 4.2
+  // ([0013-008]). Values are strings, booleans, lists, or nested objects.
+  // Integers that can exceed 2^53 MUST be encoded as decimal strings.
+  google.protobuf.Struct details = 16;
+
+  // Rule ids that fired during redaction, without content ([0013-023]).
+  repeated string redactions = 17;
+
+  // True when details were cut to the 4 KiB limit ([0013-024]).
+  bool truncated = 18;
+
+  // chain_hash of the previous event from this emitter; 64 zero characters
+  // for seq 1 ([0013-026]). Lowercase hex.
+  string prev_hash = 19;
+
+  // Lowercase hex SHA-256 over the JCS form of this event with chain_hash
+  // and signature removed ([0013-026]).
+  string chain_hash = 20;
+
+  // base64url Ed25519 signature. Set only on AUDIT_CHECKPOINT events
+  // ([0013-027]).
+  string signature = 21;
+
+  // Key id of the signing key for signature (RFC-0007 key id format).
+  string key_id = 22;
+}
