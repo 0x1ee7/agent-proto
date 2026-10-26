@@ -1,0 +1,26 @@
+[package]
+name = "a2a-tui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Local operator console for A2A-Bus (RFC-0012 sec 4.10)"
+
+[lints]
+workspace = true
+
+[dependencies]
+a2a-audit = { path = "../a2a-audit" }
+a2a-client = { path = "../a2a-client" }
+a2a-core = { path = "../a2a-core" }
+a2a-security = { path = "../a2a-security" }
+a2a-types = { path = "../a2a-types" }
+bus-api = { path = "../bus-api" }
+bus-nats = { path = "../bus-nats" }
+crossterm = "0.29.0"
+pbjson-types = "0.9.0"
+prost = "0.14.4"
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
