@@ -1,4 +1,7 @@
 upstream: lf.a2a.v1
 spec_version: 1.0
+tag: v1.0.1
+tag_commit: 3303592588e388e62e0f69f701af531d2f4e3991
+vendored_from: main commit 98279d62 (matches the tag apart from comments; see crates/a2a-types/proto/SOURCES.md)
 source: https://a2a-protocol.org/latest/definitions/
 fetched: 2026-10-26
