@@ -46,12 +46,23 @@ Non-goals:
 | Mode (card value) | read | write | exec | delete_or_move | Meaning |
 |---|---|---|---|---|---|
 | `ask-all` | prompt | prompt | prompt | prompt | every tier prompts |
-| `ask-exec` | auto-allow | auto-allow | prompt | prompt | writes and reads run without a prompt |
+| `ask-exec` | auto-allow | auto-allow | prompt | prompt | writes and reads run without a prompt (generic rule; omp uses the omp table below) |
 | `none` | auto-allow | auto-allow | auto-allow | auto-allow | no gate; the card MUST also set `dangerous: true` |
 
   `external` is not an M1 value. A Worker MUST refuse to start with an approval mode it does not implement. Auto-allow is recorded in audit (RFC-0013) but creates no `ApprovalRequest`.
 
-- [0006-004] The default mode for every M1 agent is `ask-all`, except omp, whose default is `ask-exec`, because omp cannot enforce `ask-all` (0006-029, RFC-0009 [0009-083]). The mode in effect MUST be the mode advertised in the agent card (RFC-0003), and a driver MUST NOT run a session in a backend mode more permissive than the card mode (section 4.7). A driver MUST NOT declare a mode its backend cannot enforce.
+Omp rows (observed with the stub, `docs/spikes/omp-acp.md` gating table). The card value for omp is `ask-exec`, which is `always-ask-cached` (0006-025). `elicitation` is form elicitation (0006-052); `permission` is `session/request_permission` (0006-027).
+
+| omp `approvalMode` | read | write | exec (bash) | Channel | M1 status |
+|---|---|---|---|---|---|
+| `always-ask` | auto-allow | prompt | prompt | write: elicitation; exec: permission | refused (0006-025) |
+| `always-ask-cached` (`ask-exec`) | prompt | prompt | prompt | read, write: elicitation; exec: permission | the only omp mode allowed |
+| `write` | auto-allow | auto-allow | prompt | exec: permission | refused (dangerous, 0009-063) |
+| `yolo` | auto-allow | auto-allow | auto-allow | none | refused (dangerous, 0009-063) |
+
+A cache option lets a later call of the same tool run without a prompt; the Worker never offers one (0006-057). Keying by path or folder is `[UNOBSERVED]` (Section 9 issue 2). Other tool kinds (grep, glob, find) are `[UNOBSERVED]` for prompts. A tool name the Worker does not know is tier exec (0006-002). No omp tool kind for `delete_or_move` is observed.
+
+- [0006-004] The default mode for every M1 agent is `ask-all`, except omp, whose default is `ask-exec`. A driver MUST NOT declare `ask-all` for omp: omp's `always-ask` mode runs reads with no prompt (observed-with-stub), and prompts for tool kinds other than write, read and exec (grep, glob, find) are `[UNOBSERVED]` (0006-025, RFC-0009 [0009-083]). Under any mode that offers options, only once options are offered for exec and delete_or_move tiers (0006-057). The mode in effect MUST be the mode advertised in the agent card (RFC-0003), and a driver MUST NOT run a session in a backend mode more permissive than the card mode (section 4.7). A driver MUST NOT declare a mode its backend cannot enforce.
 
 ### 4.2 Approval request
 
@@ -104,16 +115,17 @@ stateDiagram-v2
 
 ### 4.5 Driver and backend mapping
 
-- [0006-025] Omp (`--mode acp`): the driver MUST start every bus session with `tools.approvalMode` set to `always-ask-cached`, the value the operator configures as `ask-exec`. It MUST NOT use `always-ask` (omp's mode for `ask-all`): it auto-approves `read` with no prompt (observed-with-stub, `docs/spikes/omp-acp.md` Q4), so `ask-all` is not declared for omp. It MUST NOT use `write` or `yolo`; both are dangerous modes (RFC-0009 [0009-063]). Under `always-ask-cached` the Worker gates every `write` and `exec` that omp raises, as form elicitation (0006-052) or as `session/request_permission` (omp bash prompt policies, `[UNOBSERVED]`), and each one is an operator decision under 4.1. omp's documented auto-approval of reads under this mode (`acp-omp-claude.md` 3.3) is not relied on: the stub observed `read` failing (Q4), so reads also reach the Worker and the 0006-003 read column decides them. Under the 0006-003 table, `ask-exec` writes would auto-allow; for omp every write is operator-gated regardless (Section 9 issue 12). A tool call that proceeds without an answered approval is a fault that fails the task with `BACKEND_CRASHED`. The driver MUST NOT rely on omp's default answers. The driver advertises `elicitation.form` (RFC-0009 [0009-018]) so that omp sends its approvals as form elicitation. The omp start is refused unless `omp_allow_path_verified` is set (RFC-0009 [0009-083]).
+- [0006-025] Omp (`--mode acp`): the driver MUST start every bus session with `tools.approvalMode` set to `always-ask-cached`, the value the operator configures as `ask-exec`. It MUST NOT use `always-ask` (omp's mode for `ask-all`: it runs `read` with no prompt, observed-with-stub, `docs/spikes/omp-acp.md` Q4), `write` or `yolo`; both are dangerous modes (RFC-0009 [0009-063]). Under `always-ask-cached` omp raises read and write approvals as form elicitation (0006-052) and exec (bash) approvals as `session/request_permission`; the Worker gates every one as an operator decision under 4.1, and the omp table in 0006-003 governs. The generic `ask-exec` row (writes auto-allow) does not apply to omp. A tool call that proceeds without an answered approval is a fault that fails the task with `BACKEND_CRASHED`. The driver MUST NOT rely on omp's default answers. The driver advertises `elicitation.form` (RFC-0009 [0009-018]) and relays both channels (RFC-0009 [0009-088]). Omp starts under this mode without a further gate; the allow path is verified by stub (0006-029).
 - [0006-026] Claude Code (`claude-agent-acp`): the supervisor MUST set `permissions.defaultMode` to `default` in `CLAUDE_CONFIG_DIR/settings.json` (RFC-0009 [0009-084]). The `_meta.claudeCode.options.settings` override is ignored by adapter 0.97.0 (observed-with-stub, `docs/spikes/claude-acp.md`) and MUST NOT be relied on. The driver MUST NOT set `acceptEdits`, `bypassPermissions`, `dontAsk` or `auto`, or any mode that auto-accepts tool calls for a bus session (CAA-MODES, `acp-omp-claude.md` 4.3). A bus session that starts in a stricter mode than the card is acceptable.
 - [0006-027] Every `session/request_permission` MUST be answered with `outcome: selected` and an `optionId` offered in that request, or with `outcome: cancelled` (ACP-TOOL). The Worker MUST NOT answer with an option kind it did not authorize (0006-010).
-- [0006-028] On `session/cancel`, the driver MUST answer every pending `session/request_permission` with `cancelled` (`acp-omp-claude.md` 2.9) and every pending form elicitation with `{"action":"cancel"}` (0006-053). This answers the backend and closes open requests (0006-018).
-- [0006-029] Conformance gate for omp (see 0006-025): a test with a backend that issues a `read` tool call and a `write` tool call under `always-ask-cached`, with `elicitation.form` not advertised, MUST show that neither tool call proceeds. Observed-with-stub: write is denied and read fails (`docs/spikes/omp-acp.md` Q4). The allow path is not yet observed: a test with `elicitation.form` advertised MUST show that the write proceeds only after an operator `allow-once` through elicitation. Until the allow-path test passes on the target omp version, the omp agent MUST NOT start (RFC-0009 [0009-083]).
-- [0006-052] Form `elicitation/create` (sent only when the driver advertised `elicitation.form`, RFC-0009 [0009-018]) that correlates with a `tool_call` in the same session opens an approval request under 4.2. The Worker MUST take the tool, tier and summary from that `tool_call` (`toolCallId`, title, kind), never from the elicitation `message` or `requestedSchema`. The options offered to the operator are `allow-once` and `reject-once`; `allow-always` is never offered (0006-010). An elicitation with no matching `tool_call` MUST be declined and audited as `ELICITATION_UNCORRELATED`; no request opens.
-- [0006-053] The answer maps as follows. Operator `allow-once` answers `{"action":"accept","content":C}`, where C is built from the schema-declared boolean allow field (shape `[UNVERIFIED]`, Section 9 issue 10). Operator `reject-once` answers `{"action":"decline"}`. Cancel, expiry and session cancel (0006-028) answer `{"action":"cancel"}`. If the schema has no unambiguous allow field, the answer is `decline` and the audit reason is `ELICITATION_SCHEMA_UNSUPPORTED`; the Worker MUST NOT guess a field.
+- [0006-028] On `session/cancel`, the driver MUST answer every pending `session/request_permission` with `cancelled` (`acp-omp-claude.md` 2.9) and every pending form elicitation with `{"action":"cancel"}` (0006-053). An elicitation left unanswered after `session/cancel` breaks the omp session: the next prompt fails with `ACP cancel cleanup timed out`, then `Unsupported ACP session` (observed-with-stub, `docs/spikes/omp-acp.md` Q5). This answers the backend and closes open requests (0006-018).
+- [0006-029] Conformance gate for omp (see 0006-025), observed with stub (`docs/spikes/omp-acp.md` Q4, Q5): under `always-ask-cached` with `elicitation.form` not advertised, a write is denied and a read fails, so neither proceeds. With `elicitation.form` advertised, an operator `allow-once` (the once label, 0006-053) lets the write proceed, `reject-once` denies it, and `session/cancel` with the elicitation answered `cancel` ends the turn with the session still usable. Not verified: a real model run; per-path or folder keying of the cache; the other tool kinds (grep, glob, find); the Approve Directory option; omp's timeout for an unanswered elicitation. These are Section 9 issue 2. Until they close, `ask-all` stays undeclared for omp (0006-004).
+- [0006-052] Form `elicitation/create` (sent only when the driver advertised `elicitation.form`, RFC-0009 [0009-018]) opens an approval request under 4.2 when its `message` begins with the line `Allow tool: <name>`. The Worker takes the tier from `<name>` (0006-002) and takes the request summary from `<name>` alone. The rest of `message` is untrusted agent text: it MAY be shown to the operator, redacted under 0006-008, and it MUST NOT be used to decide or to choose an option. omp's elicitation has no `toolCallId`, title or kind, so the Worker cannot bind it to a `tool_call` (Section 9 issue 13). The driver keys the pending elicitation by its JSON-RPC `id`. The options offered to the operator are `allow-once` and `reject-once`; `allow-always` and every cache or always label are never offered (0006-010, 0006-057). An elicitation whose `message` has no `Allow tool:` first line MUST be declined and audited as `ELICITATION_UNCORRELATED`; no request opens.
+- [0006-053] The answer maps as follows. Operator `allow-once` answers `{"action":"accept","content":{"value":L}}`, where L is the enum label in `requestedSchema.properties.value.enum` that the request offers for a single approval (omp `always-ask-cached`: `Approve Once`; omp `always-ask`: `Approve`). The Worker MUST select L from the request and MUST NOT construct it. A label outside the enum is denied by omp (observed-with-stub), so the Worker MUST NOT send one. If the request offers no unambiguous once label, the answer is `decline` and the audit reason is `ELICITATION_SCHEMA_UNSUPPORTED`. Operator `reject-once` answers `{"action":"decline"}`. Cancel, expiry and session cancel (0006-028) answer `{"action":"cancel"}`.
 - [0006-054] An `elicitation/create` with any mode other than `form` MUST be answered `decline` and creates no request. `elicitation/complete` changes no approval state.
 - [0006-055] Permission options are selected by `kind`, not by id. The Worker answers with the offered option whose kind is `allow_once` or `reject_once`; if no option of that kind is offered, the answer is `cancelled`. The Worker MUST NOT select `allow_always` (including Claude's `allow-with-updates`). Claude option ids are passed through unchanged (observed-with-stub, `docs/spikes/claude-acp.md` Q4).
 - [0006-056] When the backend process exits or restarts, every open approval request for it is closed (CLOSED, RFC-0005) and no answer is sent. A later operator decision for a closed request is refused. A recovered agent session never inherits an open approval (RFC-0009 [0009-013]).
+- [0006-057] The Worker MUST NOT offer a cache or always option in `ask-all`, and MUST NOT offer one for the `exec` or `delete_or_move` tier, for any agent. Cache and always options are `allow_always` (any id) and omp labels such as `Approve File`, `Always Approve File`, `Approve Directory`, and `Approve write for this session`. In those cases only once options are offered (`allow-once`, `reject-once`).
 
 ### 4.6 Budget allowance and accounting
 
@@ -166,7 +178,7 @@ Hermes (A2A HTTP client and server, `hermes.md`):
 
 ACP agents (omp, claude-agent-acp):
 - They see `session/request_permission` for tool permissions, form `elicitation/create` for omp approvals (only when `elicitation.form` is advertised), and `session/cancel`. These are standard ACP. They never see budgets, lineage or fingerprints.
-- The omp risk in 0006-025 is the only place where a default answer could bypass the gate. It is gated by the conformance test in 0006-029, by the refuse-start gate in RFC-0009 [0009-083], and by the rule that an unanswered tool call is a fault.
+- The omp risk in 0006-025 is the only place where a default answer could bypass the gate. It is gated by the conformance test in 0006-029, by the omp mode rule in RFC-0009 [0009-083], and by the rule that an unanswered tool call is a fault.
 - Claude subagents keep running after a session cancel (`acp-omp-claude.md` 4.4). The Worker kills the session process at grace expiry (RFC-0005 [0005-037]), which bounds that spend and the wall time.
 
 ## 6. Security considerations
@@ -361,24 +373,21 @@ Stream end: this event carries `A2AB-Stream-End: true`.
 
 ### A.6 Form elicitation approval (omp, `ask-exec`)
 
-The matching tool call arrives first. Field names beyond `toolCallId`, `title`, `kind` and `status` are `[UNVERIFIED]` for omp's live run.
-
-```json
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"write notes.txt","kind":"edit","status":"pending"}}}
-```
-
-Agent to Worker driver (requires the driver to have advertised `elicitation.form`; RFC-0009 [0009-018]):
+The omp elicitation arrives with no preceding `tool_call` and no `toolCallId`. Field names are as observed with the stub (`docs/spikes/omp-acp.md` Q4); the message is shortened.
 
 ```json
 {"jsonrpc":"2.0","id":7,"method":"elicitation/create","params":{
-  "sessionId":"S","mode":"form","message":"Allow tool call?",
-  "requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean"}}}}}
+  "sessionId":"S","mode":"form",
+  "message":"Allow tool: write\nPath: notes.txt\nContent:\n...",
+  "requestedSchema":{"type":"object","properties":{"value":{"type":"string",
+    "enum":["Approve Directory: ...","Approve File","Always Approve File","Approve Once","Deny"]}},
+    "required":["value"]}}}
 ```
 
-The summary comes from the `tool_call` above, never from `message` or `requestedSchema` (0006-052). After the operator's allow-once decision (A.2), the driver answers (content shape `[UNVERIFIED]`, Section 9 issue 10):
+The driver opens a request for tool `write` (tier `write`, 0006-052). The summary is the tool name; the rest of the message is shown only as redacted, untrusted detail. After the operator's allow-once decision (A.2), the driver selects the once label from the enum and answers (observed-with-stub):
 
 ```json
-{"jsonrpc":"2.0","id":7,"result":{"action":"accept","content":{"approve":true}}}
+{"jsonrpc":"2.0","id":7,"result":{"action":"accept","content":{"value":"Approve Once"}}}
 ```
 
 Reject-once answers `{"action":"decline"}`. Expiry or session cancel answers `{"action":"cancel"}` (0006-053).
@@ -408,8 +417,8 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 |---|---|---|
 | 0006-001 | Backend tool call with no Worker answer; the tool call does not run | MUST |
 | 0006-002 | Unknown tool name gets tier exec; MCP tool gets at least write | MUST |
-| 0006-003 | Table test: each mode and tier produces the prompt or auto-allow in the table | MUST |
-| 0006-004 | Default mode ask-all for non-omp agents; omp starts with ask-exec; an unimplemented mode and ask-all declared for omp are refused | MUST |
+| 0006-003 | Table test: each mode and tier, in the generic table and the omp table, produces the prompt or auto-allow shown | MUST |
+| 0006-004 | Default mode ask-all for non-omp agents; omp starts with ask-exec; ask-all declared for omp is refused; an unimplemented mode is refused | MUST |
 | 0006-005 | Crash after commit and before publish; restart yields one request with one nonce | MUST |
 | 0006-006 | Request fields all present; expiry default 300 s; configured expiry outside 30 to 3600 s rejected | MUST |
 | 0006-007 | Request is INPUT_REQUIRED on the ev subject with A2AB-Stream-End true; no other subject used | MUST |
@@ -430,11 +439,11 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-022 | Fourth open request refused automatically with APPROVAL_FLOOD; task continues | MUST |
 | 0006-023 | Eleventh decision in a minute refused OVERLOADED with detail RATE_LIMITED; no state change | MUST |
 | 0006-024 | UI test: fields shown; no bulk approve; no preselected option | MUST |
-| 0006-025 | Omp session starts with approvalMode always-ask-cached (configured ask-exec); always-ask, write and yolo never set; omp start refused until omp_allow_path_verified is set (RFC-0009 [0009-083]); a write or exec that proceeds without an answered approval is BACKEND_CRASHED | MUST |
+| 0006-025 | Omp session starts with approvalMode always-ask-cached (configured ask-exec); always-ask, write and yolo never set; omp Start in any other mode refused; both channels relayed (0009-088); a write or exec that proceeds without an answered approval is BACKEND_CRASHED | MUST |
 | 0006-026 | Claude settings file under CLAUDE_CONFIG_DIR has permissions.defaultMode default; acceptEdits, bypassPermissions, dontAsk and auto never set; _meta override not relied on | MUST |
 | 0006-027 | Every request_permission answered with selected (offered id) or cancelled | MUST |
-| 0006-028 | session/cancel with a pending permission and a pending form elicitation; driver answers cancelled and cancel | MUST |
-| 0006-029 | Omp under always-ask-cached without elicitation.form: write denied and read not run; with elicitation advertised, write proceeds only after an operator allow (allow path not yet observed; required before omp starts) | MUST |
+| 0006-028 | session/cancel with a pending permission and a pending form elicitation; driver answers cancelled and cancel; the next omp prompt completes | MUST |
+| 0006-029 | Omp under always-ask-cached without elicitation.form: write denied and read not run; with elicitation advertised: write proceeds only after an operator allow-once, reject-once denies, and cancel ends the turn with the session usable. Residual items in issue 2 | MUST |
 | 0006-030 | Delegated message carries budget; receiver does not use a larger allowance than received | MUST |
 | 0006-031 | Root without budget gets configured defaults; with a budget gets the component-wise minimum | MUST |
 | 0006-032 | Zero means none (tool refused); sentinel rejected on non-root hop | MUST |
@@ -457,16 +466,17 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-049 | Required child FAILED; parent FAILED CHILD_FAILED with child id and code | MUST |
 | 0006-050 | Budget or loop trip cancels children; breaker trip leaves running tasks untouched | MUST |
 | 0006-051 | Decision with missing or different request_sha256 refused APPROVAL_NOT_APPLICABLE with no state change; matching digest honored | MUST |
-| 0006-052 | Form elicitation with a matching tool_call opens a request; summary and tier come from the tool_call; no matching call gives decline with ELICITATION_UNCORRELATED; no allow_always offered | MUST |
-| 0006-053 | Operator allow-once gives accept with content from the schema allow field; reject-once gives decline; cancel, expiry and session cancel give cancel; no unambiguous allow field gives decline with ELICITATION_SCHEMA_UNSUPPORTED | MUST |
+| 0006-052 | Form elicitation whose message starts `Allow tool: <name>` opens a request; tier and summary come from the name only; no such line gives decline with ELICITATION_UNCORRELATED; answer keyed by JSON-RPC id; no allow_always or cache label offered | MUST |
+| 0006-053 | Operator allow-once gives accept with content.value equal to the once label in requestedSchema; reject-once gives decline; cancel, expiry and session cancel give cancel; no once label gives decline with ELICITATION_SCHEMA_UNSUPPORTED | MUST |
 | 0006-054 | Elicitation in any mode other than form is declined with no request; elicitation/complete changes no approval state | MUST |
 | 0006-055 | Permission answer selects the offered option by kind (allow_once or reject_once); no option of that kind gives cancelled; allow_always never selected; Claude ids passed through | MUST |
 | 0006-056 | Backend exit or restart closes open requests with no answer sent; later decision for a closed request refused; recovered session holds no open approval | MUST |
+| 0006-057 | In ask-all, and for exec or delete_or_move, only allow-once and reject-once are offered; no allow_always or cache label is sent | MUST |
 
 ## 9. Open issues
 
 1. **Integrator request: new transition.** `(create) -> FAILED` with LOOP_DETECTED (0006-045) is not in the original RFC-0005 table. Default: LifecycleAuthor added the row to RFC-0005 Table 4.2; integrator to confirm.
-2. **Omp approval path.** Observed-with-stub (`docs/spikes/omp-acp.md` Q4): without `elicitation.form`, omp denies `write` outright and fails `read` under `always-ask-cached`; `always-ask` auto-approves `read`. Not observed: a successful allow through elicitation, omp's elicitation cancel answer, and the omp error code for an undeclared method. Default: as 0006-025, 0006-029 and RFC-0009 [0009-083] (omp refuse-start gate). Owner: RFC-0009 driver.
+2. **Omp approval path.** Verified by stub (`docs/spikes/omp-acp.md` Q4, Q5 and gating table): under `always-ask-cached` without `elicitation.form`, omp denies `write` and fails `read`; with it, an allow-once through elicitation proceeds, reject-once denies, and session cancel with the elicitation answered `cancel` ends the turn with the session usable. `always-ask` runs `read` with no prompt. Still `[UNOBSERVED]`: a real model run; cache keying beyond tool name (per path or folder; `Approve Directory` untested); prompts for other tool kinds (grep, glob, find), which gate whether `ask-all` can be declared; omp's timeout for an unanswered elicitation (none within 40 s); omp's error code for an undeclared method (RFC-0009 issue 4). Default: 0006-025 and 0006-029; RFC-0009 [0009-083] starts omp in `always-ask-cached`. Owner: RFC-0009 driver.
 3. **Approval expiry default.** Default: 300 seconds (0006-006). Operator-tunable within 30 to 3600 seconds.
 4. **Fatigue thresholds.** Defaults: 3 open requests per task, 10 decisions per minute per tenant, 30 s coalescing. Tune after M1 measurement.
 5. **Breaker thresholds.** Defaults: 3 failures in 10 minutes, open for 10 minutes (0006-048). Breaker state location: RFC-0005 store.
@@ -474,6 +484,7 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 7. **Token metering per backend.** Default: per-turn counts from the backend where available; otherwise unmetered and enforced only by wall, hops and depth (0006-037). RFC-0009 owns the per-backend source table.
 8. **Operator identity format.** Default: owned by RFC-0007. This RFC requires only that decided_by be the verified identity string.
 9. **Minted grant token not bound to the decision.** Default: not bound in M1. The decision binds the grant through `request_sha256` (0006-051), the operator signature, and the fields tool, tier, summary, chain and expiry. The root grant token bytes are not in `ApprovalRequest`, so a token digest is not checked. Owner: RFC-0007 token minting. Revisit if a token digest field is required in the request or decision.
-10. **Accept content shape.** `[UNVERIFIED]`: the `content` object for `accept` is built from the schema's boolean allow field (0006-053). No allow answer has been observed. Default: decline with `ELICITATION_SCHEMA_UNSUPPORTED` when the allow field is absent or not boolean. A live allow run decides the shape. Owner: RFC-0009 driver.
+10. **Accept content shape.** Resolved for the stub tier: the accept `content` is `{"value": <label>}`, with the label taken from `requestedSchema` (observed-with-stub, `docs/spikes/omp-acp.md` Q4; a label outside the enum is denied). Real-model runs are `[UNOBSERVED]`. Default: 0006-053. Owner: RFC-0009 driver.
 11. **Cost cumulative per session.** Stub: `usage_update.cost` reads as a cumulative sample (RFC-0009 [0009-056]). Whether it is cumulative per session on the real tier is `[UNOBSERVED]`. Default: charge high-water differences (0006-037); a decreasing sample charges nothing and records a fault.
-12. **Ask-exec write column.** The 0006-003 table shows write auto-allow under `ask-exec`, but observed omp denial without elicitation (Q4) shows omp writes are gated. Default: 0006-025 governs omp (every omp write is operator-gated). Whether the table row changes for other backends is for RFC-0003 and the integrator.
+12. **Ask-exec write column.** Resolved for omp: the omp table in 0006-003 governs, and every omp write and read is operator-gated. The generic `ask-exec` row still shows write auto-allow for other backends. Whether that row changes is for RFC-0003 and the integrator.
+13. **Elicitation binding.** omp's elicitation carries no `toolCallId` or tool name field. The bus binds the decision to the request by JSON-RPC `id` and to the tool name on the message's first line (0006-052). The message is agent-controlled, so the detail shown may not match the call omp runs. Default: accept this residual risk for M1 with once options only (0006-057). Revisit if omp adds a tool call id to elicitation. Owner: RFC-0006 and RFC-0009 driver.

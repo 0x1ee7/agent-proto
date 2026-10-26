@@ -121,7 +121,7 @@ Worked example (language-neutral JSON form of a driver event, omp turn 3):
 ### 4.4 Agent sessions and restore
 
 - [0009-012] The driver MUST key agent sessions by A2A `context_id`: one agent session per `context_id` per driver instance. The driver reports the agent session handle in a `Status` event of kind `SessionBound`. The worker persists the mapping in its state directory (RFC-0012 owns the directory).
-- [0009-013] On `Start` with a `context_id` that has a stored handle, the driver MUST try restore in this order: `session/load` if `agentCapabilities.loadSession` is true; else `session/resume` if `sessionCapabilities.resume` is present; else a new session. When restore fails, or the agent answers `ACP session not found` to `session/load` or `session/resume` (omp does this after a completed turn in a new process; observed-with-stub), the driver MUST treat the session as new, MUST emit a `Status` notice that prior context was not restored, and MUST NOT let the worker report restored context. The worker then rebuilds the context from the Worker task history on the bus and MUST NOT assume resume.
+- [0009-013] On `Start` with a `context_id` that has a stored handle, the driver MUST try restore in this order: `session/load` if `agentCapabilities.loadSession` is true; else `session/resume` if `sessionCapabilities.resume` is present; else a new session. When restore fails, or the agent answers `ACP session not found` or `ACP session load was cancelled` to `session/load` or `session/resume`, the driver MUST treat the session as new, MUST emit a `Status` notice that prior context was not restored, and MUST NOT let the worker report restored context. The worker then rebuilds the context from the Worker task history on the bus and MUST NOT assume resume. Omp returns these answers when the launch or directory conditions of 0009-087 do not hold (observed-with-stub).
 - [0009-014] A turn that was in flight at a crash MUST NOT be replayed on restore. It ends with `Failed` `BACKEND_CRASHED` (Section 4.11).
 
 ### 4.5 driver-acp
@@ -130,7 +130,7 @@ Worked example (language-neutral JSON form of a driver event, omp turn 3):
 
 - [0009-015] `driver-acp` MUST act as an ACP client using JSON-RPC 2.0 over the agent child process stdio with ACP stdio framing.
 - [0009-016] The driver MUST negotiate `protocolVersion` 1 during `initialize`. If the agent returns any other version, the driver MUST close the connection, emit `Fault`, and MUST NOT start a turn. ACP v2 is not used in M1.
-- [0009-017] Paths sent to an agent MUST be absolute. `session/new` MUST send `cwd` set to the worker's workspace root (RFC-0012, L16) and `mcpServers` as an array. The array is empty unless RFC-0007 provides MCP entries, because ACP sessions do not discover MCP servers on disk. An MCP entry counts as available only after a probe call confirms its tools: omp returned success from `session/new` for an MCP server whose command did not exist (observed-with-stub).
+- [0009-017] Paths sent to an agent MUST be absolute. `session/new` MUST send `cwd` set to the worker's workspace root (RFC-0012, L16) and `mcpServers` as an array. The array is empty unless RFC-0007 provides MCP entries, because ACP sessions do not discover MCP servers on disk. An MCP entry counts as available only after a probe call confirms its tools: omp returned success from `session/new` for an MCP server whose command did not exist (observed-with-stub). The `cwd` of an omp session MUST be the same on every restart (0009-087).
 
 Worked example (ACP requests from driver to omp; fields abbreviated):
 
@@ -149,9 +149,9 @@ Worked example (ACP requests from driver to omp; fields abbreviated):
 
 #### 4.5.2 Client capabilities
 
-- [0009-018] `clientCapabilities` MUST declare `fs.readTextFile` false, `fs.writeTextFile` false, `terminal` false, and `auth.terminal` false. It MUST declare `elicitation` with `form` (an empty object), because omp sends generic approvals only as form elicitation when that capability is present (`docs/spikes/omp-acp.md` Q4). It MUST NOT declare `elicitation.url` or any other elicitation mode.
+- [0009-018] `clientCapabilities` MUST declare `fs.readTextFile` false, `fs.writeTextFile` false, `terminal` false, and `auth.terminal` false. It MUST declare `elicitation` with `form` (an empty object), because omp sends its read and write approvals as form elicitation only when that capability is present; without it omp denies them outright (`docs/spikes/omp-acp.md` Q4). It MUST NOT declare `elicitation.url` or any other elicitation mode.
 
-The consequence is deliberate: agents use their own file and shell tools. The approval gate covers permissions an agent raises through `session/request_permission` (Claude; omp bash `prompt` policies are `[UNOBSERVED]`) and form elicitations (omp write and exec approvals, 0009-082). Section 6 records this as a trade-off.
+The consequence is deliberate: agents use their own file and shell tools. The approval gate covers permissions an agent raises through `session/request_permission` (Claude; omp bash approvals, observed-with-stub) and form elicitations (omp read and write approvals, 0009-082). Section 6 records this as a trade-off.
 
 - [0009-019] If an agent calls a client method that was not declared (file, terminal, or any unlisted client method other than `elicitation/create`), the driver MUST reply with a JSON-RPC error and MUST NOT perform the operation. `elicitation/create` is answered under 0009-082. The error code is -32601 (method not found), which is `[UNVERIFIED]` against omp's own error (Section 9 issue 4).
 
@@ -226,20 +226,23 @@ On timeout or cancel, the answer is `{"outcome":{"outcome":"cancelled"}}`.
 
 The worker turns the `PermissionRequest` into `INPUT_REQUIRED` plus the approval extension (RFC-0005, RFC-0006, L7, L10). The approval extension schema belongs to RFC-0006.
 
-- [0009-082] `elicitation/create` with `mode` `form` MUST map to `PermissionRequest` (Section 4.5.5) with a `request_id`, a kind of `form-elicitation`, and an empty tool summary. The worker takes the summary from the matching `tool_call` (RFC-0006 0006-052). The driver MUST NOT use the elicitation `message` or `requestedSchema` text as an approval summary. The driver answers only after `ResolvePermission` or its permission timeout (0009-033). A `ResolvePermission` naming `allow-once` gives an `accept` result whose content is built as RFC-0006 0006-053 defines; `reject-once` gives `decline`; `cancelled`, including a session cancel (0009-035), gives `cancel`. If the schema has no unambiguous allow field, the driver answers `decline` and raises `Fault` `elicitation-schema-unsupported`. An `elicitation/create` with any mode other than `form` MUST be answered `decline` with no `PermissionRequest` (RFC-0006 0006-054). `elicitation/complete` changes no state.
+- [0009-082] `elicitation/create` with `mode` `form` MUST map to `PermissionRequest` (Section 4.5.5) with a `request_id`, a kind of `form-elicitation`, and a tool summary built only from the tool name on the first line of `message` (`Allow tool: <name>`; RFC-0006 0006-052). An elicitation whose `message` has no such first line MUST be answered `decline` with no `PermissionRequest`. The rest of `message` and all of `requestedSchema` are untrusted text: they MUST NOT be used as the approval summary, as a decision input, or to choose an answer. The driver keys the pending elicitation by its JSON-RPC `id` and ignores an answer for an `id` it does not hold open. The driver answers only after `ResolvePermission` or its permission timeout (0009-033). A `ResolvePermission` naming `allow-once` gives an `accept` result with `content` `{"value": L}`, where L is the enum label in `requestedSchema` that offers a single approval, selected from the request and never constructed (RFC-0006 0006-053). A label outside the enum MUST NOT be sent: omp denies it (observed-with-stub). `reject-once` gives `decline`; `cancelled`, including a session cancel (0009-035), gives `cancel`. If the request offers no unambiguous once label, the driver answers `decline` and raises `Fault` `elicitation-schema-unsupported`. An `elicitation/create` with any mode other than `form` MUST be answered `decline` with no `PermissionRequest` (RFC-0006 0006-054). `elicitation/complete` changes no state.
 
-Worked example (form elicitation from omp; field names beyond `mode` and `message` are `[UNVERIFIED]`):
+Worked example (form elicitation from omp, observed with the stub; `message` abbreviated):
 
 ```json
 {"jsonrpc":"2.0","id":"e-1","method":"elicitation/create",
- "params":{"sessionId":"sess_01","mode":"form","message":"Allow tool call tc_9?",
-   "requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean"}}}}}}
+ "params":{"sessionId":"sess_01","mode":"form",
+   "message":"Allow tool: write\nReason: target not yet approved\n...",
+   "requestedSchema":{"type":"object","properties":{"value":{"type":"string",
+     "enum":["Approve Directory: ...","Approve File","Always Approve File","Approve Once","Deny"]}},
+     "required":["value"]}}}
 ```
 
-The worker's `allow-once` decision produces (accept content shape `[UNVERIFIED]`, RFC-0006 issue 10):
+The worker's `allow-once` decision selects the once label from the enum (observed-with-stub):
 
 ```json
-{"jsonrpc":"2.0","id":"e-1","result":{"action":"accept","content":{"approve":true}}}
+{"jsonrpc":"2.0","id":"e-1","result":{"action":"accept","content":{"value":"Approve Once"}}}
 ```
 
 After `reject-once`:
@@ -248,9 +251,11 @@ After `reject-once`:
 {"jsonrpc":"2.0","id":"e-1","result":{"action":"decline"}}
 ```
 
+- [0009-088] For omp, the driver MUST relay both approval channels: form elicitation (0009-082) and `session/request_permission` (0009-032). It MUST NOT suppress or auto-answer either one. The channel for each tool kind follows the omp table in RFC-0006 0006-003.
+
 #### 4.5.6 Cancel
 
-- [0009-035] On `Cancel`, the driver MUST send a `session/cancel` notification for the session. It MUST answer every pending `session/request_permission` with `cancelled` and every pending form elicitation with `cancel` (0009-082). It MUST emit `Status` `Progress` for each open tool call with status `failed` and detail `canceled`, because ACP has no cancelled tool status. It MUST then await the `stopReason` of the pending prompt. Claude returned `cancelled` within about 30 ms even with an unanswered permission request (observed-with-stub).
+- [0009-035] On `Cancel`, the driver MUST send a `session/cancel` notification for the session. It MUST then answer every pending `session/request_permission` with `cancelled` and every pending form elicitation with `cancel` (0009-082). An elicitation left unanswered after `session/cancel` breaks the omp session: the next prompt fails with `ACP cancel cleanup timed out`, then `Unsupported ACP session` (observed-with-stub, `docs/spikes/omp-acp.md` Q5). It MUST emit `Status` `Progress` for each open tool call with status `failed` and detail `canceled`, because ACP has no cancelled tool status. It MUST then await the `stopReason` of the pending prompt. Claude returned `cancelled` within about 30 ms even with an unanswered permission request (observed-with-stub).
 - [0009-036] If the pending prompt does not return within `cancel_grace` (default 10 seconds), the driver MUST terminate the agent process tree (Section 4.8), emit `Terminal` `Canceled`, and apply the restart policy. A `Canceled` terminal MUST be emitted in all cases, so the turn ends within the bound (M1-8).
 
 Worked example (cancel on the wire):
@@ -265,7 +270,9 @@ The agent then returns `{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelle
 
 - [0009-037] The driver MUST spawn agent executables by absolute path without a shell. Shell strings, `cmd /c`, and shell interpolation MUST NOT be used.
 - [0009-038] On Windows, claude-agent-acp MUST be launched as `node <absolute path to the package entry>` rather than through `cmd /c npx`. This launch form was observed with the stub (`docs/spikes/claude-acp.md`). The bin name is `claude-agent-acp` (verified against the published package, v0.97.0). The package entry is `dist/index.js` in the notes' example; the Windows install path is `[UNVERIFIED]` (Section 9).
-- [0009-039] omp MUST be launched as `omp --mode acp --cwd <workspace root> --session-dir <dir> --approval-mode ask-exec` (or `omp acp` with `--config` when an overlay file is needed). The driver MUST pass `--approval-mode` explicitly on every launch and MUST NOT rely on the schema default. Under ACP, write and exec approvals arrive as form elicitation (0009-082); `session/request_permission` covers only bash `prompt` policies, which are `[UNOBSERVED]`.
+- [0009-039] omp MUST be launched as `omp --mode acp --cwd <workspace root> --approval-mode ask-exec` (or `omp acp` with `--config` when an overlay file is needed). The driver MUST NOT pass `--session-dir` (0009-087). The driver MUST pass `--approval-mode` explicitly on every launch and MUST NOT rely on the schema default. Under ACP, read and write approvals arrive as form elicitation under `always-ask-cached` (0009-082), and exec (bash) approvals arrive as `session/request_permission` (0009-088).
+
+- [0009-087] omp session persistence. The driver MUST NOT pass `--session-dir` to omp. The supervisor MUST keep one `PI_CODING_AGENT_DIR` per agent, unchanged across restarts (RFC-0012 [0012-063]), and the driver MUST send the same workspace `cwd` on every restart. Observed with the stub (`docs/spikes/omp-acp.md` Q7): with the default session directory, the same `PI_CODING_AGENT_DIR` and the same `cwd`, `session/load` and `session/resume` restored the session and the next prompt ended `end_turn`. With `--session-dir`, the same restart got `ACP session not found`. A different `cwd` got `ACP session load was cancelled` (cause `[UNOBSERVED]`); a different `PI_CODING_AGENT_DIR` got `ACP session not found`.
 
 ### 4.6 driver-a2a-http
 
@@ -359,14 +366,14 @@ stateDiagram-v2
 - [0009-063] Allowed canonical modes are: omp `always-ask-cached` (configured as `ask-exec`); claude `default` and `plan`. Dangerous canonical modes are: omp `write` and `yolo`; claude `acceptEdits`, `bypassPermissions`, `dontAsk`, and `auto`. Claude alias `bypass` MUST be canonicalized to `bypassPermissions` before any check. Any mode in neither list, including omp `always-ask` (under which omp auto-approves read; observed-with-stub), MUST be refused as `config-refused`.
 - [0009-064] `Start` of an agent whose configured mode is not in the allowed set MUST be refused. The refusal is a `Fault` of kind `config-refused`. The only exception is an operator config that names the exact dangerous mode and sets `acknowledge_dangerous` true.
 - [0009-065] The mode MUST come from operator config only. The driver MUST NOT set a mode from an agent card, a peer request, or task content. Cards are not trusted for this (RFC-0007).
-- [0009-066] The resolved canonical mode MUST be recorded on the card as the `approvalMode` parameter of the `urn:a2abus:ext:approval:1` entry (written by the supervisor), and in every `PermissionRequest` the driver emits. The card field shape is for RFC-0003 and RFC-0006 to confirm (Section 9).
+- [0009-066] The card value of the resolved mode MUST be recorded on the card as the `approvalMode` parameter of the `urn:a2abus:ext:approval:1` entry (written by the supervisor). For omp this is `ask-exec`, which maps to canonical `always-ask-cached`. Every `PermissionRequest` the driver emits carries the same `approvalMode`. The card field shape is for RFC-0003 and RFC-0006 to confirm (Section 9).
 - [0009-067] If the agent switches into a dangerous mode during a session (ACP `switch_mode` tool kind, or any mode notification into the dangerous set), the driver MUST refuse the switch, cancel the turn (Section 4.5.6), and emit `Fault` of kind `config-refused`.
-- [0009-083] The driver MUST refuse to start an omp agent (`Fault` `config-refused`) unless the operator config sets `omp_allow_path_verified` true. The operator sets it only after the omp allow-path case of RFC-0006 0006-029 has passed on the omp version in use and the result is recorded in the lab record. The default is false. Until then the omp card carries no `approvalMode`. This keeps an omp card from claiming an approval gate whose allow path is unobserved.
+- [0009-083] The driver MUST start omp only in `always-ask-cached` (configured as `ask-exec`) and MUST NOT declare the omp `ask-all` mode. Omp `ask-all` stays undeclared until every tool kind omp runs (including grep, glob and find, `[UNOBSERVED]`) is observed to surface an approval prompt (RFC-0006 0006-004, D21). The omp allow path is verified by stub (RFC-0006 0006-029); the residual items are in RFC-0006 issue 2. The omp card carries `approvalMode` `ask-exec`, the card value that maps to `always-ask-cached` (RFC-0006 0006-003).
 
 Worked example (card extension entry, shape proposed):
 
 ```json
-{"urn:a2abus:ext:approval:1":{"approvalMode":"always-ask"}}
+{"urn:a2abus:ext:approval:1":{"approvalMode":"always-ask-cached"}}
 ```
 
 ### 4.10 Environment and credentials
@@ -398,7 +405,7 @@ The driver produces the reason tokens below. Reason tokens are carried in the `a
 ### 4.12 Contract suite and mock backend
 
 - [0009-073] The `Backend` contract suite MUST live in `a2a-conformance` and MUST run against any `Backend` implementation. It drives a deterministic scripted mock backend, and runs the same cases against each real driver where the case applies.
-- [0009-074] The mock MUST be able to inject: a crash mid-turn; duplicate events; a delayed permission request; a cancel race; a restart with load; an unsupported `protocolVersion`; unknown `sessionUpdate` kinds and unknown enum strings (which MUST be ignored); stdout end-of-file; a JSON-RPC error on prompt; a peer returning `REJECTED` or `FAILED`; a form `elicitation/create` with a matching tool call; an `ACP session not found` answer to load or resume; and a task id from another origin.
+- [0009-074] The mock MUST be able to inject: a crash mid-turn; duplicate events; a delayed permission request; a cancel race; a restart with load; an unsupported `protocolVersion`; unknown `sessionUpdate` kinds and unknown enum strings (which MUST be ignored); stdout end-of-file; a JSON-RPC error on prompt; a peer returning `REJECTED` or `FAILED`; a form `elicitation/create` whose message starts with `Allow tool:`; an `ACP session not found` answer to load or resume; and a task id from another origin.
 - [0009-075] For every case, the suite MUST assert: `event_no` is strictly increasing per turn; exactly one `Terminal` per turn; no event after `Terminal`; `Cancel` produces `Canceled` within `cancel_grace`; and the reason token is in Section 4.11.
 
 ## 5. Interoperability
@@ -410,7 +417,7 @@ What each peer sees from this design.
 | Stock A2A v1.0 client | Nothing of the drivers. It talks to the gateway (RFC-0008) and sees standard A2A states and artifacts. | Tool-call detail is status metadata only. | Drivers never emit A2A-invalid shapes. Extension data lives only under extension URIs (RFC-0001). |
 | Hermes (as A2A peer) | `driver-a2a-http` is a standard A2A HTTP client: `SendMessage`, `A2A-Version: 1.0`, `ROLE_USER` text parts, a contextId namespaced per bus origin (0009-076), and `GetTask` or `SubscribeToTask` only for tasks it created (0009-077). | No `A2A-Extensions` header, no bus metadata, no budget or provenance sent. Peer sees a derived contextId, not the bus context id. | Matches the body and headers recorded in `docs/interop/hermes.md` section 8.3. Peer-side budgets are enforced locally (L9). Anti-loop cap is respected by reusing `messageId` on resend (0009-045). Peer error shapes are tolerated (0009-079). |
 | Hermes (as A2A server, reached through gateway) | Not applicable. The driver is the client. | Not applicable. | See RFC-0008 for the server-side profile. |
-| omp (ACP agent) | An ACP client on protocol version 1 that declares `elicitation.form` and no fs, terminal, or auth terminal capability; `cwd` set to the workspace; `mcpServers` from RFC-0007 only, after a probe call (0009-017). | omp's own file and shell tools run without client mediation. Write and exec approvals arrive as form elicitation; bash `prompt` policies use `session/request_permission` (`[UNOBSERVED]`). | Explicit `--approval-mode ask-exec` (0009-039). omp refused until the allow path is recorded (0009-083). Refuse-start for dangerous modes (0009-064). Cancel path ends every turn (0009-035). |
+| omp (ACP agent) | An ACP client on protocol version 1 that declares `elicitation.form` and no fs, terminal, or auth terminal capability; `cwd` set to the workspace; `mcpServers` from RFC-0007 only, after a probe call (0009-017). | omp's own file and shell tools run without client mediation. Read and write approvals arrive as form elicitation under `always-ask-cached`; bash approvals use `session/request_permission` (0009-088). | Explicit `--approval-mode ask-exec` (0009-039) and no `--session-dir` (0009-087). Start only in `always-ask-cached` (0009-083). Refuse-start for dangerous modes (0009-064). Cancel path ends every turn (0009-035). |
 | claude-agent-acp (ACP agent) | The same ACP client profile as omp, with `session/request_permission` for approvals. Default mode is set in the supervisor-owned settings file (0009-084). | Same as omp for file and shell tools. Background subagents keep running after `session/cancel` in the notes (`docs/interop/acp-omp-claude.md`); the driver cannot stop them through ACP. | The worker's turn deadline and the supervisor's process-tree kill (0009-036, 0009-060) bound them. Open issue in Section 9. |
 
 Notes on what each ACP agent may do with an unknown client method: it may fail its own operation (0009-019). That is the expected result of declaring no fs or terminal capability and is recorded in the trade-offs. `elicitation/create` in form mode is answered under 0009-082, not refused.
@@ -419,11 +426,11 @@ Notes on what each ACP agent may do with an unknown client method: it may fail i
 
 | Threat (`docs/requirements.md` section 8) | Addressed by |
 |---|---|
-| T1 prompt injection through agent or peer output | Untrusted-content marking (0009-031). No text rewriting beyond redaction. Thought chunks off by default (0009-026). Peer text never parsed for control state (0009-048). Elicitation text is untrusted and never an approval summary (0009-082). Hermes card text sanitized before publication (0009-081). |
+| T1 prompt injection through agent or peer output | Untrusted-content marking (0009-031). No text rewriting beyond redaction. Thought chunks off by default (0009-026). Peer text never parsed for control state (0009-048). Elicitation text is untrusted; only its `Allow tool:` name line feeds the summary (0009-082). Hermes card text sanitized before publication (0009-081). |
 | T3 cost runaway | Turn and wall-time counters from the driver (0009-055). Caps are enforced by the worker (RFC-0006). Token caps only where tokens are metered (0009-057, 0009-058). |
 | T5 credential leakage | Fixed environment allowlist (0009-068). Supervisor strips provider key variables unless the operator allows them (0009-069). Driver never reads key values. Redaction of events and errors (0009-070). Bearer tokens refused over cleartext (0009-052). First auth status is non-authoritative (0009-085). |
 | T14 driver as confused deputy | One driver per agent (0009-003). No shared state (0009-004). Child runs as the same OS user, with no widened privileges (0009-037). A driver answers permissions and elicitations only from `ResolvePermission` or its own timeout (0009-033, 0009-082). |
-| T15 approval bypass through agent-native modes | Allowed and dangerous mode lists (0009-063). Refuse-start (0009-064). Mode from operator config only (0009-065). Mid-session switch into a dangerous mode refused (0009-067). Explicit `--approval-mode` (0009-039). omp refused until the allow path is recorded (0009-083). Claude default mode set in the supervisor-owned settings file (0009-084). Recorded mode on the card and in every permission event (0009-066). |
+| T15 approval bypass through agent-native modes | Allowed and dangerous mode lists (0009-063). Refuse-start (0009-064). Mode from operator config only (0009-065). Mid-session switch into a dangerous mode refused (0009-067). Explicit `--approval-mode` (0009-039). omp started only in `always-ask-cached` (0009-083). Claude default mode set in the supervisor-owned settings file (0009-084). Recorded mode on the card and in every permission event (0009-066). |
 | M1-1 no orphan processes | Shutdown on worker exit (0009-060). Job object or process group (0009-059). |
 | M1-6 permission flow, default deny | Exactly-once answer, default cancelled on timeout (0009-033). No default `allow_always` (0009-034). Form elicitation answered from the same path (0009-082). |
 | M1-8 cancel ends the turn | Cancel path and grace bound (0009-035, 0009-036). |
@@ -435,7 +442,7 @@ Attack classes, described without payloads:
 - An agent could try to switch its own mode to a dangerous one mid-session. Refused and cancelled (0009-067).
 - An agent could call a client method it was never offered, hoping the driver performs a file or shell operation. The driver refuses (0009-019).
 - A peer could return a reply whose context identifier differs from the one sent, to inject into another conversation. Rejected (0009-046).
-- An agent could send an elicitation whose text misstates the tool it asks about. The driver forwards no elicitation text as an approval summary; the worker takes the summary from the matching tool call (0009-082, RFC-0006 0006-052).
+- An agent could send an elicitation whose text misstates the action it asks about. The driver uses only the `Allow tool:` name line as the summary and never as a decision input. omp gives no tool call id, so the approval cannot be bound to one tool call (0009-082, RFC-0006 0006-052; Section 9 issue 24).
 - A peer could read or cancel another origin's task through a shared Hermes context. Rejected by 0009-076 and 0009-077.
 
 Trade-off recorded deliberately: declaring no fs or terminal capability (0009-018) means agents use their own file and shell tools. The gate covers the permission requests an agent raises through `session/request_permission` and form elicitations (0009-082). This is a weaker gate than mediating file and terminal calls, and it is accepted for M1 because mediated calls would require a much larger client surface. The conformance suite must test that unadvertised methods are refused (Section 8).
@@ -450,7 +457,7 @@ Trade-off recorded deliberately: declaring no fs or terminal capability (0009-01
 - **Usage counters from the driver, caps from the worker.** The driver reports what it can measure. Enforcement sits in one place (RFC-0006), so a driver bug cannot widen a budget.
 - **Headless claude as a fallback driver was rejected for M1.** Its stop behavior on Windows is unverified (`docs/interop/acp-omp-claude.md`), and it adds a second claude path with its own permissions. See Section 9.
 - **Token estimation was rejected.** An estimate would look like a meter and would be wrong. D13 requires metering from agent usage events.
-- **Form elicitation for omp approvals.** omp sends generic write and exec approvals only as form elicitation when the client advertises `elicitation.form` (`docs/spikes/omp-acp.md` Q4). Declaring it is the only route to an approval gate on omp short of `yolo`, which removes the gate and is refused (0009-063).
+- **Form elicitation for omp approvals.** omp sends read and write approvals as form elicitation only when the client advertises `elicitation.form`, and denies them outright without it; bash approvals use `session/request_permission` (`docs/spikes/omp-acp.md` Q4). Declaring it is the only route to an approval gate on omp short of `yolo`, which removes the gate and is refused (0009-063).
 - **Namespacing and visibility in the bridge.** Hermes shares model history by contextId and returns other origins' tasks (`docs/spikes/hermes-a2a.md` Q6). Relying on Hermes isolation would fail, so the bridge enforces it (0009-076, 0009-077).
 
 ## 8. Conformance
@@ -471,11 +478,11 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-010 | `ResolvePermission` with an unknown id; no event emitted. | contract |
 | 0009-011 | `Capabilities` returns all six fields for each driver. | contract |
 | 0009-012 | Two `Start` calls on one `context_id` reuse one session; `SessionBound` persisted. | contract |
-| 0009-013 | Restore order: `loadSession` true uses `session/load`; only `resume` uses `session/resume`; neither gives a new session with a notice. `ACP session not found` on load or resume gives a new session with a notice and no restored-context claim. | contract |
+| 0009-013 | Restore order: `loadSession` true uses `session/load`; only `resume` uses `session/resume`; neither gives a new session with a notice. `ACP session not found` or `ACP session load was cancelled` on load or resume gives a new session with a notice and no restored-context claim. | contract |
 | 0009-014 | Crash mid-turn after restart; the in-flight turn is `Failed` `BACKEND_CRASHED`, not replayed. | driver |
 | 0009-015 | Frame parser test with split and joined messages on stdio. | contract |
 | 0009-016 | Stub agent answers `protocolVersion` 2; driver closes and emits `Fault`. | contract |
-| 0009-017 | `session/new` request has absolute `cwd` and array `mcpServers`; a configured MCP entry is used only after a probe call confirms its tools. | contract |
+| 0009-017 | `session/new` request has absolute `cwd` and array `mcpServers`; a configured MCP entry is used only after a probe call confirms its tools; omp `cwd` is unchanged across restarts (0009-087). | contract |
 | 0009-018 | `initialize` request has `fs` false, `terminal` false, `auth.terminal` false, and `elicitation.form` present; no `elicitation.url`. | contract |
 | 0009-019 | Stub agent calls `fs/read_text_file` and an undeclared `terminal/create`; driver replies with an error and performs no operation. `elicitation/create` is covered by 0009-082. | contract |
 | 0009-020 | Second `Start` while a prompt is open is rejected by the driver. | contract |
@@ -493,11 +500,11 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-032 | Permission request maps to `PermissionRequest` with a unique `request_id`, a redacted tool summary, and options with the agent's ids and kinds; Claude ids `allow-once`, `allow-with-updates`, `reject` are passed as received. | contract |
 | 0009-033 | Permission with no resolution is answered `cancelled` at `permission_timeout`; an option not offered is answered `cancelled`. | contract |
 | 0009-034 | No `allow_always` chosen without a `ResolvePermission` that names it. | contract |
-| 0009-035 | Cancel with an open permission, an open form elicitation, and an open tool call; `cancelled` and `cancel` answers sent, failed tool status emitted, `session/cancel` sent. | contract |
+| 0009-035 | Cancel with an open permission, an open form elicitation, and an open tool call; `session/cancel` sent, then `cancelled` and `cancel` answers, failed tool status emitted. Against omp, the next prompt completes after the elicitation is answered `cancel`. | contract |
 | 0009-036 | Agent ignores cancel; driver kills tree after `cancel_grace` and emits `Canceled`. | contract |
 | 0009-037 | Launch spec with a shell string is rejected at config load. | contract |
 | 0009-038 | Windows launch uses `node` with an absolute entry path; no `cmd /c`. | driver |
-| 0009-039 | Launch argv for omp includes `--mode acp`, `--cwd`, `--session-dir`, and `--approval-mode ask-exec`. | contract |
+| 0009-039 | Launch argv for omp includes `--mode acp`, `--cwd`, and `--approval-mode ask-exec`, and does not include `--session-dir`. | contract |
 | 0009-040 | Hermes request carries `A2A-Version: 1.0`; no `A2A-Extensions` or `urn:a2abus:` metadata appears on the wire. | contract |
 | 0009-041 | Card fetch with 404 on the primary path falls back to `agent.json`; card failure does not abort the turn. | contract |
 | 0009-042 | Configured tenant is sent in `params.tenant`; a mismatched echo is not treated as isolation (0009-080). | contract |
@@ -522,7 +529,7 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-061 | Repeated crash injection; delays are 1, 2, 4, then capped at 60 seconds; the fifth crash in 10 minutes enters Unhealthy. | contract |
 | 0009-062 | After restart, the driver sends no prior-turn input. | contract |
 | 0009-063 | Mode canonicalization: `bypass` resolves to `bypassPermissions`; each listed mode is classified as allowed or dangerous; a mode in neither list, including omp `always-ask`, is refused. | contract |
-| 0009-064 | Start with a dangerous mode and no acknowledgement is refused with `config-refused`; omp Start with `ask-exec` is refused until 0009-083 holds. | contract |
+| 0009-064 | Start with a dangerous mode and no acknowledgement is refused with `config-refused`; omp Start with `ask-exec` is allowed and omp Start with `ask-all` is refused (0009-083). | contract |
 | 0009-065 | Mode supplied by an agent card or task content is ignored. | contract |
 | 0009-066 | Card approval entry carries `approvalMode`; each permission event carries the same mode. | integration |
 | 0009-067 | Stub agent issues a `switch_mode` into a dangerous mode; switch refused, turn cancelled, `config-refused` fault. | contract |
@@ -540,18 +547,20 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-079 | Hermes `-32002` on `GetTask` or `SubscribeToTask` maps to `BACKEND_LOST_TASK`; `-32602` maps to `BACKEND_ERROR`; a peer error with no `error.data` is handled. | contract |
 | 0009-080 | A mismatched `params.tenant` echo is not treated as isolation; the driver sends only the configured tenant. | contract |
 | 0009-081 | An ingested Hermes card with card-level `security` and tool-name tags yields a bus card with no `security` and one coarse skill; the gateway HTTP view is unchanged (RFC-0008). | contract |
-| 0009-082 | Stub agent sends a form `elicitation/create` with a matching `tool_call`; `allow-once` answers `accept` with content per RFC-0006 0006-053, `reject-once` answers `decline`, cancel answers `cancel`; a non-form mode is declined with no event. | contract |
-| 0009-083 | omp `Start` with `omp_allow_path_verified` unset is refused with `config-refused`; the omp card carries no `approvalMode`. | contract |
+| 0009-082 | Stub agent sends a form `elicitation/create` whose message starts `Allow tool: write` and whose enum offers `Approve Once` and `Deny`; `allow-once` answers `accept` with `content.value` `Approve Once`; `reject-once` answers `decline`; cancel answers `cancel`; a label not in the enum is never sent; a message without the `Allow tool:` line is declined with no event; a non-form mode is declined with no event; an answer for an unknown JSON-RPC id is ignored. | contract |
+| 0009-083 | omp Start in `always-ask-cached` (card value `ask-exec`) is allowed; omp Start with `ask-all` is refused with `config-refused`; the omp card carries `approvalMode` `ask-exec`. | contract |
 | 0009-084 | Claude launch sets `CLAUDE_CONFIG_DIR`; the settings file contains `permissions.defaultMode` `default`; the `_meta` override is not relied on. | driver |
 | 0009-085 | An initialize-time `_auth/status_update` that disagrees with later state changes no driver or worker decision. | contract |
 | 0009-086 | Claude prompt usage is counted once per turn; a cancelled turn reports zero; `cost` samples are cumulative and the worker charges high-water differences (RFC-0006 0006-037). | contract |
+| 0009-087 | omp launch has no `--session-dir`; load and resume restore after restart with the same `PI_CODING_AGENT_DIR` and `cwd`; a different `cwd` or `PI_CODING_AGENT_DIR` gives the fresh-session outcome of 0009-013. | contract |
+| 0009-088 | omp bash approval arrives as `session/request_permission` and write and read approvals as form elicitation; both are answered and neither is suppressed. | contract |
 
 ## 9. Open issues
 
 Each issue has a default. The default applies until a lab run or a revision changes it.
 
-1. **omp approvals.** Resolved for the stub tier: omp sends write and exec approvals as form elicitation when the client advertises `elicitation.form` (observed-with-stub, `docs/spikes/omp-acp.md` Q4), and denies outright without it. Still `[UNVERIFIED]`: a successful allow through elicitation and the accepted content shape (RFC-0006 issue 10); bash `prompt` policies through `session/request_permission`. Default: the driver advertises `elicitation.form` (0009-018), maps form elicitation to `PermissionRequest` (0009-082), and refuses to start omp until the allow path is recorded (0009-083).
-2. **Session restore on claude and omp.** Stub tier: claude `session/load` and `session/resume` both restore after restart, and an unknown id returns `-32002` (`docs/spikes/claude-acp.md` Q7). omp `session/load` and `session/resume` return `ACP session not found` after a completed turn in a new process (`docs/spikes/omp-acp.md` Q7; cause `[UNVERIFIED]`). Live resume is `[UNOBSERVED]` for both. Default: `session/load`, then `session/resume`, then a new session with a notice; `not found` always means a new session (0009-013).
+1. **omp approvals.** Verified by stub (`docs/spikes/omp-acp.md` Q4 and gating table): read and write approvals arrive as form elicitation under `always-ask-cached`; bash approvals arrive as `session/request_permission` in every mode except `yolo`; allow-once through elicitation works with the enum label; decline, reject, and cancel answers behave as 0009-082 and 0009-035. Still `[UNOBSERVED]`: a real model run; cache keying beyond tool name; other tool kinds (grep, glob, find); omp's timeout for an unanswered elicitation (none within 40 s). Default: the driver advertises `elicitation.form` (0009-018), maps form elicitation to `PermissionRequest` (0009-082), relays both channels (0009-088), and starts omp in `always-ask-cached` (0009-083). The residual items are RFC-0006 issue 2.
+2. **Session restore on claude and omp.** Stub tier: claude `session/load` and `session/resume` both restore after restart, and an unknown id returns `-32002` (`docs/spikes/claude-acp.md` Q7). omp `session/load` and `session/resume` restore after restart only with the default session directory, the same `PI_CODING_AGENT_DIR`, and the same `cwd` (0009-087); with `--session-dir` they return `ACP session not found`. Why a different `cwd` gives `ACP session load was cancelled` is `[UNOBSERVED]` (`docs/spikes/omp-acp.md` Q7, blocker B3). Live resume with a real model is `[UNOBSERVED]`. Default: `session/load`, then `session/resume`, then a new session with a notice; `not found` and `load was cancelled` both mean a new session (0009-013).
 3. **omp `--no-ui` in ACP.** The behavior under ACP is `[UNVERIFIED]`. Default: the driver does not pass `--no-ui`; the gate relies on `--approval-mode ask-exec` and form elicitation (0009-039, 0009-082).
 4. **ACP error code for an unadvertised method.** omp's own error code is `[UNVERIFIED]`; the -32601 seen in the omp spike was the probe's answer, not omp's. Default: -32601 (0009-019). A lab run decides whether any agent needs another code.
 5. **claude-agent-acp bin name and Windows install.** The bin name `claude-agent-acp` is verified against the published package v0.97.0. Launch as `node <absolute entry>` on Windows is observed with the stub (`docs/spikes/claude-acp.md`). The Windows install path is `[UNVERIFIED]`. Default: resolve `dist/index.js` from the installed package root, and run `node` on that absolute path (0009-038).
@@ -572,6 +581,8 @@ Each issue has a default. The default applies until a lab run or a revision chan
 20. **Hermes cross-peer state.** Shared contextId history and cross-peer task visibility were observed on Hermes v0.22.5 (stub, `docs/spikes/hermes-a2a.md` Q6). Default: bridge namespacing and visibility rules (0009-076, 0009-077). Re-run Hermes Q6 after any Hermes upgrade.
 21. **Hermes error shapes not observed.** The HTTP 413 body (request above 1 MiB, where the client saw WinError 10053), the JSON-RPC body code for HTTP 429, HTTP 403, and `WWW-Authenticate` are `[UNOBSERVED]`. Default: map by HTTP status and JSON-RPC code under 0009-051 and 0009-079; any unlisted case is `BACKEND_ERROR`.
 22. **Hermes SSE keepalive and cancel of non-terminal tasks.** Keepalive over long turns and cancel of a non-terminal task are `[UNOBSERVED]` (the Hermes spike streamed for 0.21 s only). Default: reattach and poll per 0009-049; cancel is best effort (0009-053).
+23. **omp residual unobserved items.** Real model turns (update kinds and usage, Q3); per-path or folder cache keying and `Approve Directory`; prompts for other tool kinds; omp behaviour after 40 s unanswered elicitation; replay updates on a successful load and MCP reconnect on load (Q7); cancel during streaming (Q6); omp's error code for an undeclared method (issue 4). Default: as issues 1 and 2; `ask-all` stays undeclared (0009-083). Owner: RFC-0009 driver, with the lab record.
+24. **Elicitation binding.** omp's elicitation has no tool call id, so the bus binds an approval to the tool name on the first line of the message, not to one call (0009-082; RFC-0006 issue 13). Default: accept this residual risk for M1 with once options only (RFC-0006 0006-057). Owner: RFC-0009 driver and RFC-0006.
 
 ## Appendix A. Rust trait sketch (non-normative)
 
