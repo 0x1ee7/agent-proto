@@ -71,7 +71,7 @@ Table 4.2: event types, emitter, and `details` keys (all keys optional unless ma
 | `LOOP_TRIPPED` | worker | `limit`, `count` (RFC-0006 loop guard; Hermes peers see REJECTED) |
 | `SIGNATURE_FAILED` | worker or gateway | `component`*, `key_id`, `reason` (`unknown_key`, `bad_signature`, `expired_key`) |
 | `PEER_REJECTED` | gateway | `reason` (`auth`, `rate_limited`, `untrusted_peer`, `payload_too_large`), `peer` (configured name), `count` (coalesced, sec 4.11) |
-| `WORKSPACE_CREATED` | worker | `mode`, `kind` (`worktree`, `copy`), `base_commit` |
+| `WORKSPACE_CREATED` | worker | `mode`, `kind` (`worktree`, `copy`), `base_commit`, `excluded_count` (copy mode only; decimal string; RFC-0012 [0012-074]) |
 | `WORKSPACE_RETAINED` | worker or supervisor (050) | `reason` |
 | `WORKSPACE_REMOVED` | worker or supervisor (050) | `reason` |
 | `WORKSPACE_REFUSED` | worker or supervisor (050) | `reason` (RFC-0012 codes) |
