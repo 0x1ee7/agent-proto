@@ -78,7 +78,7 @@ Each case names its tier. Cases marked `live` MUST run on both platforms. Where 
 
 | ID | Scenario | Steps | Assertion | Tier |
 |---|---|---|---|---|
-| [0014-010] | S1: omp asks Claude Code to review a file | omp sends a delegated task to `claude` through the bus peer-call tool; claude reads the named file in its worktree | Parent and child both COMPLETED; the child's reply is an artifact containing the review; both tasks share one `context_id`; `hops` is 1 on the child | live |
+| [0014-010] | S1: omp asks Claude Code to review a file | omp sends a delegated task to `claude` through the bus peer-call tool (RFC-0015 [0015-022]; child budget per [0015-055]); claude reads the named file in its worktree | Parent and child both COMPLETED; the child's reply is an artifact containing the review; both tasks share one `context_id`; `hops` is 1 on the child | live |
 | [0014-011] | S2: Hermes `a2a_call` to the gateway asks omp, with visible streaming status | Hermes calls the gateway with a streaming send; gateway routes to omp worker | Gateway SSE stream shows at least one WORKING status before COMPLETED; Hermes receives the final artifact; if the Hermes-side rendering of intermediate status fails SP-4, the case still passes on the gateway SSE stream and the limitation is recorded in section 9 | live |
 | [0014-012] | S3: Claude Code asks Hermes a research question over the HTTP driver | claude sends to the Hermes agent id; the Hermes worker (`driver-a2a-http`) calls the Hermes A2A endpoint | Claude's task COMPLETED with the Hermes answer; the outbound Hermes request carries `A2A-Version: 1.0` and no `A2A-Extensions` or `urn:a2abus:` metadata (RFC-0009 [0009-040]) | live |
 | [0014-013] | S4a: write approval, operator approves | omp requests a write; the worker opens an approval request (INPUT_REQUIRED); the operator approves through the TUI | Task INPUT_REQUIRED, then WORKING, then COMPLETED; the file has the new content; the audit contains the decision with `decided_by` set to the verified operator identity | live |
@@ -118,6 +118,7 @@ flowchart LR
   types --> core["a2a-core"]
   busapi --> core
   types --> sec["a2a-security"]
+  types --> mcp["a2a-mcp"]
   types --> audit["a2a-audit"]
   ws["a2a-workspace"]
   core --> worker["a2a-worker"]
@@ -125,6 +126,7 @@ flowchart LR
   audit --> worker
   ws --> worker
   busapi --> worker
+  mcp --> worker
   worker --> acp["driver-acp"]
   worker --> http["driver-a2a-http"]
   busapi --> client["a2a-client"]
@@ -166,6 +168,7 @@ Phases and slices (each row is a unit of work with a named exit):
 | P2 | Workspace | `a2a-workspace` | 0012 | Worktree policy, refuse-shared-checkout, non-git refuse | none | Case 0014-022 |
 | P3 | Worker | `a2a-worker` | 0005, 0006, 0009 | Worker runtime against a `Backend`, outbox, approvals, budgets, mock backend | P1 and P2 crates, `bus-api` | Cases 0014-016 to 0014-018 on mem; mock contract suite (RFC-0009) |
 | P3 | ACP driver | `driver-acp` | 0009 | omp and claude-agent-acp backends over stdio | `a2a-worker`, `a2a-types` | Cases 0014-010, 0014-013 to 0014-015, 0014-019, 0014-027 |
+| P3 | Peer-call shim | `a2a-mcp` | 0015 | `a2abus-mcp-shim` MCP stdio server (pinned protocol), tool schemas, IPC types and client; the worker-side delegation endpoint is part of the P3 worker slice | `a2a-types` | Case 0014-010 (tool side); RFC-0015 section 8 rows |
 | P4 | NATS binding | `bus-nats` | 0010, 0011 | Streams, KV, claims, permissions, JetStream consumers | `bus-api` | Case 0014-017 (nats), 0014-021, 0014-025, 0014-026 |
 | P5 | Client | `a2a-client` | 0005, 0002 | Discovery, SendMessage, streaming, resume, cancel | P2 crates, `bus-api` | Case 0014-010 (client side) |
 | P5 | HTTP bridge | `driver-a2a-http` | 0008, 0009 | Hermes backend over A2A HTTP; card fetch with fallback | `a2a-worker`, `a2a-types` | Cases 0014-012, 0014-011 (Hermes side) |

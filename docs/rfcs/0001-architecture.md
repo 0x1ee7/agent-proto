@@ -63,6 +63,7 @@ flowchart TB
     sec[a2a-security]
     ws[a2a-workspace]
     audit[a2a-audit]
+    mcp[a2a-mcp]
   end
   subgraph L1[Bus abstraction]
     api[bus-api]
@@ -101,6 +102,7 @@ Dependencies point downward only. A crate MUST NOT depend on a crate in the same
 | `driver-acp` | L4 | `Backend` implementation speaking ACP as client over stdio to omp and claude-agent-acp | `a2a-worker`, `a2a-types` |
 | `driver-a2a-http` | L4 | `Backend` implementation speaking A2A v1.0 HTTP to an external agent (Hermes); this is the HTTP client bridge that puts an external A2A agent on the bus | `a2a-worker`, `a2a-types` |
 | `gateway-http` | L4 | A2A HTTP JSON-RPC server exposing bus agents to HTTP peers | `a2a-client`, `a2a-security` |
+| `a2a-mcp` | L2 | Peer-call MCP stdio shim (`a2abus-mcp-shim` binary) plus library: MCP stdio server, tool schemas and the worker-delegation IPC protocol types (RFC-0015). L2 because `a2a-worker` (L3) uses its IPC types; it never touches the bus or any bus credential | `a2a-types` |
 | `a2ad` | L5 | Supervisor: process lifecycle, config, wires bus + drivers + gateway | L3, L4, `a2a-workspace`, `bus-nats`, `bus-mem` |
 | `a2a-tui` | L5 | Operator TUI: approvals and task view | `a2a-client`, `a2a-audit` |
 | `a2a` | L5 | Scriptable CLI: discover, send, watch, cancel | `a2a-client` |
@@ -140,7 +142,7 @@ flowchart LR
 ```
 
 - [0001-007] Each Worker is its own OS process holding exactly one Backend and one agent identity. One agent per worker process; the supervisor MAY run many workers.
-- [0001-008] The supervisor is the only component that starts or stops other processes. Workers MUST NOT spawn peers.
+- [0001-008] The supervisor is the only component that starts or stops Workers, drivers, the gateway and the bus. Workers MUST NOT spawn peers. The ACP agent a driver starts, and the MCP servers that agent starts for its own sessions (the `a2a-mcp` shim), are children of that agent, not peers.
 - [0001-009] Any component MAY run without the supervisor given a bus address and credentials (needed for tests and for edge deployments).
 
 ### 4.4 Shared vocabulary (normative for all RFCs)
@@ -179,6 +181,7 @@ flowchart LR
 | 0012 | Supervisor, Workspaces and Operator UI | Process lifecycle, worktree isolation, TUI behavior, config |
 | 0013 | Observability and Audit | Audit event model, trace context, redaction rules |
 | 0014 | Milestone 1 Plan | Acceptance scenarios, build order, spikes |
+| 0015 | Peer-Call Tool and Delegation Plumbing | `a2a-mcp` crate, tool schemas, worker delegation IPC, grant credential use, child-task budget/chain derivation, S1 flow |
 
 ### 4.6 Locked cross-RFC decisions
 
