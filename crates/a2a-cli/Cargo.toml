@@ -1,0 +1,37 @@
+[package]
+name = "a2a-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "a2a"
+path = "src/main.rs"
+
+[dependencies]
+a2a-audit = { path = "../a2a-audit" }
+a2a-client = { path = "../a2a-client" }
+a2a-core = { path = "../a2a-core" }
+a2a-security = { path = "../a2a-security" }
+a2a-types = { path = "../a2a-types" }
+bus-api = { path = "../bus-api" }
+bus-nats = { path = "../bus-nats" }
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+toml = "1.1.8"
+
+[dev-dependencies]
+bus-mem = { path = "../bus-mem" }
+pbjson-types = "0.9.0"
+tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true
