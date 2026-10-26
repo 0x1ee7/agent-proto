@@ -1,0 +1,16 @@
+{
+  "name": "A2AB_EV_local",
+  "description": "Spike: RFC-0010 [0010-024] events stream (M1, tenant local)",
+  "subjects": ["a2a.v1.local.ev.>"],
+  "retention": "limits",
+  "storage": "file",
+  "max_age": 604800000000000,
+  "max_bytes": 1073741824,
+  "max_msg_size": 1048576,
+  "discard": "new",
+  "num_replicas": 1,
+  "duplicate_window": 3630000000000,
+  "allow_direct": true,
+  "deny_delete": true,
+  "deny_purge": true
+}

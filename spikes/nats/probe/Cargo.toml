@@ -1,0 +1,22 @@
+[package]
+name = "nats-spike-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone crate: not part of the repo workspace.
+[workspace]
+
+[dependencies]
+async-nats = { version = "0.50.0", features = ["nkeys"] }
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Console",
+  "Win32_System_JobObjects",
+  "Win32_Security",
+  "Win32_System_Threading",
+] }
