@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001 (L9, L10, L13, L17; shared vocabulary); RFC-0002 (headers, Message.metadata); RFC-0003 (`approval`, `budget`, `sequence` activation and card keys); RFC-0005 (state transitions, failure codes, deadlines, cancel cascade); RFC-0007 (operator identity, signing, grants); RFC-0009 (Backend permission and usage hooks, stop reasons); RFC-0013 (audit) |
 | Owner area | Worker runtime: approvals, budgets, delegation accounting, loop breaker |
 | Related interop notes | `docs/interop/acp-omp-claude.md` sections 2.8, 2.9, 2.10, 3.3, 4.3, 4.4; `docs/interop/hermes.md` sections 6.2, 8.3, 10; `docs/interop/a2a-spec-notes.md` section 3.3 |
@@ -439,3 +439,4 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 6. **Hop margin.** Default: 1000 ms wall per hop (0006-033). Revisit if measured transfer latency exceeds it.
 7. **Token metering per backend.** Default: per-turn counts from the backend where available; otherwise unmetered and enforced only by wall, hops and depth (0006-037). RFC-0009 owns the per-backend source table.
 8. **Operator identity format.** Default: owned by RFC-0007. This RFC requires only that decided_by be the verified identity string.
+9. **Minted grant token not bound to the decision.** Default: not bound in M1. The decision binds the grant through `request_sha256` (0006-051), the operator signature, and the fields tool, tier, summary, chain and expiry. The root grant token bytes are not in `ApprovalRequest`, so a token digest is not checked. Owner: RFC-0007 token minting. Revisit if a token digest field is required in the request or decision.

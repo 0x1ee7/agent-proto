@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001 (vocabulary, locked decisions L3-L5, L7-L8, L13); RFC-0002 (headers, reply and error mapping); RFC-0003 (extension activation); RFC-0006 (approval and budget payloads, loop breaker); RFC-0009 (Backend contract and stop reasons); RFC-0010 (NATS storage, dedupe window) |
 | Owner area | Worker runtime: task lifecycle, sequence, delivery |
 | Related interop notes | `docs/interop/a2a-spec-notes.md` sections 3, 4, 6; `docs/interop/hermes.md` sections 6, 8, 10; `docs/interop/acp-omp-claude.md` sections 2.5, 2.9, 3.5; `docs/interop/nats.md` sections 2.2, 2.3, 4.1 |

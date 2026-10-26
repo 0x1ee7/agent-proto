@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001 (locked decisions L1-L17, rules 0001-001 to 0001-009); RFC-0002 (headers, subjects); RFC-0004 (presence bucket); RFC-0005 (task lifecycle, cancel, crash to FAILED, sequence); RFC-0006 (approval payload, budgets, expiry); RFC-0007 (keys, Operator identity, allowlist); RFC-0008 (gateway process); RFC-0009 (Backend profiles); RFC-0010 (NATS credentials and permissions); RFC-0011 (Bus seam); RFC-0013 (audit events) |
 | Owner area | Supervisor (`a2ad`), workspaces (`a2a-workspace`), operator TUI (`a2a-tui`), `a2a` CLI |
 | Related interop notes | `docs/interop/nats.md` sec 1, 5, 9; `docs/interop/acp-omp-claude.md` sec 3.1, 3.3, 4.1, 4.5; `docs/interop/hermes.md` sec 9.3, 11 |

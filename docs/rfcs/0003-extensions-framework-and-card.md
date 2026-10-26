@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001 (architecture, locked decisions L1-L17, vocabulary sec 4.4); RFC-0002 bus binding (headers, error envelope); RFC-0004 discovery and presence (card storage) |
 | Owner area | A2A extension mechanism, Agent Card content, card serialization and signing hook |
 | Related interop notes | `docs/interop/a2a-spec-notes.md` sec 1.1, 2, 6.1, 8; `docs/interop/hermes.md` sec 2, 8.2-8.4, 10; `docs/interop/acp-omp-claude.md` sec 2.3, 4.3, 6 |

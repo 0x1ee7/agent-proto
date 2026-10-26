@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001, RFC-0003, RFC-0005, RFC-0006, RFC-0007, RFC-0008, RFC-0011, RFC-0012, RFC-0013 |
 | Owner area | Agent drivers: `Backend` seam, `driver-acp`, `driver-a2a-http`, usage metering |
 | Related interop notes | `docs/interop/acp-omp-claude.md`, `docs/interop/hermes.md`, `docs/interop/a2a-spec-notes.md` |

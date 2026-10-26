@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0000, RFC-0001, RFC-0002 to RFC-0013 |
 | Owner area | Milestone 1 plan: scope, build order, spikes, gate (integrator-facing) |
 | Related interop notes | `docs/interop/a2a-spec-notes.md`, `docs/interop/acp-omp-claude.md`, `docs/interop/hermes.md`, `docs/interop/nats.md` |

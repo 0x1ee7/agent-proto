@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001 (layers, vocabulary, L1-L17), RFC-0011 (bus contract), RFC-0002 (subjects, headers, envelopes), RFC-0005 (sequence, redelivery, task TTL), RFC-0004 (cards and presence schemas), RFC-0007 (signing), RFC-0012 (state directory, process lifecycle), RFC-0013 (audit records) |
 | Owner area | Subject, stream, KV layout, permissions, deployment |
 | Related interop notes | `docs/interop/nats.md` (sections 1-10), `docs/interop/a2a-spec-notes.md` (sections 1, 3, 6) |

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0000, RFC-0001, RFC-0003 (interface, versioning, extensions), RFC-0005 (task state, sequence, dedupe), RFC-0007 (signing and identity), RFC-0010 (NATS mapping), RFC-0011 (bus binding contract) |
 | Owner area | Bus binding (wire protocol) |
 | Related interop notes | `docs/interop/a2a-spec-notes.md`, `docs/interop/nats.md`, `docs/interop/hermes.md`, `docs/interop/acp-omp-claude.md` |

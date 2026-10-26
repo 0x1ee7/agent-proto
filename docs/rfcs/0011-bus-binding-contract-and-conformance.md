@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0000, RFC-0001 (seam trait `Bus`, crate map), RFC-0002 (wire contract the bus must carry), RFC-0007 (identity and ACL inputs), RFC-0010 (NATS implementation of this contract) |
 | Owner area | Bus binding contract and conformance |
 | Related interop notes | `docs/interop/nats.md` (sections on streams, dedupe, KV, consumers, no-responders) |

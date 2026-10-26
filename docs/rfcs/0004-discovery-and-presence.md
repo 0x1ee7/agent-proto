@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001 (architecture, locked decisions L4, L6, L13, vocabulary sec 4.4); RFC-0002 bus binding; RFC-0003 extensions framework and card (card content, limits, signing hook); RFC-0007 identity and trust; RFC-0008 HTTP gateway; RFC-0009 backends and drivers; RFC-0010 NATS binding (bucket mapping) |
 | Owner area | Agent card publication and retrieval, presence and liveness, capability lookup, card trust at the discovery layer |
 | Related interop notes | `docs/interop/hermes.md` sec 2, 8.1-8.3, 10; `docs/interop/nats.md` sec 4.1 (KV, per-key TTL, watch); `docs/interop/a2a-spec-notes.md` sec 8; `docs/interop/acp-omp-claude.md` sec 2.3 |

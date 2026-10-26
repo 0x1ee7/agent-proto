@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001 (architecture), RFC-0002 (binding: subjects, headers, op tokens, bus errors), RFC-0003 (extensions and card), RFC-0004 (discovery and presence), RFC-0005 (lifecycle, delivery, cancel, deadlines), RFC-0006 (approval, budget, loop), RFC-0007 (identity, signing, trust, provenance), RFC-0009 (backends), RFC-0010 (NATS layout), RFC-0013 (audit and redaction) |
 | Owner area | gateway |
 | Related interop notes | `docs/interop/hermes.md`, `docs/interop/a2a-spec-notes.md`, `docs/interop/nats.md` |

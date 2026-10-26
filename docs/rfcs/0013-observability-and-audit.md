@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001 (L17 audit subject, seam `AuditSink` rule 0001-006, crate `a2a-audit`); RFC-0002 (`A2AB-Msg-Id`, `traceparent`, L1 payload encoding); RFC-0004 (presence changes); RFC-0005 (task states, `seq`, cancel, crash to FAILED); RFC-0006 (approval payload, delegation chain, budget, loop guard); RFC-0007 (Signer, key ids, signature verification results); RFC-0008 (gateway admissions and rejections); RFC-0009 (Backend usage reports); RFC-0010 (NATS permissions, JetStream stream config); RFC-0011 (`Bus` seam); RFC-0012 (supervisor lifecycle, workspaces, operator actions) |
 | Owner area | Audit model and sink (`a2a-audit`), metrics and health endpoints, log output |
 | Related interop notes | `docs/interop/nats.md` sec 2.2 (`Nats-Msg-Id` dedupe window), sec 2.3 (durable consumers), sec 4 (KV and streams), sec 5 (subject permissions); `docs/interop/acp-omp-claude.md` sec 2.8 (`usage_update` is context usage, not billing), sec 2.9 (cancel); `docs/interop/hermes.md` sec 6.2 (loop cap), sec 1.7 (rejections); `docs/requirements.md` sec 2 (Hermes local `a2a_audit.jsonl`), M1-11, R-S5, R-O2, R-O3 |
@@ -84,8 +84,8 @@ Table 4.2: event types, emitter, and `details` keys (all keys optional unless ma
 | `LATE_OUTPUT_DROPPED` | worker | `task_id`*, `state`* (RFC-0005 [0005-007]) |
 | `SUBMISSION_DROPPED` | worker | `message_id`*, `reason` (`stale_receipt`) (RFC-0005 [0005-027]) |
 | `APPROVAL_FLOOD` | worker | `task_id`*, `open_count`* (RFC-0006 [0006-022]) |
-| `APPROVAL_NOT_APPLICABLE` | worker | `request_id`*, `reason` (RFC-0006 [0006-088]) |
-| `APPROVAL_AUTO_ALLOWED` | worker | `task_id`*, `tool`*, `tier`*, `mode`* (RFC-0006 [0006-052]) |
+| `APPROVAL_NOT_APPLICABLE` | worker | `request_id`*, `reason` (RFC-0006 [0006-013]) |
+| `APPROVAL_AUTO_ALLOWED` | worker | `task_id`*, `tool`*, `tier`*, `mode`* (RFC-0006 [0006-003]) |
 | `TRUST_RELOAD_REJECTED` | supervisor | `file`*, `reason`* (RFC-0007 [0007-023]) |
 | `MESSAGE_REJECTED` | worker or gateway | `reason`* (verification class, RFC-0007 [0007-043]); a signature failure also emits `SIGNATURE_FAILED` |
 | `PERMISSION_VIOLATION` | supervisor | `subject`*, `identity` (RFC-0010 [0010-065]) |

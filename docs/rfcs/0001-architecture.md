@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0000 |
 | Owner area | architecture |
 | Interop notes | `docs/interop/*.md` |

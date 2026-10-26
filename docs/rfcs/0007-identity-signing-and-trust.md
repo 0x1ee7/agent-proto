@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Draft |
+| Status | Proposed |
 | Depends on | RFC-0001; RFC-0002 (bus headers, error carriage); RFC-0003 (extension activation); RFC-0004 (card fields); RFC-0005 (task states, dedupe, deadlines); RFC-0006 (approval decision shape); RFC-0010 (broker identity mapping) |
 | Owner area | Security (identity, signing, delegation, provenance) |
 | Related interop notes | `docs/interop/a2a-spec-notes.md` sections 2, 6, 8.3, 11; `docs/interop/hermes.md` sections 5, 6.8, 7, 8.3; `docs/interop/acp-omp-claude.md` sections 2, 3, 5; `docs/interop/nats.md` section 5 |
@@ -137,7 +137,7 @@ Header values are the exact bytes transmitted. An absent optional header contrib
 
 ### 4.6 Signed statements
 
-- [0007-090] A signed statement is a JSON object with a `signature` member. Its signature is Ed25519 over the JCS form of the object with `signature` removed; the value is base64url without padding. The key field is named by the schema (`issuerKid` for capability tokens, `kid` for approval decisions).
+- [0007-090] A signed statement is a JSON object with a `signature` member. Its signature is Ed25519 over the JCS form of the object with `signature` removed; the value is base64url without padding. The key field is named by the schema (`issuerKid` for capability tokens).
 - [0007-091] Verifiers MUST canonicalize the object as received (the JSON they parsed), not a typed re-serialization of it.
 - [0007-092] Signed statements use the proto3 JSON mapping. 64-bit integers are JSON strings. Floating-point values MUST NOT appear in signed statements.
 - [0007-093] Verifiers MUST reject a signed statement that contains members its schema does not define (fail closed).
@@ -145,8 +145,8 @@ Header values are the exact bytes transmitted. An absent optional header contrib
 
 ### 4.7 Operator approvals
 
-- [0007-095] When signing is enabled for a tenant, an approval decision (RFC-0006) that authorizes an action requiring operator approval, including delegation, MUST be a signed statement signed by an operator-role kid. With signing disabled (M1 default), decisions MUST be accepted only from the supervisor's local operator channel (RFC-0012) and never from the gateway (L10, T7, T12).
-- [0007-096] A decision statement MUST bind: the approval request id, the task id, the decision (`approve` or `deny`), a SHA-256 digest (`sha-256:` plus base64url) over the JCS form of the requested action and scope, `issuedAt`, and a 16-byte nonce. The field names are defined by RFC-0006; this RFC defines the bindings.
+- [0007-095] When signing is enabled for a tenant, an approval decision (RFC-0006) that authorizes an action requiring operator approval, including delegation, MUST be signed by an operator-role kid. The decision is a SendMessage request, so its envelope signature (A2AB-Sig, [0007-034]) is that signature. With signing disabled (M1 default), decisions MUST be accepted only from the supervisor's local operator channel (RFC-0012) and never from the gateway (L10, T7, T12).
+- [0007-096] A signed decision MUST bind the `ApprovalDecision` fields defined by RFC-0006 (`approval.proto`): `request_id`, `task_id`, `option_id`, `nonce` (equal to the request nonce), `decided_at`, `decided_by` and `request_sha256`. `request_sha256` is the lowercase hex SHA-256 of the protobuf bytes of the ApprovalRequest, checked by the owner Worker (RFC-0006 [0006-051]). The signature covers the whole decision, so a change to any field, including `option_id` or `request_sha256`, invalidates it.
 - [0007-097] A decision MUST be consumed once. A second decision with the same request id or nonce is rejected with SIGNATURE_REPLAYED.
 - [0007-098] A decision signed by a key whose role is `agent` or `gateway` MUST be rejected with KEY_ROLE_DENIED. A gateway cannot approve on behalf of anyone (T12).
 - [0007-099] The operator UI SHOULD coalesce identical pending approvals and SHOULD cap pending prompts per agent (default 3, the RFC-0006 open-request limit of [0006-022]) to limit approval fatigue (T7).
@@ -505,7 +505,7 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 | 0007-093 | Statement with an extra member rejected | MUST |
 | 0007-094 | Root grant signed by agent-role key rejected | MUST |
 | 0007-095 | Approval with signing enabled and no operator signature rejected; M1 decisions only via local channel | MUST |
-| 0007-096 | Decision missing a binding field rejected | MUST |
+| 0007-096 | Decision with altered `option_id` or `request_sha256` fails signature verification; missing `request_sha256` refused | MUST |
 | 0007-097 | Second decision with same request id or nonce rejected | MUST |
 | 0007-098 | Decision signed by gateway key rejected KEY_ROLE_DENIED | MUST |
 | 0007-099 | Ten identical requests produce one prompt; a fourth distinct pending prompt for one agent is held (cap of 3) | SHOULD |
@@ -566,4 +566,4 @@ Abuse cases are described, not reproduced: forged envelopes, stripped or modifie
 8. **`mcpCapabilities.http` in omp and claude.** [UNVERIFIED]. Default: stdio shim only (117).
 9. **Redaction thresholds.** The 4.5 bits per character and length-32 values in 130 are defaults. Default: fix them with fixtures before any release that relies on them.
 10. **Approval prompt cap.** Default 3 pending per agent (099, RFC-0006 [0006-022]); to be tuned in use.
-11. **Approval decision shape.** RFC-0006 must embed the root grant (or its digest) in the decision it signs under 095-096. Default: the decision's structured data includes the full root token object, signed under 090.
+11. **Approval decision shape.** Resolved by RFC-0006 [0006-051]: `ApprovalDecision.request_sha256` binds the decision to the exact ApprovalRequest, and the operator signature covers the whole decision (095-096). The root grant is created from that approved request (103); its scope is bound through the request's tool, tier, summary, chain and expiry.
