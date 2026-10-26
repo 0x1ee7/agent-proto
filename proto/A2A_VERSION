@@ -1,0 +1,4 @@
+upstream: lf.a2a.v1
+spec_version: 1.0
+source: https://a2a-protocol.org/latest/definitions/
+fetched: 2026-10-26
