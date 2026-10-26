@@ -3,14 +3,19 @@
 /// Maximum length of a redacted detail string, in bytes.
 pub const MAX_DETAIL_BYTES: usize = 300;
 
-/// Replaces the bearer secret and any `Bearer <token>` text, then truncates.
-pub fn redact(text: &str, secret: Option<&str>) -> String {
-    let mut out = match secret.filter(|s| s.len() >= 4) {
+/// Replaces the bearer secret and any `Bearer <token>` text. Used for outbound text (0009-044),
+/// which is sent in full.
+pub fn scrub(text: &str, secret: Option<&str>) -> String {
+    let out = match secret.filter(|s| s.len() >= 4) {
         Some(secret) => text.replace(secret, "<redacted>"),
         None => text.to_owned(),
     };
-    out = redact_bearer(&out);
-    truncate(out)
+    redact_bearer(&out)
+}
+
+/// Scrubs secret text and bounds the result for detail strings (0009-070, 0009-072).
+pub fn redact(text: &str, secret: Option<&str>) -> String {
+    truncate(scrub(text, secret))
 }
 
 fn redact_bearer(text: &str) -> String {
@@ -55,6 +60,14 @@ mod tests {
         let out = redact(text, Some("tok-secret-123"));
         assert!(!out.contains("tok-secret-123"), "{out}");
         assert!(out.contains("<redacted>"), "{out}");
+    }
+
+    /// 0009-044: outbound text is scrubbed of the secret but never truncated.
+    #[test]
+    fn req_0009_044_scrub_keeps_long_text_intact() {
+        let long = "x".repeat(400) + " tok-secret-123";
+        let out = scrub(&long, Some("tok-secret-123"));
+        assert_eq!(out, format!("{} <redacted>", "x".repeat(400)));
     }
 
     #[test]

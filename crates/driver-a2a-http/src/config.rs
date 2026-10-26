@@ -5,11 +5,14 @@
 //! (0009-052): a bearer token over a non-loopback `http://` URL.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use a2a_types::ids::AgentId;
 use serde::Deserialize;
 use url::{Host, Url};
+
+use crate::namespace;
 
 /// Default per-peer request timeout: Hermes reply timeout (300 s) plus a margin (0009-053).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 330;
@@ -57,6 +60,11 @@ pub struct PeerConfig {
     /// Absent means anonymous access.
     #[serde(default)]
     pub bearer_token_env: Option<String>,
+    /// Name of the environment variable that holds the peer contextId namespacing secret
+    /// (0009-076). Absent means a fresh random key per process, so peer contexts change on
+    /// restart; a configured secret keeps them stable across restarts.
+    #[serde(default)]
+    pub context_secret_env: Option<String>,
     /// Tenant sent in `params.tenant` when set (0009-042). Not an isolation boundary (0009-080).
     #[serde(default)]
     pub tenant: Option<String>,
@@ -66,6 +74,8 @@ pub struct PeerConfig {
     /// Operator opt-in for `SendStreamingMessage` (0009-043).
     #[serde(default)]
     pub streaming: bool,
+    /// Absolute path of the persisted per-origin task ownership map (0009-077).
+    pub task_map_path: PathBuf,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -87,6 +97,10 @@ pub struct PeerSettings {
     pub timeout: Duration,
     /// Operator opt-in for streaming.
     pub streaming: bool,
+    /// Key for the peer contextId namespacing (0009-076). Never printed.
+    pub context_key: Secret,
+    /// Persisted per-origin task ownership map (0009-077).
+    pub task_map_path: PathBuf,
 }
 
 impl fmt::Debug for PeerSettings {
@@ -98,6 +112,7 @@ impl fmt::Debug for PeerSettings {
             .field("tenant", &self.tenant)
             .field("timeout", &self.timeout)
             .field("streaming", &self.streaming)
+            .field("task_map_path", &self.task_map_path)
             .finish()
     }
 }
@@ -120,6 +135,12 @@ pub enum ConfigError {
     /// The timeout must be at least one second.
     #[error("timeout_secs must be at least 1")]
     Timeout,
+    /// The environment variable named for the namespacing secret is not set.
+    #[error("context secret environment variable {0} is not set")]
+    ContextSecretUnavailable(String),
+    /// The task map path must be absolute so the supervisor controls where state lives.
+    #[error("task_map_path must be an absolute path")]
+    TaskMapPath,
 }
 
 impl PeerConfig {
@@ -150,6 +171,18 @@ impl PeerConfig {
         if bearer.is_some() && !bearer_allowed(&base_url) {
             return Err(ConfigError::InsecureBearer);
         }
+        let context_key = match self.context_secret_env.as_deref() {
+            None => Secret::new(namespace::random_key()),
+            Some(name) => {
+                let value = env(name)
+                    .filter(|v| !v.trim().is_empty())
+                    .ok_or_else(|| ConfigError::ContextSecretUnavailable(name.to_owned()))?;
+                Secret::new(value.trim().to_owned())
+            }
+        };
+        if !self.task_map_path.is_absolute() {
+            return Err(ConfigError::TaskMapPath);
+        }
         Ok(PeerSettings {
             agent_id,
             base_url,
@@ -157,6 +190,8 @@ impl PeerConfig {
             tenant: self.tenant.filter(|t| !t.is_empty()),
             timeout: Duration::from_secs(self.timeout_secs),
             streaming: self.streaming,
+            context_key,
+            task_map_path: self.task_map_path,
         })
     }
 }
@@ -203,6 +238,8 @@ mod tests {
             tenant: None,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             streaming: false,
+            context_secret_env: None,
+            task_map_path: std::env::temp_dir().join("a2a-http-config-test.json"),
         }
     }
 
@@ -252,6 +289,51 @@ mod tests {
         assert_eq!(err, ConfigError::TokenUnavailable("ABSENT".to_owned()));
     }
 
+    /// 0009-076: a configured secret is read from the named variable and never printed.
+    #[test]
+    fn req_0009_076_configured_context_secret_is_read_and_hidden() {
+        let mut peer = config("https://peer.example/", None);
+        peer.context_secret_env = Some("CTX_SECRET".to_owned());
+        let settings = peer
+            .validate(|name| (name == "CTX_SECRET").then(|| "ctx-secret-value".to_owned()))
+            .unwrap();
+        assert_eq!(settings.context_key.expose(), "ctx-secret-value");
+        assert!(!format!("{settings:?}").contains("ctx-secret-value"));
+    }
+
+    /// 0009-076: without a configured secret each validation gets a fresh random key.
+    #[test]
+    fn req_0009_076_default_context_key_is_fresh_per_process() {
+        let a = config("https://peer.example/", None)
+            .validate(|_| None)
+            .unwrap();
+        let b = config("https://peer.example/", None)
+            .validate(|_| None)
+            .unwrap();
+        assert_ne!(a.context_key.expose(), b.context_key.expose());
+    }
+
+    #[test]
+    fn missing_context_secret_is_refused() {
+        let mut peer = config("https://peer.example/", None);
+        peer.context_secret_env = Some("ABSENT".to_owned());
+        assert_eq!(
+            peer.validate(|_| None).unwrap_err(),
+            ConfigError::ContextSecretUnavailable("ABSENT".to_owned())
+        );
+    }
+
+    /// 0009-077: the task map path must be absolute.
+    #[test]
+    fn relative_task_map_path_is_refused() {
+        let mut peer = config("https://peer.example/", None);
+        peer.task_map_path = PathBuf::from("relative/map.json");
+        assert_eq!(
+            peer.validate(|_| None).unwrap_err(),
+            ConfigError::TaskMapPath
+        );
+    }
+
     #[test]
     fn non_http_scheme_is_refused() {
         assert!(matches!(
@@ -264,7 +346,7 @@ mod tests {
     #[test]
     fn req_0009_053_default_timeout_is_330_seconds() {
         let raw: PeerConfig = serde_json::from_str(
-            r#"{"agent_id":"hermes-peer","base_url":"http://127.0.0.1:9911/"}"#,
+            r#"{"agent_id":"hermes-peer","base_url":"http://127.0.0.1:9911/","task_map_path":"/tmp/a2a-http-map.json"}"#,
         )
         .unwrap();
         assert_eq!(raw.timeout_secs, 330);

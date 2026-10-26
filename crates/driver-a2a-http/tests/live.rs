@@ -69,6 +69,10 @@ fn run_turns(extra: Value, turns: &[&str]) {
         "agent_id": "hermes-live",
         "base_url": base_url(),
         "bearer_token_env": TOKEN_ENV,
+        "task_map_path": std::env::temp_dir()
+            .join(format!("a2a-http-live-map-{}.json", std::process::id()))
+            .to_string_lossy()
+            .into_owned(),
         "timeout_secs": 120,
     });
     if let (Some(map), Value::Object(more)) = (config.as_object_mut(), extra) {
@@ -86,6 +90,7 @@ fn run_turns(extra: Value, turns: &[&str]) {
         backend
             .start(StartTurn {
                 turn: TurnRef::new(turn),
+                origin: "origin-live".to_owned(),
                 context_id: "ctx-live-bus".to_owned(),
                 input: vec![InputPart::Text(
                     "hello from the A2A-Bus live test".to_owned(),

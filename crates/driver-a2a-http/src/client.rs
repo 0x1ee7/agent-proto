@@ -222,6 +222,8 @@ mod tests {
             tenant: Some("tenant-a".to_owned()),
             timeout: Duration::from_secs(5),
             streaming: false,
+            context_key: crate::config::Secret::new("test-context-key"),
+            task_map_path: std::env::temp_dir().join("a2a-http-client-test.json"),
         };
         let transport = Transport::new(
             build_http(Duration::from_secs(5)).unwrap(),
@@ -242,6 +244,8 @@ mod tests {
             tenant: None,
             timeout: Duration::from_secs(5),
             streaming: false,
+            context_key: crate::config::Secret::new("test-context-key"),
+            task_map_path: std::env::temp_dir().join("a2a-http-client-test.json"),
         };
         let transport = Transport::new(
             build_http(Duration::from_secs(5)).unwrap(),

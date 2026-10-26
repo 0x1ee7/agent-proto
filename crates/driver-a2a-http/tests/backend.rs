@@ -200,6 +200,7 @@ fn settings(base: &str, extra: Value) -> driver_a2a_http::PeerSettings {
         "agent_id": "hermes-peer",
         "base_url": base,
         "bearer_token_env": TOKEN_ENV,
+        "task_map_path": temp_map(),
     });
     if let (Some(map), Value::Object(more)) = (config.as_object_mut(), extra) {
         map.extend(more);
@@ -216,9 +217,21 @@ fn backend(base: &str, extra: Value) -> (HttpBackend, Receiver<BackendEvent>) {
     (backend, rx)
 }
 
+fn temp_map() -> String {
+    std::env::temp_dir()
+        .join(format!("a2a-http-map-{}.json", uuid::Uuid::new_v4()))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn start_turn(turn: &str, text: &str) -> StartTurn {
+    start_turn_from("origin-a", turn, text)
+}
+
+fn start_turn_from(origin: &str, turn: &str, text: &str) -> StartTurn {
     StartTurn {
         turn: TurnRef::new(turn),
+        origin: origin.to_owned(),
         context_id: "ctx-bus-1".to_owned(),
         input: vec![InputPart::Text(text.to_owned())],
         deadline_ms: 0,
@@ -711,4 +724,111 @@ fn start_without_sink_is_refused() {
         backend.start(start_turn("turn-1", "hi")),
         Err(BackendError::NoSink)
     );
+}
+
+#[test]
+fn req_0009_076_same_bus_context_under_two_origins_uses_distinct_peer_contexts() {
+    let server = Server::start(None, |seen| match seen.rpc_method() {
+        "SendMessage" => task_reply(seen, COMPLETED, "", artifact("ok")),
+        _ => unexpected(),
+    });
+    let (mut a, rx_a) = backend(&server.base, json!({}));
+    a.start(start_turn_from("origin-a", "turn-a", "hi"))
+        .expect("start accepted");
+    collect(&rx_a, "turn-a");
+    let (mut b, rx_b) = backend(&server.base, json!({}));
+    b.start(start_turn_from("origin-b", "turn-b", "hi"))
+        .expect("start accepted");
+    collect(&rx_b, "turn-b");
+
+    let contexts: Vec<String> = server
+        .requests()
+        .iter()
+        .filter(|s| s.rpc_method() == "SendMessage")
+        .map(Seen::peer_ctx)
+        .collect();
+    assert_eq!(contexts.len(), 2);
+    assert!(contexts.iter().all(|c| c.starts_with("ctx-")));
+    assert_ne!(contexts[0], contexts[1]);
+}
+
+#[test]
+fn req_0009_077_cross_origin_task_id_is_refused_without_forwarding() {
+    let sends = Arc::new(AtomicUsize::new(0));
+    let counter = sends.clone();
+    let server = Server::start(None, move |seen| match seen.rpc_method() {
+        "SendMessage" => {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                task_reply(seen, COMPLETED, "", artifact("ok"))
+            } else {
+                task_reply(seen, WORKING, "", json!([]))
+            }
+        }
+        "GetTask" | "SubscribeToTask" | "CancelTask" => task_reply(seen, COMPLETED, "", json!([])),
+        _ => unexpected(),
+    });
+    let map = temp_map();
+    let (mut a, rx_a) = backend(&server.base, json!({"task_map_path": map}));
+    a.start(start_turn_from("origin-a", "turn-a", "hi"))
+        .expect("start accepted");
+    assert_eq!(artifact_text(&collect(&rx_a, "turn-a")), "ok");
+
+    let (mut b, rx_b) = backend(&server.base, json!({"task_map_path": map}));
+    b.start(start_turn_from("origin-b", "turn-b", "hi"))
+        .expect("start accepted");
+    let events = collect(&rx_b, "turn-b");
+    assert!(matches!(failed_reason(&events), ReasonToken::BackendError));
+    assert_eq!(server.count("GetTask"), 0);
+    assert_eq!(server.count("SubscribeToTask"), 0);
+    assert_eq!(server.count("CancelTask"), 0);
+}
+
+#[test]
+fn req_0009_077_persisted_map_survives_restart() {
+    let server = Server::start(None, |seen| match seen.rpc_method() {
+        "SendMessage" => task_reply(seen, WORKING, "", json!([])),
+        "GetTask" => task_reply(seen, COMPLETED, "", artifact("done")),
+        _ => unexpected(),
+    });
+    let map = temp_map();
+    {
+        let (mut first, rx) = backend(&server.base, json!({"task_map_path": map}));
+        first
+            .start(start_turn_from("origin-a", "turn-a", "hi"))
+            .expect("start accepted");
+        assert_eq!(artifact_text(&collect(&rx, "turn-a")), "done");
+    }
+    let gets = server.count("GetTask");
+
+    let (mut second, rx) = backend(&server.base, json!({"task_map_path": map}));
+    second
+        .start(start_turn_from("origin-b", "turn-b", "hi"))
+        .expect("start accepted");
+    let events = collect(&rx, "turn-b");
+    assert!(matches!(failed_reason(&events), ReasonToken::BackendError));
+    assert_eq!(server.count("GetTask"), gets);
+}
+
+#[test]
+fn req_0009_044_outbound_text_is_redacted() {
+    let server = Server::start(None, |seen| match seen.rpc_method() {
+        "SendMessage" => task_reply(seen, COMPLETED, "", artifact("ok")),
+        _ => unexpected(),
+    });
+    let (mut backend, rx) = backend(&server.base, json!({}));
+    let text = format!("token {TOKEN} and Authorization: Bearer abc123def456");
+    backend
+        .start(start_turn("turn-1", &text))
+        .expect("start accepted");
+    collect(&rx, "turn-1");
+
+    let sent: String = server
+        .requests()
+        .iter()
+        .filter(|s| s.rpc_method() == "SendMessage")
+        .map(|s| s.body.to_string())
+        .collect();
+    assert!(!sent.contains(TOKEN));
+    assert!(!sent.contains("abc123def456"));
+    assert!(sent.contains("<redacted>"));
 }

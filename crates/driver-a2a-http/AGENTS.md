@@ -9,8 +9,9 @@ Layer L4 driver (RFC-0001 section 4.2, RFC-0009 4.6, 4.10 to 4.12). An A2A v1.0 
 - `client`: HTTP transport, A2A-Version header, bearer attachment, unary calls, streaming reads with idle timeout.
 - `rpc`: JSON-RPC envelopes, A2A task parsing, status and code to failure-class mapping.
 - `sse`: server-sent event decoder.
-- `namespace`: peer contextId, messageId, and requestId derivation.
+- `namespace`: peer contextId derivation (keyed HMAC-SHA256 over origin and bus contextId, 0009-076), messageId and requestId derivation.
 - `redact`: removal of the bearer secret and bearer text from anything that leaves the driver.
+- `ownership`: persisted origin to task-id map (0009-077); the only task ids that lookups and cancels may use.
 - `backend`: `HttpBackend`, the `Backend` implementation (turn driving, polling, cancel, shutdown).
 
 ## Provides
@@ -29,6 +30,7 @@ Layer L4 driver (RFC-0001 section 4.2, RFC-0009 4.6, 4.10 to 4.12). An A2A v1.0 
 - No bus, store, or other workspace crate dependency (0001-002).
 - The bearer is sent only over https or loopback http (0008-069, 0009-052). It is never sent to a card-selected URL that fails that policy, and never printed, logged, or put in an event.
 - Failure mapping uses HTTP status and JSON-RPC code only. `error.data` and ErrorInfo are never required.
+- Outbound text is scrubbed of the bearer secret before it leaves (0009-044). Task ids are looked up or cancelled only for the origin that created them (0009-077).
 - Every turn ends with exactly one terminal event. Reason tokens come only from the producing protocol (0009-072).
 - Process and transport cleanup: no child processes. Turn tasks run on the backend's own runtime; `shutdown` bounds their wait by the grace period.
 - No `unsafe`. No `unwrap`, `expect`, `panic`, `todo!`, or `unimplemented!` outside tests.
@@ -40,7 +42,7 @@ Layer L4 driver (RFC-0001 section 4.2, RFC-0009 4.6, 4.10 to 4.12). An A2A v1.0 
 - 0008-071: no 1.0 JSONRPC interface is a version mismatch; the turn proceeds. Guarded in `card` and integration tests.
 - 0008-072: bus agent id comes from configuration. Guarded in `config` tests.
 - 0008-078: error code classes; reply timeout and unreachable peer mapping. Guarded in `rpc` and integration tests.
-- 0008-097: peer contextId namespaced per origin. Guarded in `namespace` tests.
+- 0008-097: peer contextId keyed per origin. Guarded in `namespace`, `config`, and integration tests.
 - 0008-098: error without `error.data` accepted; non-object body malformed. Guarded in `rpc` and integration tests.
 - 0008-099: sanitized bus card. Guarded in `card` tests.
 - 0009-020: second Start while open is busy; cancel before a task id. Guarded in integration tests.
@@ -48,6 +50,7 @@ Layer L4 driver (RFC-0001 section 4.2, RFC-0009 4.6, 4.10 to 4.12). An A2A v1.0 
 - 0009-041: card selection of the JSONRPC 1.0 interface. Guarded in `card` tests.
 - 0009-042: tenant sent in params when configured. Guarded in `client` tests.
 - 0009-043: SendMessage and SendStreamingMessage paths; messageId shape. Guarded in integration tests.
+- 0009-044: outbound text scrubbed before sending. Guarded in `redact` and integration tests.
 - 0009-045: resend after connection failure reuses messageId; retries bounded. Guarded in `backend` tests.
 - 0009-046: foreign contextId fails the turn; reply text and bare task parsing. Guarded in integration and `rpc` tests.
 - 0009-047: state mapping, INPUT_REQUIRED, CANCELED after working. Guarded in `rpc` and integration tests.
@@ -57,4 +60,17 @@ Layer L4 driver (RFC-0001 section 4.2, RFC-0009 4.6, 4.10 to 4.12). An A2A v1.0 
 - 0009-052: refuse bearer over cleartext remote. Guarded in `config` tests.
 - 0009-053: default timeout 330 s; timeout cancels remote and fails. Guarded in `config` and integration tests.
 - 0009-070: token and bearer text redacted in Debug and details. Guarded in `config` and `redact` tests.
+- 0009-076: per-origin contextId namespacing on every request. Guarded in `namespace`, `config`, and integration tests.
+- 0009-077: visibility guard; no lookup for a foreign or unrecorded task id; map survives restart. Guarded in `ownership` and integration tests.
 - 0009-078: follow-up reuses the namespaced contextId. Guarded in `namespace` tests.
+
+## Configuration keys (driver specific)
+
+- `context_secret_env`: optional name of an environment variable holding the secret that keys peer contextId derivation. Must be set and non-empty when named. Unset: a random per-process key is used (0009-076).
+- `task_map_path`: required absolute path of the persisted origin to task-id map (0009-077).
+
+## Known limits
+
+- Without `context_secret_env`, peer contextIds change on every process restart, so a follow-up turn after a restart starts a new peer context (0009-078 continuity is lost across restarts).
+- The task map only grows; entries are never pruned.
+- The map is read and rewritten under a lock on every new task id, so file I/O sits in the turn path.

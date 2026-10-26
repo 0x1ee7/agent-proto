@@ -43,6 +43,8 @@ pub enum FailureCode {
     AgentRefused,
     /// Backend stop reason max_tokens or max_turn_requests.
     AgentLimit,
+    /// Task workspace refused, lost or busy (RFC-0012); the token is in detail.
+    WorkspaceFailed,
     /// Per-peer rate limit exceeded (final state REJECTED).
     RateLimited,
     /// Queue quota exceeded (final state REJECTED).
@@ -51,7 +53,7 @@ pub enum FailureCode {
 
 impl FailureCode {
     /// Every registry code, in table order.
-    pub const ALL: [FailureCode; 15] = [
+    pub const ALL: [FailureCode; 16] = [
         FailureCode::DeadlineExceeded,
         FailureCode::ApprovalTimeout,
         FailureCode::ApprovalDenied,
@@ -65,6 +67,7 @@ impl FailureCode {
         FailureCode::BackendLostTask,
         FailureCode::AgentRefused,
         FailureCode::AgentLimit,
+        FailureCode::WorkspaceFailed,
         FailureCode::RateLimited,
         FailureCode::QueueFull,
     ];
@@ -86,6 +89,7 @@ impl FailureCode {
             FailureCode::BackendLostTask => "BACKEND_LOST_TASK",
             FailureCode::AgentRefused => "AGENT_REFUSED",
             FailureCode::AgentLimit => "AGENT_LIMIT",
+            FailureCode::WorkspaceFailed => "WORKSPACE_FAILED",
             FailureCode::RateLimited => "RATE_LIMITED",
             FailureCode::QueueFull => "QUEUE_FULL",
         }
@@ -124,12 +128,99 @@ impl FromStr for FailureCode {
     }
 }
 
+/// Workspace refusal tokens of RFC-0012 section 4.8. A [`FailureCode::WorkspaceFailed`] reason
+/// carries one of them in `detail.token` ([0005-053]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum WorkspaceToken {
+    /// Source is not a git checkout and `non_git = "refuse"`.
+    NonGitRefused,
+    /// Copy mode met a symlink, junction, reparse point or special file.
+    CopyLinkRejected,
+    /// Workspace path exists and no live lease owns it.
+    PathOccupied,
+    /// Lease branch exists with commits beyond `base_ref`.
+    BranchExists,
+    /// Caller does not hold the lease, or the leased workspace is missing.
+    LeaseLost,
+    /// Registry mutex not acquired within 30 s.
+    WorkspaceBusy,
+    /// A lock file, the registry mutex or `ws/index.json` cannot be parsed.
+    StateInvalid,
+    /// A path contains `..`, a removal target is a link, or it lies outside the root.
+    PathEscape,
+    /// Invalid path or setting, or scope or mode mismatch.
+    Config,
+    /// Workspace overlaps the operator `repo` or another live lease.
+    SharedCheckout,
+    /// Copy mode above 2 GiB or 100000 files.
+    CopyLimit,
+    /// Workspace root above 180 characters on Windows, or store path refused at start.
+    PathTooLong,
+    /// A git command failed or its output could not be parsed.
+    GitFailed,
+    /// A filesystem operation on a workspace, lease or registry file failed.
+    Io,
+}
+
+impl WorkspaceToken {
+    /// Every RFC-0012 workspace token, in table order.
+    pub const ALL: [WorkspaceToken; 14] = [
+        WorkspaceToken::NonGitRefused,
+        WorkspaceToken::CopyLinkRejected,
+        WorkspaceToken::PathOccupied,
+        WorkspaceToken::BranchExists,
+        WorkspaceToken::LeaseLost,
+        WorkspaceToken::WorkspaceBusy,
+        WorkspaceToken::StateInvalid,
+        WorkspaceToken::PathEscape,
+        WorkspaceToken::Config,
+        WorkspaceToken::SharedCheckout,
+        WorkspaceToken::CopyLimit,
+        WorkspaceToken::PathTooLong,
+        WorkspaceToken::GitFailed,
+        WorkspaceToken::Io,
+    ];
+
+    /// Wire token, exactly as the RFC-0012 table spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceToken::NonGitRefused => "non_git_refused",
+            WorkspaceToken::CopyLinkRejected => "copy_link_rejected",
+            WorkspaceToken::PathOccupied => "path_occupied",
+            WorkspaceToken::BranchExists => "branch_exists",
+            WorkspaceToken::LeaseLost => "lease_lost",
+            WorkspaceToken::WorkspaceBusy => "workspace_busy",
+            WorkspaceToken::StateInvalid => "state_invalid",
+            WorkspaceToken::PathEscape => "path_escape",
+            WorkspaceToken::Config => "config",
+            WorkspaceToken::SharedCheckout => "shared_checkout",
+            WorkspaceToken::CopyLimit => "copy_limit",
+            WorkspaceToken::PathTooLong => "path_too_long",
+            WorkspaceToken::GitFailed => "git_failed",
+            WorkspaceToken::Io => "io",
+        }
+    }
+
+    /// Parses an exact wire token. Any other string is rejected.
+    pub fn parse(token: &str) -> Result<Self, FailureError> {
+        WorkspaceToken::ALL
+            .iter()
+            .copied()
+            .find(|t| t.as_str() == token)
+            .ok_or_else(|| FailureError::UnknownWorkspaceToken(token.to_owned()))
+    }
+}
+
 /// Errors from reading or writing the `a2abus.failure` metadata.
 #[derive(Debug, Error)]
 pub enum FailureError {
     /// The code token is not in the registry.
     #[error("unknown failure code {0:?}")]
     UnknownCode(String),
+    /// The workspace token is not one of the RFC-0012 tokens.
+    #[error("unknown workspace token {0:?}")]
+    UnknownWorkspaceToken(String),
     /// The metadata value does not match `{"code": "<CODE>", "detail": {...}}`.
     #[error("malformed failure data: {0}")]
     Malformed(String),
@@ -154,6 +245,22 @@ impl FailureReason {
         Self { code, detail: None }
     }
 
+    /// Builds a WORKSPACE_FAILED reason whose detail carries the workspace token ([0005-053]).
+    #[must_use]
+    pub fn workspace(token: WorkspaceToken) -> Self {
+        let mut detail = Struct::default();
+        detail.fields.insert(
+            "token".to_owned(),
+            Value {
+                kind: Some(Kind::StringValue(token.as_str().to_owned())),
+            },
+        );
+        Self {
+            code: FailureCode::WorkspaceFailed,
+            detail: Some(detail),
+        }
+    }
+
     /// Readable text for the status message part, for example `task failed: deadline exceeded`
     /// ([0005-049]).
     #[must_use]
@@ -168,6 +275,7 @@ impl FailureReason {
 
     /// Encodes the value stored under [`FAILURE_KEY`]: `{"code": "<CODE>", "detail": {...}}`.
     pub fn to_struct(&self) -> Result<Struct, FailureError> {
+        check_workspace_detail(self.code, self.detail.as_ref())?;
         let mut object = serde_json::Map::new();
         object.insert(
             "code".to_owned(),
@@ -201,6 +309,7 @@ impl FailureReason {
         if let Some(key) = object.keys().next() {
             return Err(FailureError::Malformed(format!("unknown key {key:?}")));
         }
+        check_workspace_detail(code, detail.as_ref())?;
         Ok(Self { code, detail })
     }
 
@@ -246,6 +355,21 @@ impl FailureReason {
     }
 }
 
+/// Enforces [0005-053]: a WORKSPACE_FAILED reason carries `detail.token` with one of the
+/// RFC-0012 tokens. Other codes take no such check.
+fn check_workspace_detail(code: FailureCode, detail: Option<&Struct>) -> Result<(), FailureError> {
+    if code != FailureCode::WorkspaceFailed {
+        return Ok(());
+    }
+    let token = detail.and_then(|d| d.fields.get("token"));
+    match token.and_then(|v| v.kind.as_ref()) {
+        Some(Kind::StringValue(token)) => WorkspaceToken::parse(token).map(|_| ()),
+        _ => Err(FailureError::Malformed(
+            "WORKSPACE_FAILED needs detail.token as a string".to_owned(),
+        )),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -256,14 +380,14 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
-    // [0005-048] the registry has exactly the 15 codes of the table.
+    // [0005-048] the registry has exactly the 16 codes of the table.
     #[test]
-    fn req_0005_048_registry_has_fifteen_unique_codes() {
-        assert_eq!(FailureCode::ALL.len(), 15);
+    fn req_0005_048_registry_has_sixteen_unique_codes() {
+        assert_eq!(FailureCode::ALL.len(), 16);
         let mut tokens: Vec<&str> = FailureCode::ALL.iter().map(|c| c.as_str()).collect();
         tokens.sort_unstable();
         tokens.dedup();
-        assert_eq!(tokens.len(), 15);
+        assert_eq!(tokens.len(), 16);
     }
 
     // [0005-048] each code has the final state the table assigns to it.
@@ -413,5 +537,53 @@ mod tests {
             FailureReason::from_message(&Message::default()).unwrap(),
             None
         );
+    }
+
+    // [0005-053] WORKSPACE_FAILED carries detail.token with one RFC-0012 token.
+    #[test]
+    fn req_0005_053_workspace_failed_carries_token() {
+        let reason = FailureReason::workspace(WorkspaceToken::LeaseLost);
+        assert_eq!(reason.code.final_state(), TaskState::Failed);
+        assert_eq!(reason.text(), "task failed: workspace failed");
+        let value = reason.to_struct().unwrap();
+        assert_eq!(
+            serde_json::to_value(&value).unwrap(),
+            json!({"code": "WORKSPACE_FAILED", "detail": {"token": "lease_lost"}})
+        );
+        assert_eq!(FailureReason::from_struct(&value).unwrap(), reason);
+    }
+
+    // [0005-053] the workspace tokens are exactly the fourteen of RFC-0012 section 4.8.
+    #[test]
+    fn req_0005_053_workspace_tokens_are_the_rfc0012_fourteen() {
+        assert_eq!(WorkspaceToken::ALL.len(), 14);
+        let mut tokens: Vec<&str> = WorkspaceToken::ALL.iter().map(|t| t.as_str()).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(tokens.len(), 14);
+        for token in WorkspaceToken::ALL {
+            assert_eq!(WorkspaceToken::parse(token.as_str()).unwrap(), token);
+        }
+        for bad in ["lease-lost", "Lease_Lost", "", "shared checkout", "bogus"] {
+            assert!(WorkspaceToken::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    // [0005-053] a WORKSPACE_FAILED reason without a valid workspace token is refused.
+    #[test]
+    fn req_0005_053_workspace_failed_without_valid_token_is_refused() {
+        assert!(
+            FailureReason::new(FailureCode::WorkspaceFailed)
+                .to_struct()
+                .is_err()
+        );
+        for value in [
+            json!({"code": "WORKSPACE_FAILED"}),
+            json!({"code": "WORKSPACE_FAILED", "detail": {}}),
+            json!({"code": "WORKSPACE_FAILED", "detail": {"token": "bogus"}}),
+            json!({"code": "WORKSPACE_FAILED", "detail": {"token": 3}}),
+        ] {
+            assert!(FailureReason::from_struct(&struct_of(value)).is_err());
+        }
     }
 }

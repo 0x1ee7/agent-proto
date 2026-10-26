@@ -25,7 +25,8 @@ use crate::card;
 use crate::client::{CallError, EventStream, Transport, build_http};
 use crate::config::{CARD_FETCH_CAP, CARD_REFRESH, PeerSettings, Secret, bearer_allowed};
 use crate::namespace;
-use crate::redact::redact;
+use crate::ownership::{TaskMapError, TaskOwnership};
+use crate::redact::{redact, scrub};
 use crate::rpc::{
     self, CANCEL_TASK, Envelope, FailClass, GET_TASK, Malformed, PeerState, SEND_MESSAGE,
     SEND_STREAMING, SUBSCRIBE_TASK, Update, classify_code, classify_status, task_params,
@@ -56,6 +57,9 @@ pub enum ConnectError {
     /// The async runtime could not be started.
     #[error("cannot start the async runtime")]
     Runtime(#[source] std::io::Error),
+    /// The persisted task ownership map cannot be loaded (0009-077).
+    #[error("cannot load the task ownership map")]
+    TaskMap(#[source] TaskMapError),
 }
 
 /// Bus-facing card for a peer, built only from the bus agent id (0008-073).
@@ -84,6 +88,8 @@ impl HttpBackend {
     /// Returns [`ConnectError`] when the HTTP client or runtime cannot be created.
     pub fn connect(settings: PeerSettings) -> Result<Self, ConnectError> {
         let http = build_http(settings.timeout).map_err(ConnectError::Http)?;
+        let ownership =
+            TaskOwnership::load(&settings.task_map_path).map_err(ConnectError::TaskMap)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("a2a-http")
@@ -96,6 +102,7 @@ impl HttpBackend {
                 sink: Mutex::new(None),
                 open: Mutex::new(None),
                 peer: AsyncMutex::new(None),
+                ownership: Mutex::new(ownership),
                 live: AtomicBool::new(true),
                 closed: AtomicBool::new(false),
             }),
@@ -225,6 +232,7 @@ struct Shared {
     sink: Mutex<Option<Box<dyn BackendSink>>>,
     open: Mutex<Option<ActiveTurn>>,
     peer: AsyncMutex<Option<(Endpoint, Instant)>>,
+    ownership: Mutex<TaskOwnership>,
     live: AtomicBool,
     closed: AtomicBool,
 }
@@ -412,6 +420,7 @@ enum Flow {
 /// Per-turn protocol state.
 struct TurnCtx {
     emitter: Emitter,
+    origin: String,
     peer_ctx: String,
     task_id: Option<String>,
     last_state: Option<PeerState>,
@@ -427,7 +436,11 @@ impl TurnCtx {
                 if let Some(outcome) = self.foreign(&view.context_id) {
                     return Some(outcome);
                 }
-                self.task_id = Some(view.id);
+                if !view.id.is_empty()
+                    && let Some(outcome) = self.adopt(&view.id)
+                {
+                    return Some(outcome);
+                }
                 self.on_state(view.state, &view.status_text, &view.artifact_text)
             }
             Update::Status {
@@ -439,8 +452,10 @@ impl TurnCtx {
                 if let Some(outcome) = self.foreign(&context_id) {
                     return Some(outcome);
                 }
-                if !task_id.is_empty() {
-                    self.task_id = Some(task_id);
+                if !task_id.is_empty()
+                    && let Some(outcome) = self.adopt(&task_id)
+                {
+                    return Some(outcome);
                 }
                 self.on_state(state, &text, "")
             }
@@ -455,8 +470,10 @@ impl TurnCtx {
                 if let Some(outcome) = self.foreign(&context_id) {
                     return Some(outcome);
                 }
-                if !task_id.is_empty() {
-                    self.task_id = Some(task_id);
+                if !task_id.is_empty()
+                    && let Some(outcome) = self.adopt(&task_id)
+                {
+                    return Some(outcome);
                 }
                 if !text.is_empty() {
                     self.streamed = true;
@@ -566,6 +583,60 @@ impl TurnCtx {
             ReasonToken::BackendError,
             "peer returned a foreign contextId",
         ))
+    }
+
+    /// Adopts a peer task id from a reply for this turn. The id is recorded in the origin's
+    /// ownership map before any lookup may use it (0009-077).
+    fn adopt(&mut self, task_id: &str) -> Option<Outcome> {
+        if self.task_id.as_deref() == Some(task_id) {
+            return None;
+        }
+        let recorded = lock(&self.emitter.shared.ownership).record(&self.origin, task_id);
+        match recorded {
+            Ok(()) => {
+                self.task_id = Some(task_id.to_owned());
+                None
+            }
+            Err(TaskMapError::Foreign) => {
+                self.emitter.fault(
+                    FaultKind::Internal,
+                    "peer task id belongs to another origin",
+                );
+                Some(failed(
+                    ReasonToken::BackendError,
+                    "peer returned a task id owned by another origin",
+                ))
+            }
+            Err(_) => {
+                self.emitter
+                    .fault(FaultKind::Internal, "task ownership map unavailable");
+                Some(failed(
+                    ReasonToken::BackendError,
+                    "cannot record peer task ownership",
+                ))
+            }
+        }
+    }
+
+    /// Returns whether this origin created `task_id` through this driver (0009-077).
+    fn owns(&self, task_id: &str) -> bool {
+        lock(&self.emitter.shared.ownership).owns(&self.origin, task_id)
+    }
+
+    /// The turn's task id when this origin owns it; the only id lookups and cancels may use.
+    fn owned_task_id(&self) -> Option<String> {
+        self.task_id
+            .as_deref()
+            .filter(|id| self.owns(id))
+            .map(str::to_owned)
+    }
+
+    /// Maps an interrupt to its outcome, cancelling the remote task when this origin owns it.
+    async fn interrupted(&self, interrupt: Interrupt, transport: Option<&Transport>) -> Outcome {
+        if let (Some(transport), Some(task_id)) = (transport, self.owned_task_id()) {
+            cancel_remote(transport, &task_id).await;
+        }
+        outcome_of(interrupt)
     }
 
     /// Maps a transport or RPC failure to an outcome (RFC-0008 0008-078).
@@ -688,15 +759,8 @@ async fn cancel_remote(transport: &Transport, task_id: &str) {
     .await;
 }
 
-/// Maps an interrupt to its outcome, cancelling the remote task when one is known.
-async fn interrupted(
-    interrupt: Interrupt,
-    transport: Option<&Transport>,
-    task_id: Option<&str>,
-) -> Outcome {
-    if let (Some(transport), Some(task_id)) = (transport, task_id) {
-        cancel_remote(transport, task_id).await;
-    }
+/// Maps an interrupt to its turn outcome.
+fn outcome_of(interrupt: Interrupt) -> Outcome {
     match interrupt {
         Interrupt::Canceled => Outcome::Canceled,
         Interrupt::TimedOut => failed(ReasonToken::BackendTimeout, "turn timed out"),
@@ -710,13 +774,16 @@ async fn drive(
     start: StartTurn,
     cancel: watch::Receiver<bool>,
 ) -> Outcome {
+    if start.origin.is_empty() {
+        return failed(ReasonToken::BackendError, "turn origin is empty");
+    }
     let mut ctl = Ctl {
         cancel,
         deadline: Instant::now() + shared.settings.timeout,
     };
     let endpoint = match ctl.run(shared.endpoint()).await {
         Ok(endpoint) => endpoint,
-        Err(interrupt) => return interrupted(interrupt, None, None).await,
+        Err(interrupt) => return outcome_of(interrupt),
     };
     if endpoint.version_mismatch {
         emitter.fault(
@@ -724,11 +791,18 @@ async fn drive(
             "EXTERNAL_VERSION_MISMATCH",
         );
     }
-    let peer_ctx = namespace::peer_context_id(shared.settings.agent_id.as_str(), &start.context_id);
-    let params = send_params(&join_input(&start.input), &peer_ctx);
+    // The namespacing key is per origin (0009-076); outbound text is scrubbed (0009-044).
+    let peer_ctx = namespace::peer_context_id(
+        shared.settings.context_key.expose().as_bytes(),
+        &start.origin,
+        &start.context_id,
+    );
+    let text = scrub(&join_input(&start.input), shared.secret_text());
+    let params = send_params(&text, &peer_ctx);
     let transport = endpoint.transport.clone();
     let mut ctx = TurnCtx {
         emitter,
+        origin: start.origin,
         peer_ctx,
         task_id: None,
         last_state: None,
@@ -750,7 +824,7 @@ async fn drive(
     };
     let flow = match first {
         Flow::Ended if endpoint.streaming => match ctx.task_id.clone() {
-            Some(task_id) => {
+            Some(task_id) if ctx.owns(&task_id) => {
                 stream(
                     &mut ctx,
                     &transport,
@@ -761,6 +835,10 @@ async fn drive(
                 )
                 .await
             }
+            Some(_) => Flow::Done(failed(
+                ReasonToken::BackendLostTask,
+                "peer task is not owned by this origin",
+            )),
             None => Flow::Ended,
         },
         other => other,
@@ -779,9 +857,7 @@ async fn unary(ctx: &mut TurnCtx, transport: &Transport, ctl: &mut Ctl, params: 
     {
         Ok(reply) => reply,
         Err(interrupt) => {
-            return Flow::Done(
-                interrupted(interrupt, Some(transport), ctx.task_id.as_deref()).await,
-            );
+            return Flow::Done(ctx.interrupted(interrupt, Some(transport)).await);
         }
     };
     match reply {
@@ -812,9 +888,7 @@ async fn stream(
     {
         Ok(opened) => opened,
         Err(interrupt) => {
-            return Flow::Done(
-                interrupted(interrupt, Some(transport), ctx.task_id.as_deref()).await,
-            );
+            return Flow::Done(ctx.interrupted(interrupt, Some(transport)).await);
         }
     };
     let mut events: EventStream = match opened {
@@ -830,9 +904,7 @@ async fn stream(
             }
             Ok(Err(error)) => return Flow::Done(ctx.fail(&error, lookup)),
             Err(interrupt) => {
-                return Flow::Done(
-                    interrupted(interrupt, Some(transport), ctx.task_id.as_deref()).await,
-                );
+                return Flow::Done(ctx.interrupted(interrupt, Some(transport)).await);
             }
         };
         match rpc::parse_envelope(payload.as_bytes()) {
@@ -857,19 +929,25 @@ async fn poll(ctx: &mut TurnCtx, transport: &Transport, ctl: &mut Ctl) -> Outcom
     let Some(task_id) = ctx.task_id.clone() else {
         return failed(ReasonToken::BackendError, "peer returned no task id");
     };
+    if !ctx.owns(&task_id) {
+        return failed(
+            ReasonToken::BackendLostTask,
+            "peer task is not owned by this origin",
+        );
+    }
     let mut interval = POLL_MIN;
     let mut down = 0_u32;
     loop {
         let wait = interval.min(ctl.remaining());
         if let Err(interrupt) = ctl.run(tokio::time::sleep(wait)).await {
-            return interrupted(interrupt, Some(transport), Some(&task_id)).await;
+            return ctx.interrupted(interrupt, Some(transport)).await;
         }
         let reply = match ctl
             .run(transport.call(GET_TASK, task_params(&task_id)))
             .await
         {
             Ok(reply) => reply,
-            Err(interrupt) => return interrupted(interrupt, Some(transport), Some(&task_id)).await,
+            Err(interrupt) => return ctx.interrupted(interrupt, Some(transport)).await,
         };
         match reply {
             Ok(value) => {

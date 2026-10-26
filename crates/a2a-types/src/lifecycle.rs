@@ -107,6 +107,7 @@ const EDGES: &[(Option<TaskState>, TaskState, CodeRule)] = &[
         TaskState::Failed,
         CodeRule::Only(&[
             FailureCode::BackendUnavailable,
+            FailureCode::WorkspaceFailed,
             FailureCode::DeadlineExceeded,
         ]),
     ),
@@ -142,6 +143,7 @@ const EDGES: &[(Option<TaskState>, TaskState, CodeRule)] = &[
         CodeRule::Only(&[
             FailureCode::ApprovalTimeout,
             FailureCode::DeadlineExceeded,
+            FailureCode::WorkspaceFailed,
             FailureCode::BackendCrashed,
         ]),
     ),
@@ -430,11 +432,13 @@ mod tests {
         ));
     }
 
-    // [0005-048] SUBMITTED to FAILED takes BACKEND_UNAVAILABLE or DEADLINE_EXCEEDED only.
+    // [0005-048] SUBMITTED to FAILED takes BACKEND_UNAVAILABLE, WORKSPACE_FAILED, or
+    // DEADLINE_EXCEEDED only.
     #[test]
     fn req_0005_048_submitted_failure_codes_are_restricted() {
         for code in [
             FailureCode::BackendUnavailable,
+            FailureCode::WorkspaceFailed,
             FailureCode::DeadlineExceeded,
         ] {
             assert!(
@@ -464,13 +468,14 @@ mod tests {
         }
     }
 
-    // [0005-048] INPUT_REQUIRED to FAILED takes APPROVAL_TIMEOUT, DEADLINE_EXCEEDED, or
-    // BACKEND_CRASHED only.
+    // [0005-048] INPUT_REQUIRED to FAILED takes APPROVAL_TIMEOUT, DEADLINE_EXCEEDED,
+    // BACKEND_CRASHED, or WORKSPACE_FAILED only.
     #[test]
     fn req_0005_048_interrupted_failure_codes_are_restricted() {
         for code in [
             FailureCode::ApprovalTimeout,
             FailureCode::DeadlineExceeded,
+            FailureCode::WorkspaceFailed,
             FailureCode::BackendCrashed,
         ] {
             assert!(

@@ -7,9 +7,11 @@ pub mod config;
 mod card;
 mod client;
 mod namespace;
+mod ownership;
 mod redact;
 mod rpc;
 mod sse;
 
 pub use backend::{ConnectError, HttpBackend, bus_card};
 pub use config::{ConfigError, PeerConfig, PeerSettings, Secret};
+pub use ownership::TaskMapError;
