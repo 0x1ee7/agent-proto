@@ -18,7 +18,8 @@ Provides:
 - `error::BusError`: the closed taxonomy. Reason strings are binding-chosen constants.
 - `capabilities::{Capabilities, Persistence, Profile, Requirement, A2A_BUS_M1,
   PROFILE_REGISTRY, ProfileError, M1_MIN_DEDUPE_WINDOW, M1_MIN_MESSAGE_SIZE}`.
-- `control::{BusControl, Fault, DelayDist, Probability}`: fault and clock control.
+- `control::{BusControl, Fault, DelayDist, Probability}`: fault and clock control, each
+  method fallible (see the rule below).
 - `helpers::{fold_duplicate, Append, append_stored}`: caller-side append semantics.
 
 Uses: `a2a-types` (`TenantId`), `bytes` (payloads), `thiserror`.
@@ -28,6 +29,9 @@ Uses: `a2a-types` (`TenantId`), `bytes` (payloads), `thiserror`.
 - `BusControl` lives here, not in a simulator crate, because the simulator and the
   conformance driver both need it and the orphan rule forbids implementing a foreign
   trait for a foreign type. Its methods are synchronous.
+- Control methods return `Result<_, BusError>`. A binding without a capability reports
+  `BusError::Unsupported { capability }` naming the operation; the conformance suite
+  marks such rows unexercised, not failed. `seed` is infallible.
 - `Delivery::in_progress` extends the invisibility window to `now + ack_wait`. RFC
   Appendix A does not list it.
 - `Bus::append` to a stream that does not capture the subject returns `Absent`; no

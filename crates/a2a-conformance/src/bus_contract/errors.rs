@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use bus_api::bus::{Bus, Consumer};
-use bus_api::control::{BusControl, Fault};
+use bus_api::control::Fault;
 use bus_api::error::BusError;
 use bus_api::headers::Headers;
 use bus_api::helpers::fold_duplicate;
@@ -14,7 +14,7 @@ use bytes::Bytes;
 use super::messaging::stalled;
 use super::support::{open, seq_of};
 use super::{BusFactory, Ctx, bx, expect_variant, pat, settle, subj};
-use crate::driver::{drive, ready_now};
+use crate::driver::{Timeline, drive, ready_now};
 
 /// Canary placed in payloads and KV values; it must never appear in errors.
 const CANARY: &str = "A2A-CANARY-0011-043";
@@ -185,7 +185,8 @@ pub(super) fn r0011_050<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         "create without blob_store",
         ctx.factory.create(fx, ctx.seed, Some("blob_store")),
     )?;
-    settle(&blobless_control, async {
+    let blobless_timeline = Timeline::new(&blobless_control, ctx.fx.clock);
+    settle(&blobless_timeline, async {
         expect_variant(
             "blob_put without blob_store",
             blobless
@@ -229,9 +230,9 @@ pub(super) fn r0011_050<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             &subj("rpc.silent")?,
             &Headers::new(),
             Bytes::from_static(b"s"),
-            Duration::from_secs(1),
+            fx.scaled(Duration::from_secs(1)),
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     expect_variant(
         "request without a reply",
@@ -314,7 +315,7 @@ pub(super) fn r0011_053<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     control.set_fault(Fault::Partition {
         set_a: vec![client.clone()],
         set_b: vec![server],
-    });
+    })?;
     let under = drive(
         control,
         bus.append(
@@ -325,13 +326,13 @@ pub(super) fn r0011_053<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             Bytes::from_static(b"r"),
             &id,
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     match under {
         Err(BusError::Timeout | BusError::Unavailable { .. }) => {}
         other => return Err(format!("append under partition: unexpected {other:?}")),
     }
-    control.clear_faults();
+    control.clear_faults()?;
 
     let stored = settle(control, async {
         let first = bx(

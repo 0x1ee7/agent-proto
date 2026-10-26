@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use bus_api::bus::{Bus, Watch};
-use bus_api::control::BusControl;
 use bus_api::error::BusError;
 use bus_api::message::WatchEvent;
 use bus_api::name::{Key, KeyPrefix};
@@ -90,7 +89,7 @@ pub(super) fn r0011_016<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
                 bucket,
                 &ttl_key,
                 Bytes::from_static(b"short"),
-                Some(Duration::from_secs(2)),
+                Some(fx.scaled(Duration::from_secs(2))),
             )
             .await,
         )?;
@@ -100,7 +99,7 @@ pub(super) fn r0011_016<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         }
         Ok::<Revision, String>(rev)
     })?;
-    ctx.control.advance(Duration::from_secs(3));
+    ctx.control.advance(ctx.fx.scaled(Duration::from_secs(3)))?;
     settle(ctx.control, async {
         match bus.kv_get(&fx.client, bucket, &ttl_key).await {
             Err(BusError::Absent) => {}
@@ -151,7 +150,7 @@ pub(super) fn r0011_017<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         if back != data {
             return Err("blob_get returned different bytes".to_owned());
         }
-        if !ctx.control.corrupt_blob(tenant, &digest) {
+        if !ctx.control.corrupt_blob(tenant, &digest)? {
             return Err("control could not corrupt the stored blob".to_owned());
         }
         match bus.blob_get(&fx.client, tenant, &digest).await {

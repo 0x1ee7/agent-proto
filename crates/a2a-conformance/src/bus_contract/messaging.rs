@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use bus_api::bus::{Bus, Consumer, RequestStream};
 use bus_api::capabilities::M1_MIN_MESSAGE_SIZE;
-use bus_api::control::BusControl;
 use bus_api::error::BusError;
 use bus_api::headers::Headers;
 use bus_api::message::{Request, StartPosition};
@@ -14,7 +13,7 @@ use bytes::Bytes;
 use super::support::{expect_delivery, headers, next_of, open, put, seq_of};
 use super::{BusFactory, Ctx, bx, expect_variant, pat, settle, subj};
 use crate::driver::{drive, join, ready_now};
-use crate::fixtures::{ACK_WAIT, CONSUMER};
+use crate::fixtures::CONSUMER;
 
 /// Result for a driver that ran out of virtual time.
 pub(super) fn stalled() -> String {
@@ -123,7 +122,7 @@ pub(super) fn r0011_011<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
                 &echo_subject,
                 &Headers::new(),
                 Bytes::from_static(b"ping"),
-                ACK_WAIT,
+                fx.request_timeout,
             )
             .await,
         )?;
@@ -154,9 +153,9 @@ pub(super) fn r0011_011<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             &silent_subject,
             &Headers::new(),
             Bytes::from_static(b"ping"),
-            Duration::from_secs(1),
+            fx.scaled(Duration::from_secs(1)),
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     expect_variant(
         "silent request",
@@ -174,9 +173,9 @@ pub(super) fn r0011_011<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             &nobody_subject,
             &Headers::new(),
             Bytes::from_static(b"ping"),
-            ACK_WAIT,
+            fx.request_timeout,
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     if ctx.bus.capabilities().no_responder_signal {
         expect_variant(
@@ -225,7 +224,7 @@ pub(super) fn r0011_012<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
                     &echo_subject,
                     &Headers::new(),
                     Bytes::copy_from_slice(word),
-                    ACK_WAIT,
+                    fx.request_timeout,
                 )
                 .await,
             )?;
@@ -357,16 +356,16 @@ pub(super) fn r0011_015<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     })?;
     let d1 = settle(control, next_of(&mut c))?;
     expect_delivery(&d1, "suite.st.a", b"one", Some(seq_a))?;
-    bx("nak", d1.nak(Duration::from_secs(2)))?;
+    bx("nak", d1.nak(fx.scaled(Duration::from_secs(2))))?;
     match ready_now(next_of(&mut c)) {
         None => {}
         Some(Ok(_)) => return Err("nak'd delivery redelivered before its delay".to_owned()),
         Some(Err(reason)) => return Err(reason),
     }
-    let before = control.now();
+    let before = control.now()?;
     let d2 = settle(control, next_of(&mut c))?;
-    let waited = control.now().saturating_sub(before);
-    if waited < Duration::from_secs(2) {
+    let waited = control.now()?.saturating_sub(before);
+    if waited < fx.scaled(Duration::from_secs(2)) {
         return Err(format!(
             "nak redelivery after {waited:?}, expected at least 2s"
         ));
@@ -400,9 +399,9 @@ pub(super) fn r0011_015<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         Some(Ok(_)) => return Err("unacked delivery redelivered before ack_wait".to_owned()),
         Some(Err(reason)) => return Err(reason),
     }
-    let before = control.now();
+    let before = control.now()?;
     let d5 = settle(control, next_of(&mut c))?;
-    let waited = control.now().saturating_sub(before);
+    let waited = control.now()?.saturating_sub(before);
     if waited < fx.ack_wait {
         return Err(format!(
             "ack_wait redelivery after {waited:?}, expected at least {:?}",
@@ -451,7 +450,7 @@ pub(super) fn r0011_019<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             )),
         }
     })?;
-    control.restart_bus();
+    control.restart_bus()?;
     settle(control, async {
         let mut c = open(
             bus,
@@ -564,7 +563,7 @@ pub(super) fn r0011_023<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             )),
         }
     })?;
-    ctx.control.advance(window);
+    ctx.control.advance(window)?;
     settle(ctx.control, async {
         let outside = bus
             .append(
@@ -625,7 +624,7 @@ pub(super) fn r0011_024<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             &filter,
             StartPosition::FromSeq(seqs[0]),
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     match lost {
         Err(BusError::Unavailable {
@@ -694,7 +693,7 @@ pub(super) fn r0011_032<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             &Headers::new(),
             Bytes::from(vec![0_u8; max]),
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     if let Err(e) = at_limit {
         return Err(format!(
@@ -709,7 +708,7 @@ pub(super) fn r0011_032<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             &Headers::new(),
             Bytes::from(vec![0_u8; max + 1]),
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     expect_variant(
         "publish over max_message_size",

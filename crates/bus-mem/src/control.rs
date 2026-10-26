@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use a2a_types::ids::TenantId;
 use bus_api::control::{BusControl, Fault};
+use bus_api::error::BusError;
 use bus_api::name::{ConsumerName, StreamName};
 use bus_api::value::Digest;
 use bytes::Bytes;
@@ -29,19 +30,20 @@ impl BusControl for MemControl {
         self.shared.lock().seed
     }
 
-    fn now(&self) -> Duration {
-        self.shared.lock().now
+    fn now(&self) -> Result<Duration, BusError> {
+        Ok(self.shared.lock().now)
     }
 
-    fn advance(&self, by: Duration) {
+    fn advance(&self, by: Duration) -> Result<(), BusError> {
         {
             let mut inner = self.shared.lock();
             inner.now = inner.now.saturating_add(by);
         }
         self.shared.wake();
+        Ok(())
     }
 
-    fn set_fault(&self, fault: Fault) {
+    fn set_fault(&self, fault: Fault) -> Result<(), BusError> {
         {
             let mut inner = self.shared.lock();
             match fault {
@@ -55,35 +57,42 @@ impl BusControl for MemControl {
             }
         }
         self.shared.wake();
+        Ok(())
     }
 
-    fn clear_faults(&self) {
+    fn clear_faults(&self) -> Result<(), BusError> {
         self.shared.lock().faults = Faults::default();
         self.shared.wake();
+        Ok(())
     }
 
-    fn fault_trace(&self) -> Vec<String> {
-        self.shared.lock().trace.clone()
+    fn fault_trace(&self) -> Result<Vec<String>, BusError> {
+        Ok(self.shared.lock().trace.clone())
     }
 
-    fn restart_bus(&self) {
+    fn restart_bus(&self) -> Result<(), BusError> {
         self.shared.lock().restart();
         self.shared.wake();
+        Ok(())
     }
 
-    fn crash_consumer(&self, stream: &StreamName, consumer: &ConsumerName) -> bool {
+    fn crash_consumer(
+        &self,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+    ) -> Result<bool, BusError> {
         let found = self
             .shared
             .lock()
             .crash_consumer(&(stream.clone(), consumer.clone()));
         self.shared.wake();
-        found
+        Ok(found)
     }
 
-    fn corrupt_blob(&self, tenant: &TenantId, digest: &Digest) -> bool {
+    fn corrupt_blob(&self, tenant: &TenantId, digest: &Digest) -> Result<bool, BusError> {
         let mut inner = self.shared.lock();
         let Some(existing) = inner.blobs.get(&(tenant.clone(), *digest)).cloned() else {
-            return false;
+            return Ok(false);
         };
         let mut bytes = existing.to_vec();
         match bytes.first_mut() {
@@ -93,6 +102,6 @@ impl BusControl for MemControl {
         inner
             .blobs
             .insert((tenant.clone(), *digest), Bytes::from(bytes));
-        true
+        Ok(true)
     }
 }

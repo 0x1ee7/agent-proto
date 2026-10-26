@@ -5,22 +5,30 @@ binding can run it, and it defines the report format and claim rule.
 
 Provides:
 - `bus_contract::{BusFactory, Ctx, Gate, CheckSpec, CHECKS, run_suite, run_check}`.
-  `CHECKS` has one row per RFC-0011 requirement ID in order.
+  `BusFactory::clock()` selects the clock. `CHECKS` has one row per RFC-0011
+  requirement ID in order.
 - `fixtures::{Fixtures, StreamSpec, GrantSpec}`: the topology every check uses
   (two tenants, a client, a server, an outsider, a denied principal, streams,
-  buckets).
-- `driver::{drive, ready_now, join, STEP, BUDGET_STEPS}`: runs futures on the
-  binding's virtual clock. A future that cannot finish within the budget is a stall,
-  reported as a failure.
+  buckets). `Fixtures::new(clock)` scales `ACK_WAIT` and `OVERLOAD_RETRY_AFTER`
+  through the clock; checks wrap nominal durations with `Fixtures::scaled`.
+- `driver::{Clock, Timeline, drive, ready_now, join, STEP, BUDGET_STEPS, REAL_MIN_STEP,
+  UNSUPPORTED}`. `Clock::Virtual` moves the binding's virtual clock through
+  `BusControl::advance` and needs no sleeping. `Clock::Real { scale }` waits on the
+  wall clock; nominal durations are multiplied by `scale` in (0, 1]. `Timeline` is the
+  only path to time and fault controls; each control call returns `Result<_, String>`.
+  A future that cannot finish within the budget is a stall, reported as a failure.
 - `report::{Report, CheckResult, Outcome, Conformance, BindingInfo}`: `Report`
   implements `Display`; `Report::conformance()` applies the claim rule.
+  `Conformance::Partial { unexercised }` means no row failed but some could not run.
 
 Uses: `bus-api` (seam, `BusControl`, profile check), `a2a-types`, `bytes`, `sha2`.
 
 ## Rules
 
 - A row whose capability is undeclared is `NotApplicable` with the reason
-  `capability not declared: <names>`. Any other failed row is `Fail`.
+  `capability not declared: <names>`. A control operation the binding does not
+  provide (`BusError::Unsupported`) is `Unexercised`, printed `N/A` with the reason
+  `unsupported: <op>`; it is neither a pass nor a failure. Any other failed row is `Fail`.
 - Static and meta rows (0011-001, 002, 025, 080 to 083, 090, 091) are `NotApplicable`
   with a reason. Nothing at run time observes them.
 - The suite creates the bus through `BusFactory::create`. `withhold` names one flag to

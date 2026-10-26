@@ -21,6 +21,8 @@ dev-dependency to run the suite against this binding.
 
 - Time is virtual. It moves only through `BusControl::advance`. Request timeouts and
   `ack_wait` are deadlines on that clock.
+- `MemControl` supports every `BusControl` operation, so its methods always return `Ok`
+  and never `Unsupported`. The suite runs it with `Clock::Virtual` (`BusFactory::clock`).
 - Faults draw from one generator seeded by `MemConfig::seed`. A fault draws only when
   its switch is installed. `fault_trace()` records drop, duplicate, partition,
   reorder, delay, restart and crash decisions in order.

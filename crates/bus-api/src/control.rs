@@ -2,14 +2,15 @@
 //!
 //! [`BusControl`] lives in `bus-api` so that conformance can drive any binding
 //! through one trait. Only simulation bindings need to implement it fully; a
-//! binding without a virtual clock or fault switches reports
-//! [`BusError::Unsupported`] through its own control type where applicable.
+//! binding without a virtual clock or fault switch reports
+//! [`BusError::Unsupported`] naming the operation.
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use a2a_types::ids::TenantId;
 
+use crate::error::BusError;
 use crate::name::{ConsumerName, Principal, StreamName};
 use crate::value::Digest;
 
@@ -75,38 +76,71 @@ pub enum Fault {
 
 /// Simulation control of a binding. Time is virtual where the binding has
 /// one, so tests never sleep on the wall clock.
+///
+/// Every method except [`BusControl::seed`] returns
+/// [`BusError::Unsupported`] naming the fault or clock operation when the
+/// binding cannot provide it. The conformance suite reports those rows as
+/// unexercised rather than failed.
 pub trait BusControl: Send + Sync {
     /// The seed that determines every fault decision.
     fn seed(&self) -> u64;
 
-    /// Current virtual time since the binding was created.
-    fn now(&self) -> Duration;
+    /// Current time since the binding was created.
+    ///
+    /// # Errors
+    /// [`BusError::Unsupported`] when the binding has no clock it can report.
+    fn now(&self) -> Result<Duration, BusError>;
 
     /// Advances virtual time by `by`, waking timers that became due.
-    fn advance(&self, by: Duration);
+    ///
+    /// # Errors
+    /// [`BusError::Unsupported`] when the binding has no virtual clock.
+    fn advance(&self, by: Duration) -> Result<(), BusError>;
 
     /// Installs a fault. Faults stack until [`BusControl::clear_faults`].
-    fn set_fault(&self, fault: Fault);
+    ///
+    /// # Errors
+    /// [`BusError::Unsupported`] when the binding cannot inject this fault.
+    fn set_fault(&self, fault: Fault) -> Result<(), BusError>;
 
     /// Removes every installed fault.
-    fn clear_faults(&self);
+    ///
+    /// # Errors
+    /// [`BusError::Unsupported`] when the binding has no fault switches.
+    fn clear_faults(&self) -> Result<(), BusError>;
 
     /// Human-readable record of each fault decision, in order. Equal seeds and
     /// equal inputs give equal traces (RFC-0011 [0011-061]).
-    fn fault_trace(&self) -> Vec<String>;
+    ///
+    /// # Errors
+    /// [`BusError::Unsupported`] when the binding has no fault switches.
+    fn fault_trace(&self) -> Result<Vec<String>, BusError>;
 
     /// Simulates a bus restart: acknowledged state is kept, pending requests
     /// fail, unacknowledged deliveries are redelivered. Reopens a closed bus.
-    fn restart_bus(&self);
+    ///
+    /// # Errors
+    /// [`BusError::Unsupported`] when the binding cannot simulate a restart.
+    fn restart_bus(&self) -> Result<(), BusError>;
 
     /// Simulates a consumer crash. Its unacknowledged deliveries become
     /// redeliverable and its old handles fail. Returns `false` if the consumer
     /// does not exist.
-    fn crash_consumer(&self, stream: &StreamName, consumer: &ConsumerName) -> bool;
+    ///
+    /// # Errors
+    /// [`BusError::Unsupported`] when the binding cannot simulate a crash.
+    fn crash_consumer(
+        &self,
+        stream: &StreamName,
+        consumer: &ConsumerName,
+    ) -> Result<bool, BusError>;
 
     /// Corrupts stored blob bytes for `digest` in `tenant`'s namespace, so the
     /// next read must report corruption. Returns `false` if the blob is absent.
-    fn corrupt_blob(&self, tenant: &TenantId, digest: &Digest) -> bool;
+    ///
+    /// # Errors
+    /// [`BusError::Unsupported`] when the binding cannot corrupt stored bytes.
+    fn corrupt_blob(&self, tenant: &TenantId, digest: &Digest) -> Result<bool, BusError>;
 }
 
 #[cfg(test)]

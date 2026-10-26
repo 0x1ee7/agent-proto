@@ -14,7 +14,6 @@ use bytes::Bytes;
 use super::support::{expect_delivery, headers, next_of, open, put, seq_of};
 use super::{BusFactory, Ctx, bx, expect_denied, pat, settle, subj};
 use crate::driver::join;
-use crate::fixtures::ACK_WAIT;
 
 fn key(text: &str) -> Result<Key, String> {
     Key::parse(text).map_err(|e| format!("key {text}: {e}"))
@@ -54,7 +53,7 @@ pub(super) fn r0011_040<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
                 &subj("rpc.echo")?,
                 &Headers::new(),
                 Bytes::new(),
-                Duration::from_secs(1),
+                fx.scaled(Duration::from_secs(1)),
             )
             .await,
         )?;
@@ -129,8 +128,14 @@ fn principal_not_spoofable<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String
     let client = async {
         bx(
             "request",
-            bus.request(&fx.client, &echo_subject, &forged, body.clone(), ACK_WAIT)
-                .await,
+            bus.request(
+                &fx.client,
+                &echo_subject,
+                &forged,
+                body.clone(),
+                fx.request_timeout,
+            )
+            .await,
         )?;
         Ok::<(), String>(())
     };

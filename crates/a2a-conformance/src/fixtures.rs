@@ -5,6 +5,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use crate::driver::Clock;
 use a2a_types::ids::TenantId;
 use bus_api::name::{Bucket, ConsumerName, Principal, StreamName, SubjectPattern};
 
@@ -52,7 +53,7 @@ pub struct GrantSpec {
 }
 
 /// The fixture topology.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Fixtures {
     /// Tenant the suite's principals live in.
     pub local: TenantId,
@@ -88,15 +89,25 @@ pub struct Fixtures {
     pub overload_retry_after: Duration,
     /// Per-tenant blob quota in bytes.
     pub blob_quota: usize,
+    /// Deadline for suite requests, scaled to the clock.
+    pub request_timeout: Duration,
+    /// Clock the nominal durations were scaled to.
+    pub clock: Clock,
 }
 
 impl Fixtures {
-    /// Builds the fixture topology.
+    /// Converts a nominal suite duration to the clock this run uses.
+    #[must_use]
+    pub fn scaled(&self, nominal: Duration) -> Duration {
+        self.clock.scaled(nominal)
+    }
+
+    /// Builds the fixture topology on `clock`.
     ///
     /// # Errors
     /// Returns a message when a fixture constant fails validation (a bug in
     /// the suite, reported rather than panicking).
-    pub fn new() -> Result<Self, String> {
+    pub fn new(clock: Clock) -> Result<Self, String> {
         let local = tenant("local")?;
         let other = tenant("other")?;
         let client = principal("suite-client")?;
@@ -167,9 +178,11 @@ impl Fixtures {
             consumer,
             stream,
             retained,
-            ack_wait: ACK_WAIT,
-            overload_retry_after: OVERLOAD_RETRY_AFTER,
+            ack_wait: clock.scaled(ACK_WAIT),
+            overload_retry_after: clock.scaled(OVERLOAD_RETRY_AFTER),
+            request_timeout: clock.scaled(ACK_WAIT),
             blob_quota: BLOB_QUOTA,
+            clock,
         })
     }
 }

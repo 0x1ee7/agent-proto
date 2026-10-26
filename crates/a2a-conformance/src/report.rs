@@ -4,6 +4,8 @@
 //! binding identity, declared capability values and seed. Its
 //! [`Report::conformance`] applies the claim rule: any failed row withholds the
 //! claim. Rows that are not applicable (capability undeclared) do not block it.
+//! A row the binding could not run (`Unexercised`) leaves the result
+//! [`Conformance::Partial`]: no claim, but no failure.
 
 use std::fmt::{self, Display, Formatter};
 
@@ -19,6 +21,10 @@ pub enum Outcome {
     /// The row does not apply: a capability is undeclared, or the row is not
     /// observable at run time (the reason says which).
     NotApplicable,
+    /// The row could not run: the binding does not provide a control
+    /// operation it needs. Neither a pass nor a failure ([0011-082]); the
+    /// reason names the missing operation.
+    Unexercised,
 }
 
 impl Outcome {
@@ -29,6 +35,7 @@ impl Outcome {
             Self::Pass => "PASS",
             Self::Fail => "FAIL",
             Self::NotApplicable => "N/A",
+            Self::Unexercised => "N/A",
         }
     }
 }
@@ -74,6 +81,12 @@ pub enum Conformance {
         /// Ids of failed rows, in report order.
         failed: Vec<&'static str>,
     },
+    /// No row failed, but some rows could not run because the binding lacks a
+    /// control operation they need. Nothing is claimed for those rows.
+    Partial {
+        /// Ids of unexercised rows, in report order.
+        unexercised: Vec<&'static str>,
+    },
 }
 
 /// A complete suite run.
@@ -92,20 +105,30 @@ pub struct Report {
 }
 
 impl Report {
-    /// Applies the claim rule: any failed row withholds the claim.
+    /// Applies the claim rule. Any failed row withholds the claim. Otherwise,
+    /// rows the binding could not run (unexercised) leave the result partial:
+    /// no claim, but no failure either ([0011-082]). Not-applicable rows block
+    /// neither ([0011-083]).
     #[must_use]
     pub fn conformance(&self) -> Conformance {
-        let failed: Vec<&'static str> = self
-            .results
-            .iter()
-            .filter(|result| result.outcome == Outcome::Fail)
-            .map(|result| result.id)
-            .collect();
-        if failed.is_empty() {
+        let failed = self.ids_with(Outcome::Fail);
+        if !failed.is_empty() {
+            return Conformance::Withheld { failed };
+        }
+        let unexercised = self.ids_with(Outcome::Unexercised);
+        if unexercised.is_empty() {
             Conformance::Claimed
         } else {
-            Conformance::Withheld { failed }
+            Conformance::Partial { unexercised }
         }
+    }
+
+    fn ids_with(&self, outcome: Outcome) -> Vec<&'static str> {
+        self.results
+            .iter()
+            .filter(|result| result.outcome == outcome)
+            .map(|result| result.id)
+            .collect()
     }
 }
 
@@ -129,6 +152,11 @@ impl Display for Report {
             Conformance::Withheld { failed } => {
                 writeln!(f, "conformance: withheld (failed: {})", failed.join(", "))
             }
+            Conformance::Partial { unexercised } => writeln!(
+                f,
+                "conformance: partial (unexercised: {})",
+                unexercised.join(", ")
+            ),
         }
     }
 }

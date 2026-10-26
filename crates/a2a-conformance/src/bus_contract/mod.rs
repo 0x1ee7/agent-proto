@@ -2,7 +2,7 @@
 //!
 //! Every row of RFC-0011 that a runtime check can observe has one entry in
 //! [`CHECKS`]. Each check builds a fresh binding through [`BusFactory`], runs
-//! against the virtual clock ([`crate::driver`]), and yields a
+//! against the clock from [`BusFactory::clock`] ([`crate::driver`]), and yields a
 //! [`CheckResult`]. Rows that cannot be observed at run time (compile-time or
 //! governance rules) report `NotApplicable` with the reason.
 
@@ -14,7 +14,7 @@ use bus_api::control::BusControl;
 use bus_api::error::BusError;
 use bus_api::name::{Subject, SubjectPattern};
 
-use crate::driver::drive;
+use crate::driver::{Clock, Timeline, UNSUPPORTED, drive};
 use crate::fixtures::Fixtures;
 use crate::report::{BindingInfo, CheckResult, Outcome, Report};
 
@@ -35,11 +35,15 @@ mod tenancy;
 pub trait BusFactory {
     /// The binding under test.
     type Bus: Bus;
-    /// Its virtual clock and fault controls.
+    /// Its time and fault controls.
     type Control: BusControl;
 
     /// Name and version reported in the conformance report.
     fn binding(&self) -> BindingInfo;
+    /// Clock the suite scales nominal durations to. Bindings with a virtual
+    /// clock return [`Clock::Virtual`]; bindings on wall time return
+    /// [`Clock::Real`].
+    fn clock(&self) -> Clock;
 
     /// Starts a fresh binding.
     ///
@@ -59,8 +63,8 @@ pub struct Ctx<'a, F: BusFactory> {
     pub factory: &'a F,
     /// The binding under test.
     pub bus: &'a F::Bus,
-    /// Virtual clock and faults of [`Ctx::bus`].
-    pub control: &'a F::Control,
+    /// Time and faults of [`Ctx::bus`], moved only through [`Timeline`].
+    pub control: &'a Timeline<'a, F::Control>,
     /// Shared fixture topology.
     pub fx: &'a Fixtures,
     /// Seed the binding was started with.
@@ -391,7 +395,7 @@ const FLAG_GUARDS: &[(&str, &[&str])] = &[
 /// # Errors
 /// Returns an error when the fixtures or the first binding cannot be built.
 pub fn run_suite<F: BusFactory>(factory: &F, seed: u64) -> Result<Report, String> {
-    let fx = Fixtures::new()?;
+    let fx = Fixtures::new(factory.clock())?;
     let (bus, control) = factory
         .create(&fx, seed, None)
         .map_err(|e| format!("binding failed to start: {e:?}"))?;
@@ -427,7 +431,7 @@ pub fn run_check<F: BusFactory>(factory: &F, id: &str, seed: u64) -> Result<Chec
         .iter()
         .find(|spec| spec.id == id)
         .ok_or_else(|| format!("unknown requirement id {id}"))?;
-    let fx = Fixtures::new()?;
+    let fx = Fixtures::new(factory.clock())?;
     let (bus, _) = factory
         .create(&fx, seed, None)
         .map_err(|e| format!("binding failed to start: {e:?}"))?;
@@ -471,16 +475,27 @@ fn run_spec<F: BusFactory>(
             );
         }
     };
+    let timeline = Timeline::new(&control, fx.clock);
     let ctx = Ctx {
         factory,
         bus: &bus,
-        control: &control,
+        control: &timeline,
         fx,
         seed,
     };
-    match dispatch(spec.id, &ctx) {
-        Ok(()) => CheckResult::new(spec.id, Outcome::Pass, spec.title),
-        Err(reason) => CheckResult::new(spec.id, Outcome::Fail, reason),
+    classify(spec.id, spec.title, dispatch(spec.id, &ctx))
+}
+
+/// Maps a check result to an outcome. A check whose binding lacks a control
+/// operation reports [`UNSUPPORTED`]; that row is unexercised, neither passed
+/// nor failed ([0011-082]).
+fn classify(id: &'static str, title: &'static str, result: Result<(), String>) -> CheckResult {
+    match result {
+        Ok(()) => CheckResult::new(id, Outcome::Pass, title),
+        Err(reason) if reason.starts_with(UNSUPPORTED) => {
+            CheckResult::new(id, Outcome::Unexercised, reason)
+        }
+        Err(reason) => CheckResult::new(id, Outcome::Fail, reason),
     }
 }
 
@@ -563,17 +578,16 @@ fn coverage(capabilities: &Capabilities, results: &mut [CheckResult]) {
     }
 }
 
-/// Runs `fut` on the binding's virtual clock, failing when it stalls.
+/// Runs `fut` on the binding's clock, failing when it stalls.
 pub(crate) fn settle<C, T>(
-    control: &C,
+    timeline: &Timeline<'_, C>,
     fut: impl Future<Output = Result<T, String>>,
 ) -> Result<T, String>
 where
     C: BusControl + ?Sized,
 {
-    drive(control, fut).unwrap_or_else(|| {
-        Err("operation did not complete within the virtual-time budget".to_owned())
-    })
+    drive(timeline, fut)?
+        .unwrap_or_else(|| Err("operation did not complete within the time budget".to_owned()))
 }
 
 /// Maps a binding error into a labelled failure string.
@@ -616,4 +630,34 @@ pub(crate) fn subj(value: &str) -> Result<Subject, String> {
 /// Parses a subject pattern, labelling the failure.
 pub(crate) fn pat(value: &str) -> Result<SubjectPattern, String> {
     SubjectPattern::parse(value).map_err(|e| format!("pattern {value}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // [0011-082] a control operation the binding lacks leaves the row
+    // unexercised: not a pass, and not a failure that withholds the claim.
+    #[test]
+    fn req_0011_082_unsupported_control_is_unexercised_not_failed() {
+        let reason = format!("{UNSUPPORTED}drop");
+        let result = classify("0011-020", "title", Err(reason.clone()));
+        assert_eq!(result.outcome, Outcome::Unexercised);
+        assert_eq!(result.reason, reason);
+    }
+
+    // [0011-082] any other error is a real failure.
+    #[test]
+    fn req_0011_082_other_errors_still_fail() {
+        let result = classify("0011-020", "title", Err("sequence mismatch".to_owned()));
+        assert_eq!(result.outcome, Outcome::Fail);
+    }
+
+    // [0011-082] a passing check keeps its title as reason.
+    #[test]
+    fn req_0011_082_pass_keeps_title() {
+        let result = classify("0011-020", "the title", Ok(()));
+        assert_eq!(result.outcome, Outcome::Pass);
+        assert_eq!(result.reason, "the title");
+    }
 }

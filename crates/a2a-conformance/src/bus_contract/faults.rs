@@ -17,7 +17,7 @@ use sha2::{Digest as _, Sha256};
 use super::messaging::stalled;
 use super::support::{expect_delivery, next_of, open, put, seq_of};
 use super::{BusFactory, Ctx, bx, pat, settle, subj};
-use crate::driver::{drive, ready_now};
+use crate::driver::{Timeline, drive, ready_now};
 use crate::fixtures::Fixtures;
 
 /// Transcript of a scripted run: deliveries seen and the fault trace.
@@ -31,8 +31,12 @@ fn window(size: usize) -> Result<NonZeroUsize, String> {
     NonZeroUsize::new(size).ok_or_else(|| "reorder window must be non-zero".to_owned())
 }
 
-fn grew(control: &impl BusControl, before: usize, what: &str) -> Result<(), String> {
-    if control.fault_trace().len() > before {
+fn grew<C: BusControl + ?Sized>(
+    control: &Timeline<'_, C>,
+    before: usize,
+    what: &str,
+) -> Result<(), String> {
+    if control.fault_trace()?.len() > before {
         Ok(())
     } else {
         Err(format!(
@@ -48,7 +52,7 @@ pub(super) fn r0011_020<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     let bus = ctx.bus;
     let control = ctx.control;
 
-    control.set_fault(Fault::Drop(prob(1.0)?));
+    control.set_fault(Fault::Drop(prob(1.0)?))?;
     let seq = settle(control, async {
         seq_of(&put(bus, &fx.client, "suite.fl.a", b"f1").await?)
     })?;
@@ -68,13 +72,13 @@ pub(super) fn r0011_020<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         Some(Ok(_)) => return Err("delivery was not dropped under Drop(1.0)".to_owned()),
         Some(Err(reason)) => return Err(reason),
     }
-    control.clear_faults();
-    control.advance(fx.ack_wait);
+    control.clear_faults()?;
+    control.advance(fx.ack_wait)?;
     let d = settle(control, next_of(&mut c))?;
     expect_delivery(&d, "suite.fl.a", b"f1", Some(seq))?;
     bx("ack", d.ack())?;
 
-    control.set_fault(Fault::Duplicate(prob(1.0)?));
+    control.set_fault(Fault::Duplicate(prob(1.0)?))?;
     let seq = settle(control, async {
         seq_of(&put(bus, &fx.client, "suite.fl.b", b"f2").await?)
     })?;
@@ -92,7 +96,7 @@ pub(super) fn r0011_020<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     let d = settle(control, next_of(&mut c))?;
     expect_delivery(&d, "suite.fl.b", b"f2", Some(seq))?;
     bx("ack", d.ack())?;
-    control.clear_faults();
+    control.clear_faults()?;
     Ok(())
 }
 
@@ -115,7 +119,7 @@ pub(super) fn r0011_021<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         Ok::<(), String>(())
     })?;
 
-    control.set_fault(Fault::Reorder { window: window(4)? });
+    control.set_fault(Fault::Reorder { window: window(4)? })?;
     let mut c = settle(
         control,
         open(
@@ -133,7 +137,7 @@ pub(super) fn r0011_021<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         seen.push((d.subject().as_str().to_owned(), d.payload().to_vec()));
         bx("ack", d.ack())?;
     }
-    control.clear_faults();
+    control.clear_faults()?;
 
     let on = |subject: &str| -> Vec<Vec<u8>> {
         seen.iter()
@@ -162,8 +166,8 @@ pub(super) fn r0011_060<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     let bus = ctx.bus;
     let control = ctx.control;
 
-    let before = control.fault_trace().len();
-    control.set_fault(Fault::Drop(prob(1.0)?));
+    let before = control.fault_trace()?.len();
+    control.set_fault(Fault::Drop(prob(1.0)?))?;
     settle(control, async {
         put(bus, &fx.client, "suite.f60.drop", b"d").await?;
         Ok::<(), String>(())
@@ -184,11 +188,11 @@ pub(super) fn r0011_060<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         Some(Ok(_)) => return Err("dropped delivery was delivered".to_owned()),
         Some(Err(reason)) => return Err(reason),
     }
-    control.clear_faults();
+    control.clear_faults()?;
     grew(control, before, "drop")?;
 
-    let before = control.fault_trace().len();
-    control.set_fault(Fault::Duplicate(prob(1.0)?));
+    let before = control.fault_trace()?.len();
+    control.set_fault(Fault::Duplicate(prob(1.0)?))?;
     settle(control, async {
         put(bus, &fx.client, "suite.f60.dup", b"u").await?;
         Ok::<(), String>(())
@@ -206,10 +210,10 @@ pub(super) fn r0011_060<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     )?;
     let d = settle(control, next_of(&mut c))?;
     bx("ack", d.ack())?;
-    control.clear_faults();
+    control.clear_faults()?;
     grew(control, before, "duplicate")?;
 
-    control.set_fault(Fault::Reorder { window: window(2)? });
+    control.set_fault(Fault::Reorder { window: window(2)? })?;
     settle(control, async {
         put(bus, &fx.client, "suite.f60.ro.a", b"r1").await?;
         put(bus, &fx.client, "suite.f60.ro.b", b"r2").await?;
@@ -228,9 +232,11 @@ pub(super) fn r0011_060<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         }
         Ok::<(), String>(())
     })?;
-    control.clear_faults();
+    control.clear_faults()?;
 
-    control.set_fault(Fault::Delay(DelayDist::Fixed(Duration::from_secs(1))));
+    control.set_fault(Fault::Delay(DelayDist::Fixed(
+        fx.scaled(Duration::from_secs(1)),
+    )))?;
     settle(control, async {
         put(bus, &fx.client, "suite.f60.dl", b"l").await?;
         let mut c = open(
@@ -246,15 +252,15 @@ pub(super) fn r0011_060<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         bx("ack", d.ack())?;
         Ok::<(), String>(())
     })?;
-    control.clear_faults();
+    control.clear_faults()?;
 
-    let before = control.fault_trace().len();
+    let before = control.fault_trace()?.len();
     let server = fx.server.clone();
     let client = fx.client.clone();
     control.set_fault(Fault::Partition {
         set_a: vec![client.clone()],
         set_b: vec![server.clone()],
-    });
+    })?;
     let echo = pat("rpc.echo")?;
     let _serving = settle(control, async {
         bx("serve", bus.serve(&server, &echo).await)
@@ -267,26 +273,26 @@ pub(super) fn r0011_060<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             &echo_subject,
             &Headers::new(),
             Bytes::from_static(b"p"),
-            Duration::from_secs(1),
+            fx.scaled(Duration::from_secs(1)),
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     match out {
         Err(BusError::Timeout | BusError::Unavailable { .. }) => {}
         other => return Err(format!("partitioned request: unexpected {other:?}")),
     }
-    control.clear_faults();
+    control.clear_faults()?;
     grew(control, before, "partition")?;
 
-    let before = control.fault_trace().len();
-    control.restart_bus();
+    let before = control.fault_trace()?.len();
+    control.restart_bus()?;
     settle(control, async {
         put(bus, &fx.client, "suite.f60.rs", b"after").await?;
         Ok::<(), String>(())
     })?;
     grew(control, before, "restart")?;
 
-    let before = control.fault_trace().len();
+    let before = control.fault_trace()?.len();
     settle(control, async {
         put(bus, &fx.client, "suite.f60.cr", b"crash").await?;
         Ok::<(), String>(())
@@ -304,7 +310,7 @@ pub(super) fn r0011_060<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             StartPosition::FromFirst,
         ),
     )?;
-    if !control.crash_consumer(&fx.stream, &crash_consumer) {
+    if !control.crash_consumer(&fx.stream, &crash_consumer)? {
         return Err("crash_consumer found no consumer to crash".to_owned());
     }
     grew(control, before, "crash consumer")?;
@@ -336,11 +342,11 @@ pub(super) fn r0011_060<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
 async fn scripted<B: Bus, C: BusControl>(
     bus: &B,
     fx: &Fixtures,
-    control: &C,
+    control: &Timeline<'_, C>,
 ) -> Result<Transcript, String> {
-    control.set_fault(Fault::Drop(prob(0.5)?));
-    control.set_fault(Fault::Duplicate(prob(0.5)?));
-    control.set_fault(Fault::Reorder { window: window(2)? });
+    control.set_fault(Fault::Drop(prob(0.5)?))?;
+    control.set_fault(Fault::Duplicate(prob(0.5)?))?;
+    control.set_fault(Fault::Reorder { window: window(2)? })?;
     for i in 0..6 {
         let subject = format!("suite.det.{i}");
         put(bus, &fx.client, &subject, b"det").await?;
@@ -370,8 +376,8 @@ async fn scripted<B: Bus, C: BusControl>(
             Some(Err(reason)) => return Err(reason),
         }
     }
-    control.clear_faults();
-    Ok((deliveries, control.fault_trace()))
+    control.clear_faults()?;
+    Ok((deliveries, control.fault_trace()?))
 }
 
 /// [0011-061] faults are deterministic under the seed: the same seed and the
@@ -379,8 +385,10 @@ async fn scripted<B: Bus, C: BusControl>(
 pub(super) fn r0011_061<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     let (bus_a, control_a) = bx("create", ctx.factory.create(ctx.fx, ctx.seed, None))?;
     let (bus_b, control_b) = bx("create", ctx.factory.create(ctx.fx, ctx.seed, None))?;
-    let a = settle(&control_a, scripted(&bus_a, ctx.fx, &control_a))?;
-    let b = settle(&control_b, scripted(&bus_b, ctx.fx, &control_b))?;
+    let ta = Timeline::new(&control_a, ctx.fx.clock);
+    let tb = Timeline::new(&control_b, ctx.fx.clock);
+    let a = settle(&ta, scripted(&bus_a, ctx.fx, &ta))?;
+    let b = settle(&tb, scripted(&bus_b, ctx.fx, &tb))?;
     if a.1.is_empty() {
         return Err("seeded script injected no faults".to_owned());
     }
@@ -405,9 +413,9 @@ pub(super) fn r0011_062<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     let fx = ctx.fx;
     let bus = ctx.bus;
     let control = ctx.control;
-    control.set_fault(Fault::Drop(prob(0.3)?));
-    control.set_fault(Fault::Duplicate(prob(0.3)?));
-    control.set_fault(Fault::Reorder { window: window(4)? });
+    control.set_fault(Fault::Drop(prob(0.3)?))?;
+    control.set_fault(Fault::Duplicate(prob(0.3)?))?;
+    control.set_fault(Fault::Reorder { window: window(4)? })?;
     settle(control, async {
         for (subject, payload) in SIX {
             put(bus, &fx.client, subject, payload.as_bytes()).await?;
@@ -428,7 +436,7 @@ pub(super) fn r0011_062<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
                     if delivered.iter().all(|done| *done) {
                         break;
                     }
-                    control.advance(fx.ack_wait);
+                    control.advance(fx.ack_wait)?;
                 }
                 Some(Ok(d)) => {
                     let Some(index) = SIX.iter().position(|(s, _)| *s == d.subject().as_str())
@@ -450,7 +458,7 @@ pub(super) fn r0011_062<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         }
         Ok::<(), String>(())
     })?;
-    control.clear_faults();
+    control.clear_faults()?;
     Ok(())
 }
 
@@ -480,7 +488,7 @@ pub(super) fn r0011_063<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         drop(held);
         Ok::<(), String>(())
     })?;
-    control.restart_bus();
+    control.restart_bus()?;
     settle(control, async {
         let mut c = open(
             bus,
@@ -531,7 +539,7 @@ pub(super) fn r0011_064<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     control.set_fault(Fault::Partition {
         set_a: vec![client.clone()],
         set_b: vec![server.clone()],
-    });
+    })?;
     let appended = drive(
         control,
         bus.append(
@@ -542,7 +550,7 @@ pub(super) fn r0011_064<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             payload.clone(),
             &msg_id,
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     match appended {
         Err(BusError::Timeout | BusError::Unavailable { .. }) => {}
@@ -556,15 +564,15 @@ pub(super) fn r0011_064<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             &echo_subject,
             &Headers::new(),
             Bytes::from_static(b"p"),
-            Duration::from_secs(1),
+            fx.scaled(Duration::from_secs(1)),
         ),
-    )
+    )?
     .ok_or_else(stalled)?;
     match requested {
         Err(BusError::Timeout | BusError::Unavailable { .. }) => {}
         other => return Err(format!("request under partition: unexpected {other:?}")),
     }
-    control.clear_faults();
+    control.clear_faults()?;
 
     let ack = settle(control, async {
         bx(

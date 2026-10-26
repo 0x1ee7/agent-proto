@@ -2,7 +2,6 @@
 
 use bus_api::bus::Bus;
 use bus_api::capabilities::{A2A_BUS_M1, FLAG_NAMES, M1_MIN_DEDUPE_WINDOW, Profile, ProfileError};
-use bus_api::control::BusControl;
 use bytes::Bytes;
 
 use super::support::put;
@@ -36,7 +35,7 @@ pub(super) fn r0011_018<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         )?;
         Ok::<(), String>(())
     })?;
-    ctx.control.restart_bus();
+    ctx.control.restart_bus()?;
     if bus.capabilities() != &before {
         return Err("capabilities changed after operations and restart".to_owned());
     }

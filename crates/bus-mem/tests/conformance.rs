@@ -1,6 +1,7 @@
 //! Runs the RFC-0011 conformance suite against the in-memory binding.
 
 use a2a_conformance::bus_contract::{BusFactory, CHECKS, run_suite};
+use a2a_conformance::driver::Clock;
 use a2a_conformance::fixtures::Fixtures;
 use a2a_conformance::report::{BindingInfo, Conformance, Outcome, Report};
 use bus_api::error::BusError;
@@ -20,6 +21,10 @@ impl BusFactory for MemFactory {
             name: "bus-mem",
             version: env!("CARGO_PKG_VERSION"),
         }
+    }
+
+    fn clock(&self) -> Clock {
+        Clock::Virtual
     }
 
     fn create(
@@ -96,6 +101,9 @@ fn req_0011_080_suite_runs_offline_against_bus_mem() -> Result<(), String> {
     match report.conformance() {
         Conformance::Claimed => Ok(()),
         Conformance::Withheld { failed } => Err(format!("claim withheld: {failed:?}")),
+        Conformance::Partial { unexercised } => {
+            Err(format!("claim partial, unexercised: {unexercised:?}"))
+        }
     }
 }
 
