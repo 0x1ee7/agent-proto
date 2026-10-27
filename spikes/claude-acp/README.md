@@ -51,8 +51,8 @@ Stub results are observed-with-stub, not real-model results.
 Prompt directives understood by the stub (in a user message containing `STUB:`):
 `STUB:WRITE:<name>` (Write tool), `STUB:READ:<name>` (Read), `STUB:BASH:<cmd>` (Bash),
 `STUB:LONG` (200 text chunks at 50 ms), `STUB:REMEMBER:<word>` (replies OK), `STUB:RECALL` (echoes the remembered word),
-`STUB:PLAIN` (plain "OK"). After a tool result the stub replies `DONE`. Requests without tools get `OK`.
-`STUB:A2A:<agent>:<text>` emits one `a2a_send` tool call (matched by suffix to the a2abus MCP tool). It only reaches a peer when the session is offered the a2abus MCP tools; see `docs/spikes/e2e-m1.md` S3.
+`STUB:PLAIN` (plain "OK"). After a tool result the stub replies `DONE`, except after a `ToolSearch` result, where the turn continues. Requests without tools get `OK`.
+`STUB:A2A:<agent>:<text>` makes one `a2a_send` call on the a2abus MCP tool. Claude Code defers MCP tools, so when the session has them the stub first calls `ToolSearch` with `select:mcp__a2abus__a2a_send` (the full name is announced in a system reminder), then calls the full name; a tool already in `tools` is called directly. The stub log `stub-<name>.jsonl` records `tools_offered` and `deferred` (announced `mcp__*` names). `tools_offered` alone does not show which MCP tools a session has. See `docs/spikes/e2e-m1.md` Re-run 2026-10-27f. Behavior tests: `python spikes/claude-acp/test_stub_anthropic.py`.
 
 Outputs: `.spikes/claude-acp/out/<scenario>.jsonl` (frame log, redacted), `*.stderr.log`, and `stub-<name>.jsonl` (stub request log).
 Work dirs: `.spikes/claude-acp/work/`. Config dirs for stub runs: `.spikes/claude-acp/cfg/`.

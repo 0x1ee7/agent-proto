@@ -6,7 +6,11 @@ It is NOT a model. It answers POST /v1/messages (streaming SSE or JSON), POST
 directive in the latest user prompt (see README.md). Usage numbers are fixed so
 they can be checked against adapter output. Runs as a daemon thread inside the
 client process; no separate process is started.
-STUB:A2A:<agent>:<text> emits one a2a_send tool call (the a2abus MCP tool, matched by suffix).
+STUB:A2A:<agent>:<text> emits one a2a_send tool call (the a2abus MCP tool). Claude Code defers MCP tools: the
+model is offered only ToolSearch and the full mcp__<server>__<tool> names are announced in a system reminder. The
+stub therefore calls ToolSearch select:<full name> first, then the full name; if the tool is already in `tools` it
+is called directly (matched by suffix). The stub log records `deferred` (announced mcp__ names) next to
+`tools_offered`, because the `tools` array alone does not show which MCP tools a session has.
 """
 import json
 import pathlib
@@ -34,6 +38,41 @@ def _tool_results(content):
     if isinstance(content, list):
         return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
     return []
+
+
+def _all_text(body):
+    """Text of the system prompt and of every message."""
+    parts = []
+    system = body.get("system")
+    if isinstance(system, str):
+        parts.append(system)
+    elif isinstance(system, list):
+        parts.append(_text_of(system))
+    for m in body.get("messages", []):
+        parts.append(_text_of(m.get("content")))
+    return "\n".join(parts)
+
+
+def _deferred_mcp(body):
+    """Full mcp__<server>__<tool> names announced as deferred (one per line in a system reminder)."""
+    found = []
+    for line in _all_text(body).splitlines():
+        line = line.strip()
+        if re.fullmatch(r"mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+", line) and line not in found:
+            found.append(line)
+    return found
+
+
+def _answers_tool_search(msgs):
+    """True when the latest user message carries only results of ToolSearch calls."""
+    if len(msgs) < 2:
+        return False
+    results = _tool_results(msgs[-1].get("content"))
+    prev = msgs[-2].get("content")
+    if not results or not isinstance(prev, list):
+        return False
+    uses = {b.get("id"): b.get("name") for b in prev if isinstance(b, dict) and b.get("type") == "tool_use"}
+    return all(uses.get(r.get("tool_use_id")) == "ToolSearch" for r in results)
 
 
 def _usage(output):
@@ -71,7 +110,8 @@ class Stub:
         msgs = body.get("messages", [])
         last = msgs[-1] if msgs else {}
         if last.get("role") == "user" and _tool_results(last.get("content")):
-            return "text", "DONE"
+            if not _answers_tool_search(msgs):
+                return "text", "DONE"
         if not body.get("tools"):
             return "text", "OK"
         prompt = ""
@@ -90,7 +130,7 @@ class Stub:
             return "tool", ("Bash", {"command": m.group(1).strip()})
         m = re.search(r"STUB:A2A:([a-z0-9][a-z0-9-]{0,47}):([^\n]+)", prompt)
         if m:
-            return "tool", ("a2a_send", {"agent": m.group(1), "text": m.group(2).strip()})
+            return "tool", self.peer_send(m.group(1), m.group(2).strip(), body, _answers_tool_search(msgs))
         if "STUB:LONG" in prompt:
             return "long", None
         if "STUB:RECALL" in prompt:
@@ -103,6 +143,19 @@ class Stub:
                         break
             return "text", word
         return "text", "OK"
+
+    def peer_send(self, agent, text, body, searched):
+        """The a2a_send call as a model that obeys Claude Code's deferred-tool rule would make it."""
+        args = {"agent": agent, "text": text}
+        names = [t.get("name", "") for t in body.get("tools", []) if isinstance(t, dict)]
+        if any(n.lower().endswith("a2a_send") for n in names):
+            return "a2a_send", args
+        deferred = [n for n in _deferred_mcp(body) if n.endswith("__a2a_send")]
+        if not deferred:
+            return "a2a_send", args
+        if not searched and "ToolSearch" in names:
+            return "ToolSearch", {"query": f"select:{deferred[0]}", "max_results": 5}
+        return deferred[0], args
 
     def resolve_tool(self, name, body):
         names = [t.get("name", "") for t in body.get("tools", []) if isinstance(t, dict)]
@@ -156,7 +209,8 @@ class _Handler(BaseHTTPRequestHandler):
             n = stub.count
         stub.note(n=n, path=self.path, stream=bool(body.get("stream")), model=body.get("model"),
                   kind=kind, tool=payload[0] if kind == "tool" else None,
-                  tools_offered=[t.get("name") for t in body.get("tools", []) if isinstance(t, dict)])
+                  tools_offered=[t.get("name") for t in body.get("tools", []) if isinstance(t, dict)],
+                  deferred=_deferred_mcp(body))
         try:
             self._respond(stub, n, body, kind, payload)
         except (BrokenPipeError, ConnectionResetError):

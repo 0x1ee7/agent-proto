@@ -32,6 +32,7 @@ Layer L4 driver (RFC-0001 section 4.2, RFC-0009 4.6, 4.10 to 4.12). An A2A v1.0 
 - Failure mapping uses HTTP status and JSON-RPC code only. `error.data` and ErrorInfo are never required.
 - Outbound text is scrubbed of the bearer secret before it leaves (0009-044). Task ids are looked up or cancelled only for the origin that created them (0009-077).
 - Every turn ends with exactly one terminal event. Reason tokens come only from the producing protocol (0009-072).
+- `can_start` is `!closed` and nothing else: it refuses exactly when `start` answers `Closed`, after `shutdown` (the Worker's `kill` shuts a backend down, and this driver does not respawn). The Worker then withdraws its RPC subscription instead of accepting turns that can only fail (0014-029). Static reading: "unhealthy means not startable" (driver-acp) has no counterpart here. `live` goes false when the peer is unreachable and returns to true as soon as a call reaches it (`apply`), and only a turn makes that call, so mapping `!live` to "cannot start" would withdraw on the first transient outage with nothing left to flip `live` back. Do not add a latched unhealthy state without a recovery probe.
 - Process and transport cleanup: no child processes. Turn tasks run on the backend's own runtime; `shutdown` bounds their wait by the grace period.
 - No `unsafe`. No `unwrap`, `expect`, `panic`, `todo!`, or `unimplemented!` outside tests.
 - ASCII only in source. No shell is spawned.
@@ -63,6 +64,7 @@ Layer L4 driver (RFC-0001 section 4.2, RFC-0009 4.6, 4.10 to 4.12). An A2A v1.0 
 - 0009-076: per-origin contextId namespacing on every request. Guarded in `namespace`, `config`, and integration tests.
 - 0009-077: visibility guard; no lookup for a foreign or unrecorded task id; map survives restart. Guarded in `ownership` and integration tests.
 - 0009-078: follow-up reuses the namespaced contextId. Guarded in `namespace` tests.
+- 0014-029: a closed backend cannot start (`can_start` agrees with `start`); an unreachable peer leaves the backend startable. Guarded in integration tests.
 
 ## Configuration keys (driver specific)
 

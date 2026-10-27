@@ -131,6 +131,13 @@ impl Backend for HttpBackend {
         }
     }
 
+    /// Refuses exactly when `start` answers `Closed`. An unreachable peer is not a latched
+    /// failure: `live` returns once a call reaches the peer, and only a turn makes that call, so
+    /// a not-live backend stays startable (RFC-0014 [0014-029]).
+    fn can_start(&self) -> bool {
+        !self.shared.closed.load(Ordering::SeqCst)
+    }
+
     fn attach(&mut self, sink: Box<dyn BackendSink>) {
         *lock(&self.shared.sink) = Some(sink);
     }

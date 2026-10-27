@@ -716,6 +716,46 @@ fn shutdown_ends_open_turn_refuses_start_and_reports_not_live() {
     assert!(!backend.health().live);
 }
 
+/// A closed backend refuses every `start` with `Closed`, so it must say so through `can_start`;
+/// otherwise the Worker keeps its RPC subscription and accepts turns that can only fail
+/// (RFC-0014 [0014-029]).
+#[test]
+fn req_0014_029_closed_backend_cannot_start() {
+    let server = Server::start(None, |_| unexpected());
+    let (mut backend, _rx) = backend(&server.base, json!({}));
+    assert!(backend.can_start(), "a fresh backend can start");
+
+    backend.shutdown(Duration::from_secs(5)).expect("shutdown");
+
+    assert_eq!(
+        backend.start(start_turn("turn-1", "hi")),
+        Err(BackendError::Closed)
+    );
+    assert!(!backend.health().live);
+    assert!(!backend.can_start(), "can_start must refuse as start does");
+}
+
+/// An unreachable peer is not a latched failure: the next turn is the probe that finds the peer
+/// again, so the backend stays startable while it is not live (RFC-0014 [0014-029]). Withdrawing
+/// here would leave nothing to flip `live` back.
+#[test]
+fn req_0014_029_unreachable_peer_leaves_backend_startable() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = closed.local_addr().expect("addr");
+    drop(closed);
+    let (mut backend, rx) = backend(&format!("http://{addr}/"), json!({}));
+
+    start(&mut backend, "turn-1", "hi");
+    let events = collect(&rx, "turn-1");
+    assert_eq!(failed_reason(&events), ReasonToken::BackendCrashed);
+
+    assert!(!backend.health().live, "the failed call marks it not live");
+    assert!(
+        backend.can_start(),
+        "an unreachable peer is retried, not given up"
+    );
+}
+
 #[test]
 fn start_without_sink_is_refused() {
     let server = Server::start(None, |_| unexpected());

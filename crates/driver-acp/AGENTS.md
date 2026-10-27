@@ -20,6 +20,7 @@
 - The driver never answers a permission or elicitation except from `ResolvePermission` or its own timeout.
 - `CanStart` (the worker's serving check) is false only when the driver is closed, failed, or unhealthy. Unhealthy is five unexpected exits inside 10 min (0009-061): the driver stops respawning and refuses `start` until the worker restarts. Conservative reading: 0009-061 says the restart waits for the operator.
 - Every turn ends with exactly one `Terminal`; nothing follows it.
+- The peer-tools `mcpServers` entry is exactly the 0015-084 shape and is the whole attach: the claude adapter maps it to a stdio server and the shim starts (verified live, D9). Claude Code defers MCP tools behind `ToolSearch`, so the model's `tools` array has no `mcp__*` name until `ToolSearch select:<name>` loads it (`docs/interop/acp-omp-claude.md` section 4.4). A missing `mcp__*` name in the offered tools is not evidence that the driver failed to attach; read the deferred-tool reminder. Do not add driver workarounds (for example setting `ENABLE_TOOL_SEARCH`); that is operator and adapter territory.
 - Live tests are `#[ignore = "live: ..."]` and run only with `--ignored`.
 
 ## Tests guarding requirement IDs
