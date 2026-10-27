@@ -6,7 +6,7 @@ use a2a_core::task::{Event, EventBody, Failure, StopReason, TaskView};
 use a2a_types::failure::FailureCode;
 use a2a_types::ids::MessageId;
 use a2a_types::proto::a2a as pb;
-use a2a_types::proto::a2abus::ApprovalRequest;
+use a2a_types::proto::a2abus::{ApprovalRequest, BudgetUsage};
 use a2a_types::vocab::FAILURE_KEY;
 use pbjson_types::{Struct, Timestamp, Value, value::Kind};
 
@@ -24,6 +24,27 @@ pub fn timestamp(ms: u64) -> Timestamp {
 fn string_value(text: &str) -> Value {
     Value {
         kind: Some(Kind::StringValue(text.to_owned())),
+    }
+}
+
+/// Parses a metadata `Struct` into a proto-shaped value. `Struct` numbers are `f64`; whole
+/// numbers become integers so the u64 fields of a proto message parse from the JSON form.
+pub(crate) fn from_struct<T: serde::de::DeserializeOwned>(data: &Struct) -> Option<T> {
+    let mut json = serde_json::to_value(data).ok()?;
+    integral_numbers(&mut json);
+    serde_json::from_value(json).ok()
+}
+
+fn integral_numbers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) if number.is_f64() => {
+            if let Some(whole) = number.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0) {
+                *value = serde_json::Value::from(whole as u64);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(integral_numbers),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(integral_numbers),
+        _ => {}
     }
 }
 
@@ -112,6 +133,21 @@ pub fn task_proto(view: &TaskView) -> pb::Task {
         .failure
         .as_ref()
         .and_then(|failure| failure_message(&view.task_id, &view.context_id, failure));
+    let metadata = view
+        .state
+        .is_terminal()
+        .then(|| usage_metadata(&view.usage))
+        .flatten();
+    let artifacts = view
+        .artifacts
+        .iter()
+        .map(|artifact| pb::Artifact {
+            artifact_id: artifact.artifact_id.clone(),
+            name: artifact.name.clone(),
+            parts: vec![artifact_part(artifact.payload.clone())],
+            ..Default::default()
+        })
+        .collect();
     pb::Task {
         id: view.task_id.clone(),
         context_id: view.context_id.clone(),
@@ -120,8 +156,26 @@ pub fn task_proto(view: &TaskView) -> pb::Task {
             message,
             timestamp: Some(timestamp(view.updated_ms)),
         }),
+        metadata,
+        artifacts,
         ..Default::default()
     }
+}
+
+/// The child's final `BudgetUsage` as the budget metadata entry of a terminal task
+/// (RFC-0006 0006-041). `None` only when the message fails to convert to a JSON object.
+#[must_use]
+pub fn usage_metadata(usage: &BudgetUsage) -> Option<Struct> {
+    let json = serde_json::to_value(usage).ok()?;
+    let body: Struct = serde_json::from_value(json).ok()?;
+    Some(Struct {
+        fields: HashMap::from([(
+            a2a_types::vocab::ext::BUDGET.to_owned(),
+            Value {
+                kind: Some(Kind::StructValue(body)),
+            },
+        )]),
+    })
 }
 
 /// Builds the `StreamResponse` for one committed event.
@@ -132,12 +186,16 @@ pub fn task_proto(view: &TaskView) -> pb::Task {
 /// `approval_body` is the full approval request for a Status event that carries an approval id,
 /// built with [`approval_metadata`] (RFC-0006 0006-006). The caller MUST supply it for those
 /// events; it is ignored otherwise.
+///
+/// `usage` is the hop's `BudgetUsage` for a terminal Status event; it is carried in that event's
+/// metadata (RFC-0006 0006-041). Callers pass `None` for every other event.
 #[must_use]
 pub fn stream_response(
     event: &Event,
     context_id: &str,
     first_chunk: bool,
     approval_body: Option<Struct>,
+    usage: Option<&BudgetUsage>,
 ) -> pb::StreamResponse {
     match &event.body {
         EventBody::Status {
@@ -161,7 +219,7 @@ pub fn stream_response(
                             message,
                             timestamp: Some(timestamp(event.at_ms)),
                         }),
-                        metadata: None,
+                        metadata: usage.and_then(usage_metadata),
                     },
                 )),
             }
@@ -170,6 +228,7 @@ pub fn stream_response(
             artifact_id,
             last_chunk,
             payload,
+            ..
         } => pb::StreamResponse {
             payload: Some(pb::stream_response::Payload::ArtifactUpdate(
                 pb::TaskArtifactUpdateEvent {
@@ -271,12 +330,13 @@ mod tests {
             at_ms: 0,
             body: EventBody::Artifact {
                 artifact_id: "a".to_owned(),
+                append: true,
                 last_chunk: false,
                 payload: b"hi".to_vec(),
             },
         };
-        let first = stream_response(&event, "c", true, None);
-        let later = stream_response(&event, "c", false, None);
+        let first = stream_response(&event, "c", true, None, None);
+        let later = stream_response(&event, "c", false, None, None);
         let append_of = |resp: pb::StreamResponse| match resp.payload {
             Some(pb::stream_response::Payload::ArtifactUpdate(update)) => update.append,
             _ => panic!("expected artifact update"),
@@ -324,7 +384,7 @@ mod tests {
                 approval: Some("req-1".to_owned()),
             },
         };
-        let response = stream_response(&event, "c", false, Some(body));
+        let response = stream_response(&event, "c", false, Some(body), None);
         let Some(pb::stream_response::Payload::StatusUpdate(update)) = response.payload else {
             panic!("expected status update");
         };

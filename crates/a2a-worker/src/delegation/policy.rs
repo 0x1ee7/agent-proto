@@ -88,6 +88,23 @@ pub(crate) fn budget_exhausted(dimension: &str) -> IpcError {
     IpcError::new(reason::BUDGET_EXHAUSTED).with_meta("dimension", dimension)
 }
 
+/// The first budget dimension whose child share is zero (0015-055): the parent has nothing
+/// left to hand a child, so the send is refused before any delegation or network traffic.
+pub(crate) fn exhausted_dimension(
+    tokens: u64,
+    cost_units: u64,
+    wall_ms: u64,
+) -> Option<&'static str> {
+    [
+        ("tokens", tokens),
+        ("cost", cost_units),
+        ("wall_ms", wall_ms),
+    ]
+    .into_iter()
+    .find(|(_, share)| *share == 0)
+    .map(|(dimension, _)| dimension)
+}
+
 /// The budget dimension a delegation refusal names.
 pub(crate) fn dimension_of(refused: &DelegationRefused) -> &'static str {
     match refused {
@@ -119,10 +136,10 @@ pub(crate) fn context_id(raw: &str) -> Result<ContextId, IpcError> {
 }
 
 /// Blocking deadline for a call (0015-022, 0015-066): the requested timeout, bounded by
-/// the child's wall budget. An unlimited or zero wall budget falls back to the maximum
-/// request deadline.
+/// the child's wall budget. Only the unlimited sentinel falls back to the maximum request
+/// deadline; a zero wall budget is exhausted and bounds the call to zero (0015-055).
 pub(crate) fn call_deadline(now: u64, timeout_ms: Option<u64>, wall_ms: u64) -> u64 {
-    let wall = if wall_ms == 0 || wall_ms == UNLIMITED {
+    let wall = if wall_ms == UNLIMITED {
         MAX_DEADLINE_MS
     } else {
         wall_ms
@@ -131,7 +148,9 @@ pub(crate) fn call_deadline(now: u64, timeout_ms: Option<u64>, wall_ms: u64) -> 
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
+
     use super::*;
 
     fn agent(raw: &str) -> AgentId {
@@ -180,7 +199,16 @@ mod tests {
     #[test]
     fn req_0015_022_deadline_bounded_by_wall_budget() {
         assert_eq!(call_deadline(1_000, Some(500), 200), 1_200);
-        assert_eq!(call_deadline(1_000, None, UNLIMITED), 1_000 + MAX_DEADLINE_MS);
+        assert_eq!(
+            call_deadline(1_000, None, UNLIMITED),
+            1_000 + MAX_DEADLINE_MS
+        );
         assert_eq!(call_deadline(u64::MAX, Some(5), 10), u64::MAX);
+    }
+
+    /// req_0015_055: an exhausted wall allowance (zero) bounds the call to zero.
+    #[test]
+    fn req_0015_055_zero_wall_budget_is_exhausted() {
+        assert_eq!(call_deadline(1_000, None, 0), 1_000);
     }
 }

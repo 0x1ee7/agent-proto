@@ -5,18 +5,23 @@
 //! which pumps after each request) no later than [`Worker::next_wakeup`].
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use a2a_core::approval::{ALLOW_ONCE_ID, NewRequest, Opened, Tier};
 use a2a_core::envelope::{self, Clock, EventParts, Outgoing, Rejection};
 use a2a_core::task::{
-    ApprovalAnswer, Effect, Event, EventBody, StopReason, TaskError, TaskStore, Tasks,
+    ApprovalAnswer, ArtifactChunk, Effect, Event, EventBody, StopReason, TaskError, TaskStore,
+    Tasks,
 };
 use a2a_types::failure::FailureCode;
 use a2a_types::ids::{MessageId, TaskId};
 use a2a_types::proto::a2a as pb;
+use a2a_types::proto::a2a::TaskState;
 use bus_api::bus::{Bus, RequestStream};
 use bus_api::error::BusError;
 use bus_api::name::SubjectPattern;
@@ -31,6 +36,12 @@ use crate::error::WorkerError;
 use crate::sanitize::{frame_inputs, redact_outbound};
 use crate::wire;
 use crate::workspace::WorkspaceHook;
+
+/// What woke [`Worker::await_peer`]: the outbound call finished, or a bus request arrived.
+enum Turn<T> {
+    Done(T),
+    Request(Result<bus_api::message::Request, BusError>),
+}
 
 /// A note the host should log or persist. Drained with [`Worker::take_audit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +78,7 @@ pub struct Worker<B: Bus, D: Backend, S: TaskStore> {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) tasks: Tasks<S>,
     pub(crate) pending: BTreeMap<String, PendingTurn>,
-    /// Tasks admitted to the backend but waiting for the single turn slot (FIFO).
+    /// Tasks admitted to the backend but waiting for their context to free (FIFO, 0005-054).
     pub(crate) queue: VecDeque<String>,
     /// Open turns: task id to the last `event_no` accepted for the turn.
     pub(crate) open: BTreeMap<String, u64>,
@@ -85,12 +96,13 @@ pub struct Worker<B: Bus, D: Backend, S: TaskStore> {
     pub(crate) audit_failures: u64,
     /// Workspace lease hook; `None` when no workspace binding is configured.
     pub(crate) workspace: Option<WorkspaceHook>,
-    /// Directory approvals report when no workspace lease applies (RFC-0006 [0006-006]).
-    pub(crate) working_directory: String,
     /// Card and presence publisher; `None` when no publication is configured (RFC-0004).
     pub(crate) presence: Option<crate::presence::Publisher>,
     /// Peer-call delegation (RFC-0015); `None` when no delegation table is attached.
     pub(crate) delegation: Option<crate::delegation::Delegation<B>>,
+    /// Peer-call state (RFC-0015) kept on the worker itself, so bus requests served while
+    /// a delegation pump awaits a peer can create bindings and queue child cancels.
+    pub(crate) peers: crate::delegation::Peers,
 }
 
 impl<B: Bus, D: Backend, S: TaskStore> std::fmt::Debug for Worker<B, D, S> {
@@ -119,10 +131,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
         let now = clock.now_ms().ok_or(WorkerError::Clock)?;
         let workspace = WorkspaceHook::for_config(&config)?;
-        let working_directory = std::env::current_dir()
-            .map_err(|_| WorkerError::Config("working directory unavailable"))?
-            .to_string_lossy()
-            .into_owned();
+        if config.working_directory.as_os_str().is_empty() {
+            return Err(WorkerError::Config("working directory not configured"));
+        }
         let (sink, events) = ChannelSink::channel();
         backend.attach(Box::new(sink));
         let pattern = rpc_pattern(&config)?;
@@ -153,9 +164,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             audit_sink: None,
             audit_failures: 0,
             workspace,
-            working_directory,
             presence,
             delegation: None,
+            peers: crate::delegation::Peers::default(),
         };
         worker.run(effects, now)?;
         worker.publish_presence(now, true).await?;
@@ -165,15 +176,49 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
     /// Awaits one inbound request, answers it, then pumps.
     pub async fn serve_one(&mut self) -> Result<(), WorkerError> {
         let request = self.requests.next().await?;
+        self.serve_request(request).await?;
+        self.pump().await
+    }
+
+    /// Answers one inbound bus request.
+    async fn serve_request(
+        &mut self,
+        request: bus_api::message::Request,
+    ) -> Result<(), WorkerError> {
         match envelope::receive(&self.config.wire, self.clock.as_ref(), request) {
-            Err(Rejection::Dropped) => {}
-            Err(Rejection::Answer(answer)) => answer.send()?,
+            Err(Rejection::Dropped) => Ok(()),
+            Err(Rejection::Answer(answer)) => Ok(answer.send()?),
             Ok(inbound) => {
                 let now = self.now()?;
-                self.handle(inbound, now).await?;
+                self.handle(inbound, now).await
             }
         }
-        self.pump().await
+    }
+
+    /// Awaits an outbound peer call while still serving bus requests (RFC-0015). A worker
+    /// waiting on a peer keeps answering that peer, so two workers calling each other
+    /// cannot deadlock.
+    pub(crate) async fn await_peer<T>(
+        &mut self,
+        call: impl Future<Output = T>,
+    ) -> Result<T, WorkerError> {
+        let mut call = pin!(call);
+        loop {
+            let turn = poll_fn(|cx| {
+                if let Poll::Ready(value) = call.as_mut().poll(cx) {
+                    return Poll::Ready(Turn::Done(value));
+                }
+                match pin!(self.requests.next()).poll(cx) {
+                    Poll::Ready(request) => Poll::Ready(Turn::Request(request)),
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await;
+            match turn {
+                Turn::Done(value) => return Ok(value),
+                Turn::Request(request) => self.serve_request(request?).await?,
+            }
+        }
     }
 
     /// Advances the worker at the current time: backend events, backend health,
@@ -345,11 +390,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 Ok(Vec::new())
             }
             Effect::CancelChild { child_id, .. } => {
-                let d = self
-                    .delegation
-                    .as_mut()
-                    .ok_or(WorkerError::Config("delegation not attached"))?;
-                d.cancels.push(child_id);
+                self.peers.cancels.push(child_id);
                 Ok(Vec::new())
             }
             Effect::Audit { task_id, reason } => {
@@ -359,16 +400,34 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
     }
 
-    /// Starts queued tasks while no turn is open. A backend runs one turn at a time (0009-020).
+    /// Starts queued tasks whose context has no open turn (0005-054). Turns of one
+    /// (origin, context_id) run one at a time, in admission order; turns of different contexts
+    /// run concurrently (0009-020).
     fn dispatch_next(&mut self, now: u64) -> Result<Vec<Effect>, WorkerError> {
         let mut out = Vec::new();
-        while self.open.is_empty() {
-            let Some(task) = self.queue.pop_front() else {
+        while self.open.len() < self.config.max_active {
+            let Some(pos) = self.queue.iter().position(|task| !self.context_held(task)) else {
+                break;
+            };
+            let Some(task) = self.queue.remove(pos) else {
                 break;
             };
             out.extend(self.start_turn(&task, now)?);
         }
         Ok(out)
+    }
+
+    /// Whether an open turn holds the (origin, context_id) of `task`. A task with no record
+    /// holds nothing and is left to `start_turn`, which ends it.
+    fn context_held(&self, task: &str) -> bool {
+        let Some(lane) = self.tasks.task_owner(task) else {
+            return false;
+        };
+        self.open.keys().any(|holder| {
+            self.tasks.task_owner(holder).is_some_and(|owner| {
+                owner.origin == lane.origin && owner.context_id == lane.context_id
+            })
+        })
     }
 
     fn start_turn(&mut self, task: &str, now: u64) -> Result<Vec<Effect>, WorkerError> {
@@ -591,13 +650,19 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             BackendEvent::ArtifactDelta {
                 artifact_key,
                 text,
+                append,
                 last,
                 ..
             } => match self.tasks.append_artifact(
                 &turn,
-                artifact_key,
-                last,
-                redact_outbound(&text)?.into_bytes(),
+                ArtifactChunk {
+                    artifact_id: artifact_key.clone(),
+                    name: artifact_key,
+                    media_type: "text/plain".to_owned(),
+                    append,
+                    last_chunk: last,
+                    payload: redact_outbound(&text)?.into_bytes(),
+                },
                 now,
             ) {
                 Ok(()) => Ok(Vec::new()),
@@ -756,7 +821,23 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             }
             _ => None,
         };
-        Ok(wire::stream_response(event, context_id, first, body))
+        let usage = match &event.body {
+            EventBody::Status { state, .. }
+                if TaskState::from_wire(*state).is_ok_and(|state| state.is_terminal()) =>
+            {
+                self.tasks
+                    .budget_view(&event.task_id)
+                    .map(|(_, usage)| usage)
+            }
+            _ => None,
+        };
+        Ok(wire::stream_response(
+            event,
+            context_id,
+            first,
+            body,
+            usage.as_ref(),
+        ))
     }
 
     async fn flush_outbox(&mut self, now: u64) -> Result<(), WorkerError> {

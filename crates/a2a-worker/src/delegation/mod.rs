@@ -25,6 +25,8 @@ use a2a_mcp::ipc::{
 use a2a_mcp::ipc_server::{GrantTable, ServerHandle, ServerRequest};
 use a2a_types::ids::{AgentId, TaskId};
 use a2a_types::proto::a2a::{self as pb, TaskState};
+use a2a_types::proto::a2abus::Hop;
+use a2a_types::vocab::ext;
 use base64::Engine as _;
 use bus_api::bus::Bus;
 
@@ -152,7 +154,7 @@ impl GrantTable for Grants {
 
 /// The per-task binding: one slot, one grant, idempotency keys and rate windows.
 #[derive(Debug)]
-struct Binding {
+pub(crate) struct Binding {
     slot: String,
     grant_id: String,
     credential: String,
@@ -184,23 +186,43 @@ pub(crate) struct Child {
     deadline: u64,
 }
 
-/// Delegation state of a worker with an attached endpoint.
+/// Delegation state of a worker with an attached endpoint. It is taken out of the worker
+/// while served (see [`Worker::pump_delegation`]); state that bound tasks need lives in
+/// [`Peers`] instead.
 pub(crate) struct Delegation<B: Bus> {
     pub(crate) config: DelegationConfig,
     own: AgentId,
-    grants: Arc<Mutex<GrantBook>>,
     /// Keeps the IPC endpoint serving; dropping the handle stops it.
     _server: ServerHandle,
     requests: Receiver<ServerRequest>,
     pub(crate) client: Client<Arc<B>>,
-    /// Bindings keyed by parent task id.
-    bindings: BTreeMap<String, Binding>,
-    /// Slot to parent task id.
-    slots: BTreeMap<String, String>,
     /// Children keyed by local child task id.
     children: BTreeMap<String, Child>,
+}
+
+/// Peer-call state kept on the worker (RFC-0015).
+#[derive(Default)]
+pub(crate) struct Peers {
+    /// Grants authenticating the IPC endpoint.
+    pub(crate) grants: Arc<Mutex<GrantBook>>,
+    /// Bindings keyed by parent task id.
+    pub(crate) bindings: BTreeMap<String, Binding>,
+    /// Slot to parent task id.
+    pub(crate) slots: BTreeMap<String, String>,
     /// Local child ids whose remote task must be canceled.
     pub(crate) cancels: Vec<String>,
+    /// Endpoint paths handed to bound tasks; `None` when no endpoint is attached.
+    pub(crate) endpoint: Option<PeerEndpoint>,
+    /// Delegation chain of each admitted task: the inbound chain, or this agent's root hop
+    /// for a budgetless root (0006-043). Outbound delegation extends it.
+    pub(crate) chains: BTreeMap<String, Vec<Hop>>,
+}
+
+/// Paths a bound task's shim needs.
+#[derive(Clone)]
+pub(crate) struct PeerEndpoint {
+    pub(crate) endpoint: PathBuf,
+    pub(crate) shim_path: PathBuf,
 }
 
 impl<B: Bus> Delegation<B> {
@@ -229,33 +251,39 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             .to_str()
             .ok_or(WorkerError::Config("delegation endpoint is not UTF-8"))?
             .to_owned();
-        let grants = Arc::new(Mutex::new(GrantBook::default()));
+        let peers = Peers {
+            endpoint: Some(PeerEndpoint {
+                endpoint: config.endpoint.clone(),
+                shim_path: config.shim_path.clone(),
+            }),
+            ..Peers::default()
+        };
         let (sender, requests) = mpsc::channel();
         let server = a2a_mcp::ipc_server::spawn(
             &endpoint,
-            Arc::new(Grants(Arc::clone(&grants))),
+            Arc::new(Grants(Arc::clone(&peers.grants))),
             sender,
         )
         .map_err(|_| WorkerError::Config("delegation endpoint unavailable"))?;
         let client = Client::new(
             Arc::clone(&self.bus),
             Arc::clone(&self.clock),
-            ClientConfig::default(),
+            ClientConfig {
+                extensions: vec![ext::BUDGET.to_owned(), ext::PROVENANCE.to_owned()],
+                ..ClientConfig::default()
+            },
             self.config.tenant.clone(),
             self.config.agent.clone(),
         )
         .map_err(|_| WorkerError::Config("delegation client unavailable"))?;
+        self.peers = peers;
         self.delegation = Some(Delegation {
             config,
             own: self.config.agent.clone(),
-            grants,
             _server: server,
             requests,
             client,
-            bindings: BTreeMap::new(),
-            slots: BTreeMap::new(),
             children: BTreeMap::new(),
-            cancels: Vec::new(),
         });
         Ok(())
     }
@@ -266,7 +294,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         let Some(mut d) = self.delegation.take() else {
             return;
         };
-        if let Ok(mut book) = d.grants.lock() {
+        self.peers.endpoint = None;
+        if let Ok(mut book) = self.peers.grants.lock() {
             book.stopped = true;
             for grant in book.grants.values_mut() {
                 grant.live = false;
@@ -285,14 +314,15 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
     /// Binds a task's peer tools, creating its slot and grant on first use.
     /// Returns `None` when no delegation endpoint is attached.
     pub(crate) fn bind_peer_tools(&mut self, task: &str) -> Result<Option<PeerTools>, WorkerError> {
-        let Some(d) = self.delegation.as_mut() else {
+        let Some(endpoint) = self.peers.endpoint.clone() else {
             return Ok(None);
         };
-        if !d.bindings.contains_key(task) {
+        if !self.peers.bindings.contains_key(task) {
             let slot = random_token::<SESSION_SLOT_BYTES>()?;
             let grant_id = random_token::<GRANT_ID_BYTES>()?;
             let credential = random_token::<GRANT_CREDENTIAL_BYTES>()?;
-            d.grants
+            self.peers
+                .grants
                 .lock()
                 .map_err(|_| WorkerError::Config("grant table unavailable"))?
                 .grants
@@ -304,8 +334,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                         live: true,
                     },
                 );
-            d.slots.insert(slot.clone(), task.to_owned());
-            d.bindings.insert(
+            self.peers.slots.insert(slot.clone(), task.to_owned());
+            self.peers.bindings.insert(
                 task.to_owned(),
                 Binding {
                     slot,
@@ -317,7 +347,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 },
             );
         }
-        let binding = d
+        let binding = self
+            .peers
             .bindings
             .get(task)
             .ok_or(WorkerError::Config("peer binding missing"))?;
@@ -325,8 +356,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             slot: binding.slot.clone(),
             grant_id: binding.grant_id.clone(),
             grant_credential: SecretText::new(binding.credential.clone()),
-            endpoint: d.config.endpoint.clone(),
-            shim_path: d.config.shim_path.clone(),
+            endpoint: endpoint.endpoint,
+            shim_path: endpoint.shim_path,
         }))
     }
 
@@ -351,7 +382,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         while let Ok(request) = d.requests.try_recv() {
             self.dispatch(d, request, now, &mut effects).await?;
         }
-        flush_cancels(d).await;
+        self.flush_cancels(d).await?;
         self.poll_children(d, now, &mut effects).await?;
         expire_waiters(d, now);
         Ok(effects)
@@ -360,18 +391,29 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
     /// Ends bindings whose parent task is terminal or gone (0015-073). Pending calls
     /// are answered `UNAVAILABLE`; unsettled children stay tracked until they settle.
     fn teardown_ended(&mut self, d: &mut Delegation<B>) {
-        let ended: Vec<String> = d
+        let ended_chains: Vec<String> = self
+            .peers
+            .chains
+            .keys()
+            .filter(|task| !self.parent_open(task))
+            .cloned()
+            .collect();
+        for task in ended_chains {
+            self.peers.chains.remove(&task);
+        }
+        let ended: Vec<String> = self
+            .peers
             .bindings
             .keys()
             .filter(|task| !self.parent_open(task))
             .cloned()
             .collect();
         for task in ended {
-            let Some(binding) = d.bindings.remove(&task) else {
+            let Some(binding) = self.peers.bindings.remove(&task) else {
                 continue;
             };
-            d.slots.remove(&binding.slot);
-            if let Ok(mut book) = d.grants.lock() {
+            self.peers.slots.remove(&binding.slot);
+            if let Ok(mut book) = self.peers.grants.lock() {
                 if let Some(grant) = book.grants.get_mut(&binding.grant_id) {
                     grant.live = false;
                 }
@@ -403,13 +445,14 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         effects: &mut Vec<Effect>,
     ) -> Result<(), WorkerError> {
         let frame = request.frame.clone();
-        let Some(task) = d.slots.get(&request.slot).cloned() else {
+        let Some(task) = self.peers.slots.get(&request.slot).cloned() else {
             respond_err(request, IpcError::new(reason::SLOT_UNBOUND));
             return Ok(());
         };
         if !matches!(frame, ClientFrame::CancelCall { .. }) {
             let max = d.config.max_calls_per_min;
-            let admitted = d
+            let admitted = self
+                .peers
                 .bindings
                 .get_mut(&task)
                 .is_some_and(|b| b.calls.try_admit(now, max));
@@ -420,7 +463,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
         match frame {
             ClientFrame::Discover { params, .. } => {
-                self.discover(d, request, &task, &params).await;
+                self.discover(d, request, &task, &params).await?;
             }
             ClientFrame::Send { params, .. } => {
                 self.send_call(d, request, &task, &params, now, effects)
@@ -443,6 +486,26 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         respond_err(request, error);
     }
 
+    /// Sends queued cancels of children whose parents asked for them (0015-069).
+    async fn flush_cancels(&mut self, d: &mut Delegation<B>) -> Result<(), WorkerError> {
+        for child_id in std::mem::take(&mut self.peers.cancels) {
+            let Some(child) = d.children.get(&child_id) else {
+                continue;
+            };
+            if child.settled.is_some() {
+                continue;
+            }
+            let (target, remote) = (child.target.clone(), child.remote.clone());
+            let _ = self
+                .await_peer(
+                    d.client
+                        .cancel_task(&target, &remote, &CallOptions::default()),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn poll_children(
         &mut self,
         d: &mut Delegation<B>,
@@ -460,11 +523,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 continue;
             };
             let (target, remote) = (child.target.clone(), child.remote.clone());
-            match d
-                .client
-                .get_task(&target, &remote, &CallOptions::default())
-                .await
-            {
+            let polled = self
+                .await_peer(d.client.get_task(&target, &remote, &CallOptions::default()))
+                .await?;
+            match polled {
                 Ok(unary) => self.observe(d, &id, &unary.value, now, effects)?,
                 Err(_) => {
                     if let Some(child) = d.children.get_mut(&id) {
@@ -503,7 +565,11 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
         let code = status
             .and_then(|s| s.message.as_ref())
-            .and_then(|m| a2a_types::failure::FailureReason::from_message(m).ok().flatten())
+            .and_then(|m| {
+                a2a_types::failure::FailureReason::from_message(m)
+                    .ok()
+                    .flatten()
+            })
             .map(|r| r.code.to_string());
         let parent = child.parent.clone();
         let cancelled_by_parent = child.cancel_requested && state == TaskState::Canceled;
@@ -514,7 +580,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             ChildEnd {
                 state,
                 code,
-                usage: Usage::default(),
+                usage: result::usage(task).unwrap_or_default(),
                 cancelled_by_parent,
             },
             now,
@@ -564,28 +630,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
     }
 }
 
-async fn flush_cancels<B: Bus>(d: &mut Delegation<B>) {
-    for child_id in std::mem::take(&mut d.cancels) {
-        let Some(child) = d.children.get(&child_id) else {
-            continue;
-        };
-        if child.settled.is_some() {
-            continue;
-        }
-        let (target, remote) = (child.target.clone(), child.remote.clone());
-        let _ = d
-            .client
-            .cancel_task(&target, &remote, &CallOptions::default())
-            .await;
-    }
-}
-
 fn expire_waiters<B: Bus>(d: &mut Delegation<B>, now: u64) {
     for (child_id, child) in &mut d.children {
-        let (due, rest): (Vec<Waiter>, Vec<Waiter>) = child
-            .waiters
-            .drain(..)
-            .partition(|w| w.deadline <= now);
+        let (due, rest): (Vec<Waiter>, Vec<Waiter>) =
+            child.waiters.drain(..).partition(|w| w.deadline <= now);
         child.waiters = rest;
         for waiter in due {
             let snapshot = result::snapshot(child_id, child);
@@ -627,7 +675,6 @@ pub(crate) fn respond_value<T: serde::Serialize>(request: ServerRequest, value: 
 /// Random bytes as unpadded base64url, the encoding the IPC frames carry.
 fn random_token<const N: usize>() -> Result<String, WorkerError> {
     let mut bytes = [0u8; N];
-    getrandom::fill(&mut bytes)
-        .map_err(|_| WorkerError::Config("random source unavailable"))?;
+    getrandom::fill(&mut bytes).map_err(|_| WorkerError::Config("random source unavailable"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }

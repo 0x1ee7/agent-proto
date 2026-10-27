@@ -4,7 +4,7 @@
 
 use a2a_client::budget as client_budget;
 use a2a_client::{CallOptions, ClientError, Directory, Outbound, SendReply, outbound};
-use a2a_core::budget::BreakerStatus;
+use a2a_core::budget::{self, BreakerStatus};
 use a2a_core::task::{Effect, TaskError, TaskStore};
 use a2a_mcp::ipc::{
     CancelResult, DiscoverParams, DiscoverResult, GetParams, IpcError, PeerEntry, SendParams,
@@ -20,11 +20,12 @@ use serde_json::{Value, json};
 
 use super::policy::{
     budget_exhausted, budget_refusal, call_deadline, check_allowlist, check_inflight,
-    child_context, context_id, dimension_of, parse_task_id,
+    child_context, context_id, dimension_of, exhausted_dimension, parse_task_id,
 };
 use super::result::{frame, state_name};
-use super::{CHILD_POLL_MS, Child, Delegation, Waiter, current, respond_err, respond_outcome,
-    respond_value};
+use super::{
+    CHILD_POLL_MS, Child, Delegation, Waiter, current, respond_err, respond_outcome, respond_value,
+};
 use crate::backend::Backend;
 use crate::error::WorkerError;
 use crate::worker::Worker;
@@ -69,7 +70,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             return Ok(());
         }
         let blocking = matches!(params.wait, Wait::Blocking);
-        let replayed = d
+        let replayed = self
+            .peers
             .bindings
             .get(task)
             .and_then(|b| b.keys.get(&params.idempotency_key))
@@ -85,7 +87,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 return Ok(());
             }
         };
-        if let Some(binding) = d.bindings.get_mut(task) {
+        if let Some(binding) = self.peers.bindings.get_mut(task) {
             binding
                 .keys
                 .insert(params.idempotency_key.clone(), child_id.clone());
@@ -116,13 +118,15 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             }
             Err(_) => return Ok(Err(unavailable())),
         };
-        if let Some(binding) = d.bindings.get_mut(task) {
+        if let Some(binding) = self.peers.bindings.get_mut(task) {
             binding.sends.admit(now);
         }
-        let sent = d
-            .client
-            .send(&prepared.target, &prepared.message, &CallOptions::default())
-            .await;
+        let sent = self
+            .await_peer(
+                d.client
+                    .send(&prepared.target, &prepared.message, &CallOptions::default()),
+            )
+            .await?;
         let remote = match sent.map(|unary| unary.value) {
             Ok(SendReply::Task(remote)) => remote,
             _ => {
@@ -177,9 +181,20 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         ) {
             return Err(IpcError::new(reason::RATE_LIMITED).with_meta("breaker", "open"));
         }
-        let (budget, usage) = self.tasks.budget_view(task).ok_or_else(unavailable)?;
+        let (mut budget, usage) = self.tasks.budget_view(task).ok_or_else(unavailable)?;
+        if let Some(chain) = self.peers.chains.get(task) {
+            budget.chain = chain.clone();
+        }
+        // 0015-054 (c) / 0006-059: a target already in this task's chain is re-entrant
+        // delegation whatever the text; the pair rule (0006-045) is checked by the client.
+        let reentrant = budget::is_reentrant(&budget.chain, target.as_str());
         let fingerprint = client_budget::text_fingerprint(&target, &params.text);
-        let child_budget = match client_budget::child(&budget, &usage, &target, &fingerprint) {
+        let child = if reentrant {
+            Err(ClientError::LoopDetected)
+        } else {
+            client_budget::child(&budget, &usage, &target, &fingerprint)
+        };
+        let child_budget = match child {
             Ok(child_budget) => child_budget,
             Err(ClientError::LoopDetected) => {
                 let failed = self
@@ -191,7 +206,14 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             }
             Err(err) => return Err(budget_refusal(&err)),
         };
-        let binding = d.bindings.get(task).ok_or_else(unavailable)?;
+        if let Some(dimension) = exhausted_dimension(
+            child_budget.max_tokens,
+            child_budget.max_cost_units,
+            child_budget.max_wall_ms,
+        ) {
+            return Err(budget_exhausted(dimension));
+        }
+        let binding = self.peers.bindings.get(task).ok_or_else(unavailable)?;
         if !binding.sends.allows(now, d.config.max_sends_per_min) {
             return Err(IpcError::new(reason::RATE_LIMITED));
         }
@@ -205,7 +227,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             d.config.max_inflight,
         )?;
 
-        let hop = u32::try_from(child_budget.chain.len()).unwrap_or(u32::MAX);
+        let hop = u32::try_from(child_budget.chain.len().saturating_sub(1)).unwrap_or(u32::MAX);
         let deadline = call_deadline(now, params.timeout_ms, child_budget.max_wall_ms);
         let mut message = Outbound::new(vec![outbound::text(&params.text)]);
         message.context_id = Some(context_id(&context)?);
@@ -243,11 +265,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Err(err) => return self.refuse(Some(task), request, err),
         };
         let Some(child) = d.children.get(&child_id).filter(|c| c.parent == task) else {
-            return self.refuse(
-                Some(task),
-                request,
-                IpcError::new(reason::TASK_NOT_FOUND),
-            );
+            return self.refuse(Some(task), request, IpcError::new(reason::TASK_NOT_FOUND));
         };
         let mut answer = current(&child_id, child);
         if !params.include_text {
@@ -270,20 +288,12 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Ok(id) => id.as_str().to_owned(),
             Err(err) => return self.refuse(Some(task), request, err),
         };
-        let Some(child) = d
-            .children
-            .get_mut(&child_id)
-            .filter(|c| c.parent == task)
-        else {
-            return self.refuse(
-                Some(task),
-                request,
-                IpcError::new(reason::TASK_NOT_FOUND),
-            );
+        let Some(child) = d.children.get_mut(&child_id).filter(|c| c.parent == task) else {
+            return self.refuse(Some(task), request, IpcError::new(reason::TASK_NOT_FOUND));
         };
         if child.settled.is_none() && !child.cancel_requested {
             child.cancel_requested = true;
-            d.cancels.push(child_id.clone());
+            self.peers.cancels.push(child_id.clone());
         }
         let state = state_name(child.state).to_owned();
         respond_value(
@@ -304,14 +314,15 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         task: &str,
         call_id: u64,
     ) {
-        let waiting = d.children.iter_mut().find(|(_, c)| {
-            c.parent == task && c.waiters.iter().any(|w| w.call_id == call_id)
-        });
+        let waiting = d
+            .children
+            .iter_mut()
+            .find(|(_, c)| c.parent == task && c.waiters.iter().any(|w| w.call_id == call_id));
         if let Some((child_id, child)) = waiting {
             child.waiters.retain(|w| w.call_id != call_id);
             if child.settled.is_none() && !child.cancel_requested {
                 child.cancel_requested = true;
-                d.cancels.push(child_id.clone());
+                self.peers.cancels.push(child_id.clone());
             }
         }
         respond_value(request, &json!({ "ok": true }));
@@ -324,17 +335,23 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         request: ServerRequest,
         task: &str,
         params: &DiscoverParams,
-    ) {
+    ) -> Result<(), WorkerError> {
         if let Err(err) = validate_discover(params) {
-            return self.refuse(Some(task), request, err);
+            self.refuse(Some(task), request, err);
+            return Ok(());
         }
         let mut directory = Directory::new(&d.client);
-        if directory.sync().await.is_err() {
-            return self.refuse(Some(task), request, unavailable());
+        let synced = self.await_peer(directory.sync()).await?;
+        if synced.is_err() {
+            self.refuse(Some(task), request, unavailable());
+            return Ok(());
         }
         let listings = match directory.all(false) {
             Ok(listings) => listings,
-            Err(_) => return self.refuse(Some(task), request, unavailable()),
+            Err(_) => {
+                self.refuse(Some(task), request, unavailable());
+                return Ok(());
+            }
         };
         let limit = params.limit.unwrap_or(DEFAULT_DISCOVER_LIMIT) as usize;
         let mut peers = Vec::new();
@@ -377,7 +394,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 .collect();
             let description = match frame(&description, agent.as_str()) {
                 Ok(framed) => framed,
-                Err(err) => return respond_err(request, err),
+                Err(err) => {
+                    respond_err(request, err);
+                    return Ok(());
+                }
             };
             peers.push(PeerEntry {
                 agent: agent.as_str().to_owned(),
@@ -389,6 +409,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
         let text = format!("{} peer(s) available", peers.len());
         respond_value(request, &DiscoverResult { text, peers });
+        Ok(())
     }
 }
 
@@ -422,7 +443,10 @@ fn card_skills(card: &Value) -> (Vec<SkillRef>, Vec<String>) {
         .flatten()
     {
         let id = skill.get("id").and_then(Value::as_str).unwrap_or_default();
-        let name = skill.get("name").and_then(Value::as_str).unwrap_or_default();
+        let name = skill
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         skills.push(SkillRef {
             id: id.to_owned(),
             name: name.to_owned(),

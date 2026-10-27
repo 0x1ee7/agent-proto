@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use a2a_core::task::{Effect, StopReason, TaskError, TaskStore};
+use a2a_core::task::{ArtifactChunk, Effect, StopReason, TaskError, TaskStore};
 use a2a_workspace::{
     AcquireRequest, AgentId, Lease, ReleaseOutcome, WorkKey, WorkScope, Workspace, WorkspaceConfig,
     WorkspaceMode, WorkspaceRef,
@@ -24,6 +24,14 @@ use crate::worker::Worker;
 
 /// Artifact id of the workspace summary published before each turn's terminal event.
 const SUMMARY_ARTIFACT_ID: &str = "workspace-summary";
+
+/// RFC-0006 0006-006 token for a workspace mode.
+fn mode_token(mode: WorkspaceMode) -> &'static str {
+    match mode {
+        WorkspaceMode::PerTask => "per-task",
+        WorkspaceMode::PerSession => "per-session",
+    }
+}
 
 /// Workspace settings of a worker (RFC-0012 sections 4.8 and 4.9).
 #[derive(Debug, Clone)]
@@ -189,10 +197,7 @@ impl WorkspaceHook {
     /// Path and workspace-mode token of the lease `task` holds, if any.
     fn lease_context(&self, task: &str) -> Option<(String, String)> {
         let held = self.held.get(self.users.get(task)?)?;
-        let mode = match self.workspace.config().mode {
-            WorkspaceMode::PerTask => "per-task",
-            WorkspaceMode::PerSession => "per-session",
-        };
+        let mode = mode_token(self.workspace.config().mode);
         Some((
             held.lease.path().to_string_lossy().into_owned(),
             mode.to_owned(),
@@ -210,11 +215,19 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
     }
 
     /// Working directory and workspace mode `task` runs under, as RFC-0006 [0006-006] reports them
-    /// on an approval request. Without a workspace binding the configured directory applies.
+    /// on an approval request. The lease path applies when the task holds one; otherwise the
+    /// configured directory and mode apply (never the process working directory).
     pub(crate) fn working_context(&self, task: &str) -> (String, String) {
-        match self.workspace.as_ref().and_then(|hook| hook.lease_context(task)) {
+        match self
+            .workspace
+            .as_ref()
+            .and_then(|hook| hook.lease_context(task))
+        {
             Some(context) => context,
-            None => (self.working_directory.clone(), "per-session".to_owned()),
+            None => (
+                self.config.working_directory.to_string_lossy().into_owned(),
+                mode_token(self.config.working_mode).to_owned(),
+            ),
         }
     }
 
@@ -252,10 +265,18 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Err(err) => return Ok(Some(err.kind().token())),
         };
         let payload = summary.render_text().into_bytes();
-        match self
-            .tasks
-            .append_artifact(task, SUMMARY_ARTIFACT_ID.to_owned(), true, payload, now)
-        {
+        match self.tasks.append_artifact(
+            task,
+            ArtifactChunk {
+                artifact_id: SUMMARY_ARTIFACT_ID.to_owned(),
+                name: SUMMARY_ARTIFACT_ID.to_owned(),
+                media_type: "text/plain".to_owned(),
+                append: true,
+                last_chunk: true,
+                payload,
+            },
+            now,
+        ) {
             Ok(()) => Ok(None),
             Err(TaskError::Terminal | TaskError::NotActive) => Ok(None),
             Err(err) => Err(err.into()),

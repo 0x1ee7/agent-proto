@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use a2a_core::budget::{self, Allowance};
 use a2a_core::envelope::{Inbound, ReplyOptions, RequestBody, RequestHead};
 use a2a_core::errors::{StatusExtras, WireError};
-use a2a_core::task::{Admission, Effect, ListQuery, Submission, TaskError, TaskStore};
+use a2a_core::task::{Admission, Effect, Incoming, ListQuery, Submission, TaskError, TaskStore};
 use a2a_types::extension::{Activation, ExtensionError, read_activated};
 use a2a_types::failure::FailureCode;
-use a2a_types::ids::ContextId;
+use a2a_types::ids::{ContextId, TaskId};
 use a2a_types::proto::a2a as pb;
 use a2a_types::proto::a2abus;
 use a2a_types::vocab::ext::{APPROVAL, BUDGET};
@@ -126,9 +126,7 @@ fn extension_error(err: ExtensionError) -> RpcError {
 }
 
 fn budget_of(data: &Struct) -> Option<a2abus::Budget> {
-    serde_json::to_value(data)
-        .ok()
-        .and_then(|value| serde_json::from_value(value).ok())
+    crate::wire::from_struct(data)
 }
 
 fn decision_of(value: &pbjson_types::Value) -> Option<a2abus::ApprovalDecision> {
@@ -268,16 +266,27 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             };
         let agent = self.config.agent.as_str();
         let fingerprint = budget::fingerprint(agent, texts.iter().copied());
-        let loop_detected = budget_proto
-            .as_ref()
-            .is_some_and(|proto| budget::chain_has_loop(&proto.chain, agent, &fingerprint));
-        let pressure = if loop_detected {
-            Some(FailureCode::LoopDetected)
-        } else if self.tasks.active_count() >= self.config.max_active {
+        let chain = budget_proto.as_ref().map_or_else(
+            || budget::root_chain(agent, &fingerprint),
+            |proto| proto.chain.clone(),
+        );
+        // 0006-059 / 0015-057: re-entrancy is refused by core at admission, without queueing. A
+        // full queue must not take precedence over it, so only the ancestors are consulted here.
+        let reentrant = budget::chain_before_self(&chain, agent)
+            .is_some_and(|ancestors| budget::is_reentrant(ancestors, agent));
+        let pressure = if !reentrant && self.tasks.active_count() >= self.config.max_active {
             Some(FailureCode::QueueFull)
         } else {
             None
         };
+        // A message carrying a budget and chain is a delegation (0006-043): core validates the
+        // chain and applies the loop rules (0006-045, 0006-059) when it is admitted.
+        let incoming = budget.map(|grant| Incoming {
+            task_id: TaskId::generate().to_string(),
+            parent_task_id: None,
+            grant,
+            chain: chain.clone(),
+        });
         let submission = Submission {
             msg_id: head.msg_id.as_str().to_owned(),
             origin: head.origin.clone(),
@@ -287,12 +296,13 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             ttl_ms: head.deadline_ms.saturating_sub(now),
             fingerprint,
             budget,
-            incoming: None,
+            incoming,
             pressure,
         };
         let (admission, effects) = self.tasks.submit(submission, now)?;
         let task_id = match admission {
             Admission::Created { task_id } => {
+                self.peers.chains.insert(task_id.clone(), chain);
                 let staged = effects
                     .iter()
                     .any(|effect| matches!(effect, Effect::StartBackend { task_id: id } if *id == task_id));

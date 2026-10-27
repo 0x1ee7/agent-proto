@@ -6,10 +6,12 @@
 //! `serve_one`, then `pump`. Nothing sleeps; time moves only through [`MemControl::advance`].
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod peer;
 mod req_0002;
 mod req_0005;
 mod req_0006;
 mod req_0014;
+mod req_0015;
 
 use std::collections::HashMap;
 use std::pin::{Pin, pin};
@@ -44,12 +46,15 @@ use crate::backend::{Capabilities, Protocol, UsageSource};
 use crate::config::{ApprovalMode, WorkerBuilder};
 use crate::mock::{Command, MockBackend, MockControl, Step};
 use crate::worker::Worker;
+use a2a_workspace::WorkspaceMode;
 
 pub(crate) const TENANT: &str = "acme";
 pub(crate) const WORKER: &str = "worker";
 pub(crate) const REQUESTER: &str = "planner";
 pub(crate) const OPERATOR: &str = "operator";
 pub(crate) const OBSERVER: &str = "observer";
+/// Configured working directory approvals report (0006-006); never the process cwd.
+pub(crate) const WORK_DIR: &str = "agent-work";
 const EVENT_STREAM: &str = "EV";
 const TTL_MS: u64 = 60_000;
 const MAX_POLLS: usize = 500_000;
@@ -293,8 +298,9 @@ pub(crate) fn rig_with(approval: ApprovalMode, agent_deadline_ms: u64) -> Rig {
             cost: true,
         },
     };
-    let builder =
-        WorkerBuilder::new(tenant(), agent(WORKER), principal(WORKER), tasks).approval(approval);
+    let builder = WorkerBuilder::new(tenant(), agent(WORKER), principal(WORKER), tasks)
+        .approval(approval)
+        .working_directory(WORK_DIR, WorkspaceMode::PerSession);
     let worker = block_on(builder.build(
         bus.clone(),
         backend,
@@ -478,6 +484,15 @@ fn message(context_id: &str, task_id: &str, parts: Vec<pb::Part>) -> pb::Message
 /// Starts a new task (empty context and task ids) and returns the reply payload.
 pub(crate) async fn submit(bus: &MemBus, text: &str) -> pb::Task {
     let reply = send_text(bus, "", "", text).await.unwrap();
+    match reply.payload {
+        Some(pb::send_message_response::Payload::Task(task)) => task,
+        other => panic!("expected Task reply, got {other:?}"),
+    }
+}
+
+/// Starts a new task in an existing context (empty task id) and returns the reply payload.
+pub(crate) async fn submit_in(bus: &MemBus, context_id: &str, text: &str) -> pb::Task {
+    let reply = send_text(bus, context_id, "", text).await.unwrap();
     match reply.payload {
         Some(pb::send_message_response::Payload::Task(task)) => task,
         other => panic!("expected Task reply, got {other:?}"),

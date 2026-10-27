@@ -1,15 +1,32 @@
 //! Outcome mapping for remote children (RFC-0015 0015-032 to 0015-036, 0015-070):
 //! the result a delegating task's call receives, framed and bounded.
 
+use a2a_core::budget::Usage;
 use a2a_mcp::ipc::{
     ArtifactSummary, IpcError, MAX_RESULT_TEXT_BYTES, Provenance, TaskResult, reason,
 };
 use a2a_security::frame::frame_untrusted;
 use a2a_types::proto::a2a::{self as pb, TaskState};
-use a2a_types::proto::a2abus::TrustClass;
+use a2a_types::proto::a2abus::{BudgetUsage, TrustClass};
+use pbjson_types::value::Kind;
 
 use super::Child;
 use crate::sanitize::redact_outbound;
+
+/// The child's final usage from its terminal budget metadata (RFC-0006 0006-041).
+/// `None` when the child reports no budget entry or the entry does not parse.
+pub(crate) fn usage(task: &pb::Task) -> Option<Usage> {
+    let entry = task
+        .metadata
+        .as_ref()?
+        .fields
+        .get(a2a_types::vocab::ext::BUDGET)?;
+    let Some(Kind::StructValue(body)) = entry.kind.as_ref() else {
+        return None;
+    };
+    let proto: BudgetUsage = crate::wire::from_struct(body)?;
+    Some(Usage::from_proto(&proto))
+}
 
 /// The outcome of a settled child: its result, or the refusal a call receives.
 pub(crate) fn outcome(
@@ -67,12 +84,7 @@ pub(crate) fn frame(text: &str, origin: &str) -> Result<String, IpcError> {
 }
 
 fn completed(local_id: &str, child: &Child, task: &pb::Task) -> Result<TaskResult, IpcError> {
-    let raw = task
-        .status
-        .as_ref()
-        .and_then(|s| s.message.as_ref())
-        .map(message_text)
-        .unwrap_or_default();
+    let raw = answer_text(task);
     if raw
         .chars()
         .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
@@ -125,15 +137,35 @@ fn provenance(child: &Child) -> Provenance {
     }
 }
 
-fn message_text(message: &pb::Message) -> String {
-    message
-        .parts
+/// The child's answer (0015-032): the text parts of its artifacts in creation order. A child
+/// with no text artifact answers with its final status message. Raw artifact parts are
+/// summarized by `completed`, never inlined.
+fn answer_text(task: &pb::Task) -> String {
+    let from_artifacts: String = task
+        .artifacts
         .iter()
-        .filter_map(|part| match &part.content {
-            Some(pb::part::Content::Text(text)) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+        .flat_map(|artifact| artifact.parts.iter())
+        .filter_map(part_text)
+        .collect();
+    if !from_artifacts.is_empty() {
+        return from_artifacts;
+    }
+    task.status
+        .as_ref()
+        .and_then(|status| status.message.as_ref())
+        .map(message_text)
+        .unwrap_or_default()
+}
+
+fn message_text(message: &pb::Message) -> String {
+    message.parts.iter().filter_map(part_text).collect()
+}
+
+fn part_text(part: &pb::Part) -> Option<&str> {
+    match &part.content {
+        Some(pb::part::Content::Text(text)) => Some(text.as_str()),
+        _ => None,
+    }
 }
 
 fn part_bytes(part: &pb::Part) -> u64 {
@@ -170,5 +202,33 @@ mod tests {
         assert_eq!(truncate_utf8(text, 2), ("a", 2));
         assert_eq!(truncate_utf8(text, 3), ("aé", 0));
         assert_eq!(truncate_utf8(text, 0), ("", 3));
+    }
+
+    /// req_0006_041: a child's terminal usage survives `usage_metadata` and `task_proto`, and
+    /// `usage` reads back the same consumption.
+    #[test]
+    fn req_0006_041_terminal_usage_round_trips_through_task_proto() {
+        let spent = Usage {
+            tokens: 120,
+            cost_units: 7,
+            wall_ms: 4_500,
+            hops: 2,
+            children: 1,
+        };
+        let view = a2a_core::task::TaskView {
+            task_id: "t".to_owned(),
+            context_id: "c".to_owned(),
+            state: pb::TaskState::Completed,
+            failure: None,
+            seq: 4,
+            created_ms: 0,
+            updated_ms: 9,
+            deadline_ms: 0,
+            usage: spent.to_proto(1),
+            artifacts: Vec::new(),
+            chain: Vec::new(),
+        };
+        let task = crate::wire::task_proto(&view);
+        assert_eq!(usage(&task), Some(spent));
     }
 }

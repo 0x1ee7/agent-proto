@@ -1,11 +1,13 @@
 //! Worker configuration and builder.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use a2a_core::envelope;
 use a2a_core::task;
 use a2a_core::task::TaskStore;
 use a2a_types::ids::{AgentId, TenantId};
+use a2a_workspace::WorkspaceMode;
 use bus_api::bus::Bus;
 use bus_api::name::Principal;
 
@@ -51,6 +53,11 @@ pub struct WorkerConfig {
     pub workspace: Option<WorkspaceBinding>,
     /// Card and presence publication (RFC-0004). `None` publishes neither.
     pub publication: Option<presence::Publication>,
+    /// Directory approvals report when no workspace lease applies (RFC-0006 0006-006).
+    /// Set with [`WorkerBuilder::working_directory`]; the worker never reads the process cwd.
+    pub working_directory: PathBuf,
+    /// Workspace mode approvals report when no workspace lease applies.
+    pub working_mode: WorkspaceMode,
 }
 
 /// Builder for [`Worker`]. Required values are supplied to [`WorkerBuilder::new`].
@@ -83,6 +90,8 @@ impl WorkerBuilder {
                 max_inline: envelope::MAX_INLINE_BYTES,
                 workspace: None,
                 publication: None,
+                working_directory: PathBuf::new(),
+                working_mode: WorkspaceMode::PerSession,
             },
             audit_sink: None,
         }
@@ -128,6 +137,15 @@ impl WorkerBuilder {
     #[must_use]
     pub fn workspace(mut self, binding: WorkspaceBinding) -> Self {
         self.config.workspace = Some(binding);
+        self
+    }
+
+    /// Sets the directory and workspace mode approvals report when no workspace lease applies
+    /// (RFC-0006 0006-006). Required: the worker never reads the process working directory.
+    #[must_use]
+    pub fn working_directory(mut self, path: impl Into<PathBuf>, mode: WorkspaceMode) -> Self {
+        self.config.working_directory = path.into();
+        self.config.working_mode = mode;
         self
     }
 

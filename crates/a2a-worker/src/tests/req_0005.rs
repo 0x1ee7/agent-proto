@@ -17,7 +17,8 @@ fn req_0005_036_cancel_submitted_commits_canceled_immediately() {
         mock.enqueue(vec![Step::Hold]);
         let first = submit(bus, "first").await;
         wait_for_state(bus, &first.id, pb::TaskState::Working).await;
-        let second = submit(bus, "second").await;
+        // Same context: the second task waits behind the first (0005-054).
+        let second = submit_in(bus, &first.context_id, "second").await;
         assert_eq!(state(&second), pb::TaskState::Submitted as i32);
 
         let reply = cancel(bus, &second.id).await.unwrap();
@@ -128,5 +129,27 @@ fn req_0005_041_deadline_runs_while_input_required() {
         advance(bus, 1);
         let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
         assert_eq!(failure_code(&failed).as_deref(), Some("DEADLINE_EXCEEDED"));
+    });
+}
+
+/// 0005-054: a second task in the same context stays SUBMITTED until the first turn closes,
+/// then starts in admission order.
+#[test]
+fn req_0005_054_same_context_turn_waits_for_holder() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold]);
+        mock.enqueue(vec![completed()]);
+        let first = submit(bus, "first").await;
+        wait_for_state(bus, &first.id, pb::TaskState::Working).await;
+        let second = submit_in(bus, &first.context_id, "second").await;
+        assert_eq!(state(&second), pb::TaskState::Submitted as i32);
+        assert_eq!(count_commands(mock, |c| matches!(c, Command::Start(_))), 1);
+
+        cancel(bus, &first.id).await.unwrap();
+        wait_for_state(bus, &first.id, pb::TaskState::Canceled).await;
+        wait_for_state(bus, &second.id, pb::TaskState::Completed).await;
+        assert_eq!(count_commands(mock, |c| matches!(c, Command::Start(_))), 2);
     });
 }

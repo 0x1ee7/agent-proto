@@ -170,8 +170,11 @@ fn req_0006_006_approval_carries_working_directory_and_mode() {
         let task = submit(bus, "write").await;
         let (_, request) = next_approval(&mut events, &task.id).await;
 
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(request.working_directory, cwd.to_string_lossy());
+        assert_eq!(request.working_directory, super::WORK_DIR);
+        assert_ne!(
+            request.working_directory,
+            std::env::current_dir().unwrap().to_string_lossy()
+        );
         assert_eq!(request.workspace_mode, "per-session");
     });
 }

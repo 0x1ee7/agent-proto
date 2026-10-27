@@ -30,3 +30,4 @@ getrandom = "0.4.3"
 
 [dev-dependencies]
 bus-mem = { path = "../bus-mem" }
+tokio = { version = "1.54.1", features = ["rt", "macros", "time", "sync"] }
