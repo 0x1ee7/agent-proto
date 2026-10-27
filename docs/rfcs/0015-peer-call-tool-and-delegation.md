@@ -279,7 +279,7 @@ Context note: the child shares ctx-0193a6df with its parent ([0015-059]). If cla
 Refusal example: a `send` to `codex`, which is not in omp's allowlist, returns `isError: true` with `PERMISSION_DENIED` and creates no child; the message is identical to the one for a nonexistent agent (section 4.6 [0015-054]).
 
 - [0015-114] The S1 run in section 5.2 SHOULD be executed end-to-end on the live omp and claude drivers before Milestone 1 acceptance; the spike result is the evidence.
-- [0015-115] In the S1 shared context, a child that delegates back to a chain member MUST NOT wait for the open turn: the receiving Worker creates the task FAILED with `LOOP_DETECTED` (RFC-0006 [0006-059]). Waiting would deadlock until the deadline, because turns are serialized per `context_id` (RFC-0009 [0009-020]).
+- [0015-115] In the S1 shared context, a child that delegates back to a chain member MUST NOT wait for the open turn: the receiving Worker creates the task FAILED with `LOOP_DETECTED` (RFC-0006 [0006-059]). Waiting would deadlock until the deadline, because turns are serialized per `context_id` (RFC-0005 [0005-054]).
 
 ## 6. Security considerations
 

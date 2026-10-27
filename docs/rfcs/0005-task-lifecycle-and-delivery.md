@@ -64,7 +64,7 @@ Table 4.2: Transitions
 | (create) | SUBMITTED | admission committed | - | [0005-024] |
 | (create) | REJECTED | admission refused (overload, quota) | RATE_LIMITED, QUEUE_FULL | [0005-028] |
 | (create) | FAILED | delegated task whose (agent, fingerprint) pair is already in the lineage, or whose receiving agent is already in the lineage (re-entrancy); no backend start | LOOP_DETECTED | RFC-0006 [0006-045], [0006-059] |
-| SUBMITTED | WORKING | backend session started | - | [0005-025] |
+| SUBMITTED | WORKING | backend session started; no other turn open in the context | - | [0005-025], [0005-054] |
 | SUBMITTED | FAILED | backend could not start; workspace refused or lost; deadline reached | BACKEND_UNAVAILABLE, WORKSPACE_FAILED, DEADLINE_EXCEEDED | [0005-041], [0005-053] |
 | SUBMITTED | CANCELED | CancelTask | - | [0005-036] |
 | WORKING | INPUT_REQUIRED | backend permission request | - | RFC-0006 |
@@ -119,13 +119,14 @@ stateDiagram-v2
 - [0005-026] Admission records MUST be retained for at least W = 2 x H (defaults: H = 1 hour, W = 2 hours), and for at least as long as the task they created: expiry = max(created + W, terminal + T_task). The NATS duplicate window (default 2 minutes, `nats.md` section 2.2) is a first line of defence only; correctness rests on the store, not on the bus window (decision for RFC-0010).
 - [0005-027] The owner Worker MUST NOT admit a submission whose receipt is past its Ttl plus the 30-second staleness allowance (RFC-0002 [0002-072]). As the receiver it answers `REQUEST_EXPIRED` ([0002-072]), creates no task and audits the refusal (R-F3). The check uses the envelope Ttl and the local clock only; no cross-host clock comparison is made beyond that allowance.
 - [0005-028] Overload: when a per-peer rate limit or queue quota is exceeded (R-S6), the Worker MUST create a task in REJECTED with code RATE_LIMITED or QUEUE_FULL, commit it, publish its single event with seq 1 and `A2AB-Stream-End: true`, and reply with that Task. No backend is started. A silent drop is not permitted.
+- [0005-054] A Worker MUST run at most one backend turn per (origin, context_id) (origin scoping per [0005-002] and RFC-0002 [0002-089]); turns of different contexts MAY run concurrently. The holder of a context is the task whose backend turn has started and has not reached a terminal state. INPUT_REQUIRED does NOT release the context: the open approval belongs to the holder's turn, and only the holder's terminal state releases it. Every other SUBMITTED task in that context MUST wait in admission order, with no backend start. When the holder's terminal state is committed, the Worker MUST start the oldest waiting task of that context only after that commit. A decision for the holder's open request (RFC-0006) or a resume of the holder ([0005-008]) is delivered to its open turn and MUST NOT wait behind a queued task. A SendMessage naming a waiting task does not change its queue position or start it. A waiting task's deadline runs from admission ([0005-040]); its expiry commits FAILED DEADLINE_EXCEEDED ([0005-041]) with no backend start, and CancelTask on it commits CANCELED ([0005-036]). The number of waiting tasks per context is bounded by the queue quota of [0005-028]; a submission beyond it is REJECTED with QUEUE_FULL and is not queued.
 
 ### 4.5 Delivery, redelivery and crash recovery
 
 - [0005-029] Delivery is at least once. Handlers MUST NOT assume single delivery and MUST be idempotent under [0005-023] and [0005-017].
 - [0005-030] A completed or terminal task MUST NEVER be run again. A restart or a redelivery may only re-publish outbox entries or return snapshots.
 - [0005-031] On Worker start, the Worker MUST process every non-terminal task as follows:
-  1. SUBMITTED with no recorded backend start: start execution (it has never run).
+  1. SUBMITTED with no recorded backend start: start execution (it has never run), or keep it waiting if its context has an open turn ([0005-054]).
   2. Backend start recorded but no live backend session: commit FAILED with BACKEND_CRASHED. The Worker MUST NOT re-run an in-flight turn, because the turn may already have caused side effects (M1-9).
   3. INPUT_REQUIRED: keep the open approval if it has not expired and the backend session is alive; if it has expired, commit FAILED APPROVAL_TIMEOUT; if the session is gone, a later decision commits FAILED BACKEND_CRASHED.
   4. Re-publish every outbox entry not yet acknowledged, with its stored seq and A2AB-Msg-Id.
@@ -347,6 +348,7 @@ ACP agents (omp `--mode acp`, `claude-agent-acp`, `acp-omp-claude.md`):
 | 0005-051 | Cross-origin CancelTask expects TaskNotFoundError, not -32002; same-origin cancel of a terminal task still gets TaskNotCancelableError | MUST |
 | 0005-052 | Two origins send the same contextId through the Hermes bridge: no shared model history; cross-origin GetTask, CancelTask and SubscribeToTask are not forwarded; ListTasks is not sent | MUST |
 | 0005-053 | Inject a workspace loss during a task (token `lease_lost`); expect FAILED with code WORKSPACE_FAILED and detail token; a refusal at Worker start creates no task | MUST |
+| 0005-054 | Two tasks in one context: the second stays SUBMITTED until the first is terminal; INPUT_REQUIRED keeps the holder; a decision reaches the holder while another task waits; a queued deadline or cancel gives no backend start; a task in another context starts; a submission past the queue quota is REJECTED QUEUE_FULL | MUST |
 
 ## 9. Open issues
 

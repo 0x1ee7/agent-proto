@@ -157,7 +157,7 @@ The consequence is deliberate: agents use their own file and shell tools. The ap
 
 #### 4.5.3 Turn lifecycle and stop reasons
 
-- [0009-020] A `Start` MUST map to one `session/prompt`. The driver MUST NOT send a second prompt on a session while one is open. The worker serializes turns per `context_id` (RFC-0005).
+- [0009-020] A `Start` MUST map to one `session/prompt`. The driver MUST NOT send a second prompt on a session while one is open. The worker serializes turns per `context_id` (RFC-0005 [0005-054]).
 - [0009-021] A `stopReason` MUST map to the outcome in this table. Any other stop reason string MUST map to `Failed` `BACKEND_ERROR`, because a turn must always end.
 
 | `stopReason` | Outcome | Reason |
