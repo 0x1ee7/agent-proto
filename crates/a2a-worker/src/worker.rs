@@ -109,6 +109,9 @@ pub struct Worker<B: Bus, D: Backend, S: TaskStore> {
     /// Peer-call state (RFC-0015) kept on the worker itself, so bus requests served while
     /// a delegation pump awaits a peer can create bindings and queue child cancels.
     pub(crate) peers: crate::delegation::Peers,
+    /// Nonces of verified operator decisions, refused on replay ([0007-041]). Used only when
+    /// signing is enabled ([0010-079]).
+    pub(crate) replay: a2a_security::replay::ReplayCache,
 }
 
 impl<B: Bus, D: Backend, S: TaskStore> std::fmt::Debug for Worker<B, D, S> {
@@ -181,6 +184,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             presence,
             delegation: None,
             peers: crate::delegation::Peers::default(),
+            replay: a2a_security::replay::ReplayCache::new(crate::signing::REPLAY_CAPACITY),
         };
         worker.run(effects, now)?;
         worker.publish_presence(now, true).await?;
@@ -199,12 +203,17 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         &mut self,
         request: bus_api::message::Request,
     ) -> Result<(), WorkerError> {
+        let signed = self
+            .config
+            .signing
+            .is_some()
+            .then(|| crate::signing::Received::of(&request));
         match envelope::receive(&self.config.wire, self.clock.as_ref(), request) {
             Err(Rejection::Dropped) => Ok(()),
             Err(Rejection::Answer(answer)) => Ok(answer.send()?),
             Ok(inbound) => {
                 let now = self.now()?;
-                self.handle(inbound, now).await
+                self.handle(inbound, now, signed).await
             }
         }
     }

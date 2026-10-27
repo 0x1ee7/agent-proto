@@ -10,6 +10,7 @@ mod peer;
 mod req_0002;
 mod req_0005;
 mod req_0006;
+mod req_0010;
 mod req_0014;
 mod req_0015;
 
@@ -272,7 +273,7 @@ pub(crate) fn rig_with(approval: ApprovalMode, agent_deadline_ms: u64) -> Rig {
 
 /// A rig whose per-context waiting quota is `quota` (0005-028).
 pub(crate) fn rig_with_quota(approval: ApprovalMode, agent_deadline_ms: u64, quota: usize) -> Rig {
-    build_rig(approval, agent_deadline_ms, quota, false)
+    build_rig(approval, agent_deadline_ms, quota, false, None)
 }
 
 /// A rig whose backend is still starting when the Worker opens (lazy spawn; health not live).
@@ -282,10 +283,17 @@ pub(crate) fn rig_starting() -> Rig {
         3_600_000,
         crate::config::DEFAULT_MAX_WAITING_PER_CONTEXT,
         true,
+        None,
     )
 }
 
-fn build_rig(approval: ApprovalMode, agent_deadline_ms: u64, quota: usize, starting: bool) -> Rig {
+fn build_rig(
+    approval: ApprovalMode,
+    agent_deadline_ms: u64,
+    quota: usize,
+    starting: bool,
+    signing: Option<Arc<a2a_security::trust::TrustStore>>,
+) -> Rig {
     let bus = MemBus(Arc::new(
         BusMem::new(MemConfig {
             seed: 7,
@@ -328,6 +336,10 @@ fn build_rig(approval: ApprovalMode, agent_deadline_ms: u64, quota: usize, start
         .approval(approval)
         .max_waiting_per_context(quota)
         .working_directory(WORK_DIR, WorkspaceMode::PerSession);
+    let builder = match signing {
+        Some(trust) => builder.signing(trust),
+        None => builder,
+    };
     let worker = block_on(builder.build(
         bus.clone(),
         backend,
@@ -363,6 +375,7 @@ fn grants() -> Vec<Grant> {
         },
         requester(REQUESTER),
         requester(OPERATOR),
+        requester("cli"),
         Grant {
             principal: principal(OBSERVER),
             tenant: tenant(),
@@ -732,6 +745,17 @@ pub(crate) async fn decide(
     context: &str,
     decision: &a2abus::ApprovalDecision,
 ) -> Result<pb::SendMessageResponse, ReplyDecodeError> {
+    let body = decision_body(task, context, decision);
+    let reply = call(bus, OPERATOR, Op::Send, body, vec![APPROVAL.to_owned()]).await;
+    envelope::decode_reply::<pb::SendMessageResponse>(&reply)
+}
+
+/// The SendMessage body that carries `decision` as an approval part on the task's request.
+pub(crate) fn decision_body(
+    task: &str,
+    context: &str,
+    decision: &a2abus::ApprovalDecision,
+) -> RequestBody {
     let data: Value = serde_json::from_value(serde_json::to_value(decision).unwrap()).unwrap();
     let part = pb::Part {
         content: Some(pb::part::Content::Data(data)),
@@ -745,13 +769,11 @@ pub(crate) async fn decide(
         }),
         ..Default::default()
     };
-    let body = RequestBody::SendMessage(pb::SendMessageRequest {
+    RequestBody::SendMessage(pb::SendMessageRequest {
         tenant: TENANT.to_owned(),
         message: Some(message(context, task, vec![part])),
         ..Default::default()
-    });
-    let reply = call(bus, OPERATOR, Op::Send, body, vec![APPROVAL.to_owned()]).await;
-    envelope::decode_reply::<pb::SendMessageResponse>(&reply)
+    })
 }
 
 /// Returns the next INPUT_REQUIRED approval event for `task`, skipping other events.

@@ -65,6 +65,9 @@ pub struct WorkerConfig {
     pub working_directory: PathBuf,
     /// Workspace mode approvals report when no workspace lease applies.
     pub working_mode: WorkspaceMode,
+    /// Operator-decision signing (RFC-0010 [0010-079]). `None` keeps signing off. Set with
+    /// [`WorkerBuilder::signing`].
+    pub signing: Option<Arc<a2a_security::trust::TrustStore>>,
 }
 
 /// Builder for [`Worker`]. Required values are supplied to [`WorkerBuilder::new`].
@@ -100,6 +103,7 @@ impl WorkerBuilder {
                 publication: None,
                 working_directory: PathBuf::new(),
                 working_mode: WorkspaceMode::PerSession,
+                signing: None,
             },
             audit_sink: None,
         }
@@ -162,6 +166,15 @@ impl WorkerBuilder {
     pub fn working_directory(mut self, path: impl Into<PathBuf>, mode: WorkspaceMode) -> Self {
         self.config.working_directory = path.into();
         self.config.working_mode = mode;
+        self
+    }
+
+    /// Enables operator-decision signing ([0010-079]): an approval decision is applied only when
+    /// it verifies under an operator-role key in `trust`. Unsigned decisions are then refused
+    /// with SIGNATURE_MISSING. Off by default, so decisions take the bus sender as before.
+    #[must_use]
+    pub fn signing(mut self, trust: Arc<a2a_security::trust::TrustStore>) -> Self {
+        self.config.signing = Some(trust);
         self
     }
 

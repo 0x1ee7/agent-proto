@@ -21,6 +21,7 @@ pub mod error;
 pub mod presence;
 pub mod rpc;
 pub mod sanitize;
+mod signing;
 pub mod store;
 pub mod wire;
 pub mod worker;

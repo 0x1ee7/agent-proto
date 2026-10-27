@@ -382,8 +382,16 @@ impl Inbound {
     /// # Errors
     /// Returns [`BusError`] when the bus refuses the reply or the status cannot be serialized.
     pub fn fail(self, error: WireError, extras: &StatusExtras) -> Result<(), BusError> {
-        let payload = error
-            .status_with(extras)
+        self.fail_status(&error.status_with(extras))
+    }
+
+    /// Answers the request with a prepared failure status ([0002-090] to [0002-096]). Security
+    /// refusals carry their RFC-0007 reason through this path.
+    ///
+    /// # Errors
+    /// Returns [`BusError`] when the bus refuses the reply or the status cannot be serialized.
+    pub fn fail_status(self, status: &rpc::Status) -> Result<(), BusError> {
+        let payload = status
             .encode_wire(self.head.json)
             .ok_or(BusError::Internal)?;
         let headers = base_reply_headers(

@@ -10,6 +10,7 @@ use a2a_core::errors::{StatusExtras, WireError};
 use a2a_core::task::{
     Admission, Effect, EventBody, Incoming, ListQuery, Submission, TaskError, TaskStore, TaskView,
 };
+use a2a_security::error::{BusError, Reason};
 use a2a_types::extension::{Activation, ExtensionError, read_activated};
 use a2a_types::failure::FailureCode;
 use a2a_types::ids::{ContextId, TaskId};
@@ -21,6 +22,7 @@ use pbjson_types::{Struct, Timestamp};
 
 use crate::backend::{Backend, InputPart};
 use crate::error::WorkerError;
+use crate::signing::{self, Received};
 use crate::wire;
 use crate::worker::{PendingTurn, Worker, artifact_key};
 use a2a_core::envelope::Outgoing;
@@ -56,12 +58,14 @@ pub(crate) struct Held {
     pub(crate) wait: Wait,
 }
 
-/// A refused request. `Wire` answers the caller; `Fatal` means the worker cannot continue.
+/// A refused request. `Wire` and `Security` answer the caller; `Fatal` means the worker cannot continue.
 pub(crate) enum RpcError {
     Wire {
         error: WireError,
         detail: Option<&'static str>,
     },
+    /// A refused decision carrying an RFC-0007 security reason, answered with that reason.
+    Security(BusError),
     Fatal(WorkerError),
 }
 
@@ -163,8 +167,13 @@ fn timestamp_ms(ts: &Timestamp) -> Option<u64> {
 impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
     /// Answers one accepted request: a blocking send with a task still in flight is held,
     /// everything else is answered at once.
-    pub(crate) async fn handle(&mut self, inbound: Inbound, now: u64) -> Result<(), WorkerError> {
-        match self.route(&inbound.head, &inbound.body, now) {
+    pub(crate) async fn handle(
+        &mut self,
+        inbound: Inbound,
+        now: u64,
+        signed: Option<Received>,
+    ) -> Result<(), WorkerError> {
+        match self.route(&inbound.head, &inbound.body, now, signed.as_ref()) {
             Ok(Handled {
                 hold: Some(wait), ..
             }) => {
@@ -211,6 +220,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 }
                 inbound.fail(error, &extras).map_err(WorkerError::Bus)
             }
+            Err(RpcError::Security(err)) => inbound
+                .fail_status(&err.to_status())
+                .map_err(WorkerError::Bus),
             Err(RpcError::Fatal(err)) => {
                 // No internal-error wire code exists (RFC-0002); OVERLOADED tells the caller to retry.
                 inbound
@@ -253,9 +265,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         head: &RequestHead,
         body: &RequestBody,
         now: u64,
+        signed: Option<&Received>,
     ) -> Result<Handled, RpcError> {
         match body {
-            RequestBody::SendMessage(req) => self.send_message(head, req, now),
+            RequestBody::SendMessage(req) => self.send_message(head, req, now, signed),
             RequestBody::GetTask(req) => self.get_task(head, req),
             RequestBody::ListTasks(req) => self.list_tasks(head, req),
             RequestBody::CancelTask(req) => self.cancel_task(head, req, now),
@@ -277,6 +290,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         head: &RequestHead,
         req: &pb::SendMessageRequest,
         now: u64,
+        signed: Option<&Received>,
     ) -> Result<Handled, RpcError> {
         let message = req
             .message
@@ -284,7 +298,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             .ok_or(RpcError::invalid("MESSAGE_REQUIRED"))?;
         for part in &message.parts {
             if marked(part.metadata.as_ref(), APPROVAL, &head.activation)?.is_some() {
-                return self.decide_request(head, message, part, now);
+                return self.decide_request(head, message, part, now, signed);
             }
         }
         if !message.task_id.is_empty() {
@@ -418,12 +432,15 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         message: &pb::Message,
         part: &pb::Part,
         now: u64,
+        signed: Option<&Received>,
     ) -> Result<Handled, RpcError> {
         let Some(pb::part::Content::Data(value)) = &part.content else {
             return Err(RpcError::extension_invalid("APPROVAL_DECISION_INVALID"));
         };
         let decision =
             decision_of(value).ok_or(RpcError::extension_invalid("APPROVAL_DECISION_INVALID"))?;
+        // The signature is checked before any task state is read, so a refusal changes nothing.
+        let operator = self.decision_operator(head, signed, now)?;
         if decision.task_id != message.task_id {
             return Err(RpcError::invalid("APPROVAL_NOT_APPLICABLE"));
         }
@@ -440,7 +457,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         let (_settled, effects) = self.tasks.decide(
             &owner.origin,
             &decision,
-            Some(head.sender.as_str()),
+            Some(operator.as_str()),
             head.tenant.as_str(),
             now,
         )?;
@@ -453,6 +470,31 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             replay: Vec::new(),
             hold: None,
         })
+    }
+
+    /// The operator identity a decision is attributed to ([0006-014]). With signing off the bus
+    /// sender stands. With signing on, the signature must verify under an operator-role key and
+    /// the relay must be `tui` or `cli` ([0010-079]); anything else is refused.
+    fn decision_operator(
+        &self,
+        head: &RequestHead,
+        signed: Option<&Received>,
+        now: u64,
+    ) -> Result<String, RpcError> {
+        let Some(trust) = self.config.signing.as_deref() else {
+            return Ok(head.sender.as_str().to_owned());
+        };
+        let received =
+            signed.ok_or_else(|| RpcError::Security(BusError::new(Reason::SignatureMissing)))?;
+        signing::verify_operator_decision(
+            trust,
+            &self.replay,
+            now,
+            &head.tenant,
+            &head.sender,
+            received,
+        )
+        .map_err(RpcError::Security)
     }
 
     fn get_task(&self, head: &RequestHead, req: &pb::GetTaskRequest) -> Result<Handled, RpcError> {
