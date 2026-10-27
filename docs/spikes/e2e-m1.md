@@ -115,3 +115,45 @@ Process check (omp.exe PIDs not owned by this run, left untouched): 32988, 43184
 This run's omp child 18152 (spawned 16:28:04) was absent before the second task. This run's respawned child 9132 (spawned 16:33:57) was alive after the second task (`tasklist`) and absent after `a2ad stop` (`tasklist /FI "PID eq 9132"`: no tasks). No `agent process exited` line was logged for either child.
 
 Cleanup: no listeners on 4252, 9485, 18777, 18786 after stop and stub kill. Nothing committed; no source changed.
+
+## Re-run 2026-10-27c: LiveGatewayRestart (S2, S3, S9, N3, N8, N9)
+
+Stack: `.spikes/e2e/m1/m1.toml` (bus 4262 with sha256, health 127.0.0.1:9495, gateway 127.0.0.1:9930 with `loopback_anonymous = false` unless noted, omp stub 18796, Hermes UUID stub 9922). Hermes home `.spikes/e2e/m1/hermes-home`. Peer bearer read from owner-only file `.spikes/e2e/m1/secrets/peer.token` (dummy value, not a secret). Real Hermes gateway and the `a2a-spike` profile were not touched. Task store: `.spikes/e2e/m1/state/agents/omp/tasks.log` (length-prefixed frames: 4-byte big-endian length, then JSON `{"upsert":{...}}`).
+
+Summary: S2 PASS with a stub workaround (defect D1). S3 NOT RUN. S9 PASS. N3 PASS with strict config; default config observed (not a failure). N8 PASS. N9 PASS for the in-flight task and the restart; backoff doubling NOT RUN.
+
+| Case | Scenario | Verdict | Evidence / reason |
+|---|---|---|---|
+| 0014-011 (S2) | Hermes `a2a_call` to gateway, WORKING before COMPLETED | PASS (with workaround) | Command (PowerShell): `$env:HERMES_HOME=".spikes/e2e/m1/hermes-home"`, dummy `OPENAI_API_KEY` and peer env set inline, `ANTHROPIC_API_KEY` removed, then `hermes.exe -z "STUB_TOOL_CALL omp-gw s2 check ping" -t a2a`. Output: `STUB_AFTER_TOOL:` line naming omp-gw, context `4fdf0a75-cf73-4914-9195-e8916b67878c`, completed; then `OK`. Task `01a17e48-81af-73ee-9c09-58f56a009955`: state 1 at seq 1, state 2 (WORKING) seq 2-5, state 3 (COMPLETED) seq 6. WORKING-before-COMPLETED is read from tasks.log; the SSE wire was not captured separately. Workaround: `.spikes/e2e/m1/stub_hermes_uuid.py`, a copy of the shared stub that adds a UUID `context_id` to `a2a_call`. With the shared stub, tasks `01a17e46-5b70-7462-aa8d-36484b4577e7` and `01a17e46-b645-7102-bcf0-de681231deba` FAILED with `WORKSPACE_FAILED`, detail `{"token":"config"}` (D1). |
+| 0014-012 (S3) | claude to Hermes via driver-a2a-http, `A2A-Version: 1.0` | NOT RUN | `spikes/claude-acp/stub_anthropic.py` has no A2A send trigger (only WRITE, READ, BASH, LONG, RECALL, REMEMBER), so no claude turn could call Hermes. Hermes server on 9921 was not started. Not a Hermes-side failure. |
+| 0014-020 (S9) | a2a-sdk Python client via gateway | PASS | `.spikes/e2e/venv/Scripts/python.exe .spikes/e2e/m1/s9_sdk_client.py` (a2a-sdk 1.0.3, bearer header, `streaming=False`, `accepted_output_modes=["text/plain"]`). One event: task `01a17e49-1e90-727e-b565-1135c89f8f61`, `TASK_STATE_COMPLETED`, artifacts `reply` (OK) and `workspace-summary`, budget metadata present. Exit 0. Agent card at `/agents/omp/.well-known/agent-card.json` contains no `nats://`, `4262` or `a2abus.bus` strings. |
+| 0014-023 (N3) | gateway without creds gives 401 | PASS (strict config) | `loopback_anonymous = false`. `curl -X POST http://127.0.0.1:9930/agents/omp` with no Authorization: HTTP 401, `WWW-Authenticate: Bearer`, JSON-RPC `-32050`, reason UNAUTHORIZED. Wrong bearer: same 401. tasks.log size 32284 bytes before and after both requests; omp.log and bus.log line counts unchanged (30, 151). Headers and bodies: `.spikes/e2e/m1/logs/n3/`. |
+| 0008-022 (default config) | anonymous loopback, default `loopback_anonymous` | OBSERVED (not a failure) | Setting omitted (default enabled). No-header POST without `A2A-Version`: HTTP 200, JSON-RPC `-32009 VERSION_NOT_SUPPORTED`, so auth was not enforced and the request reached the protocol check. With `A2A-Version: 1.0`: HTTP 200, task `01a17e4a-0ba5-7076-87ac-3bef4a9a0915` created with `origin: loopback`, COMPLETED with artifact `reply` = OK. Matches RFC 0008-022. Logs: `.spikes/e2e/m1/logs/n3/default-noauth*`. |
+| 0014-028 (N8) | supervisor killed | PASS | `taskkill /PID 59836 /F` at 16:59:04 UTC; PID 59836 verified as `a2ad.exe run --config .spikes/e2e/m1/m1.toml`. Children before the kill: nats-server 59124, gateway host 19424, omp host 18916, omp 58152. Sampled at +3 s, +10 s and +20 s: all gone. No listeners on 9930, 9495 or 4262 afterwards. Outcome observed; the containment mechanism (job object on Windows) was not inspected. |
+| 0014-029 (N9) | worker crash while ready | PASS for in-flight task and restart; backoff doubling NOT RUN | `taskkill /PID 23720 /F` at 16:57:52 UTC (omp child of host 18916) while task `01a17e4b-c45b-752a-b883-4a4c17126cff` (context `66666666-7777-4888-8999-aaaaaaaaaac1`) was WORKING (state 2, seq 64). tasks.log seq 65: state 4 FAILED at 16:57:53.084 UTC, `failure.code` `BACKEND_CRASHED`, detail `BACKEND_NOT_LIVE: backend not live: agent stdout closed (exit code: 1)`. Only one task ID exists for that context: not re-run (0012-013). omp.log: `agent process ended unexpectedly` at 16:57:53.10; respawn `pid=58152` at 16:57:54.11 (about 1.0 s); health `live=true init=Ready restarts=1` at 16:57:54.37. Earlier idle kill (no task) of omp at 16:56:44 UTC: respawn at 16:56:45.9 (about 1.2 s). After that kill omp.log shows `previous presence record still live; retrying claim agent=omp` once per second from 16:56:45.99 to 16:57:10.82, then no further retries (consistent with the 30 s TTL of 0004-017; the expiry event itself is not logged). NOT verified: gateway 503 `AGENT_UNAVAILABLE` with `Retry-After` for a request during the outage (0008-049). Backoff: both restarts were 1.0 s; the doubling toward 60 s (0012-011) was not exercised. |
+
+Observations and defects (not fixed; owners decide):
+
+- D1: Hermes `_send_task` uses `ctx-<16 hex>` context IDs, which are not UUIDs. The workspace key parse (`crates/a2a-workspace/src/ids.rs`, `WorkKey::parse`) requires a canonical UUID, so workspace-backed workers return `WORKSPACE_FAILED` with detail token `config` (tasks `01a17e46-5b70-7462-aa8d-36484b4577e7`, `01a17e46-b645-7102-bcf0-de681231deba`). Either Hermes mints UUIDs or the gateway rejects with a clear error before submission.
+- D2: a gateway peer bearer cannot come from an environment variable. The gateway child runs with `env_clear` (`crates/a2ad/src/supervisor.rs`, about line 553) and the gateway config refuses env passthrough, so the error `environment variable ... named by a secret reference is not set` is raised. Workaround used: owner-only file reference.
+- D3: the owner-only credential check rejects the default inherited Windows ACL, which grants NT AUTHORITY\SYSTEM. The file had to be tightened with `icacls` to the current user only. Decide whether SYSTEM should be allowed.
+- D4: the blocking `SendMessage` in the N9 run returned JSON-RPC `-32603` `DEADLINE_EXCEEDED` while the task was still WORKING. The return time was not measured, so this cannot be attributed to `blocking_wait_ms` (100000 in config).
+- O5: `/readyz` on 9495 reported `"agents":{}` and `"status":"unavailable"` from 16:57:54 to 16:58:18 UTC, while driver health reported omp live at 16:57:54.37 and `a2ad.exe status` reported omp `ready`. Not diagnosed.
+
+Commands used (all relative to the repo root):
+
+- `target/debug/a2ad.exe run --config .spikes/e2e/m1/m1.toml` (supervisor, ready on 9930)
+- `target/debug/a2ad.exe stop --config .spikes/e2e/m1/m1.toml` (stopped supervisor 54772, not hard-killed)
+- `target/debug/a2ad.exe status --config .spikes/e2e/m1/m1.toml`
+- `curl -s -D - -X POST http://127.0.0.1:9930/agents/omp -H "Content-Type: application/json" [-H "A2A-Version: 1.0"] [-H "Authorization: Bearer <dummy>"] -d <SendMessage JSON-RPC>`
+- `.spikes/e2e/venv/Scripts/python.exe .spikes/e2e/m1/s9_sdk_client.py`
+- `hermes.exe -z "STUB_TOOL_CALL omp-gw s2 check ping" -t a2a` with `HERMES_HOME=.spikes/e2e/m1/hermes-home`
+- `python .spikes/e2e/m1/stub_hermes_uuid.py 9922 .spikes/e2e/m1/logs/hermes-stub.jsonl`
+- `python spikes/omp-acp/stub/stub_openai.py 18796 .spikes/e2e/m1/logs`
+- `taskkill /PID <pid> /F` on the specific PIDs listed above (each verified by command line first)
+
+Pass counts: no cargo tests or clippy were run (no source changed). Scenario verdicts: PASS 4 (S2 with workaround, S9, N3 strict, N8), PASS with one sub-item NOT RUN (N9), NOT RUN 1 (S3), plus the default-config N3 observation.
+
+Processes: started and stopped by this run: both supervisors, the omp stub (pid 57456), the Hermes UUID stub (pid 47780), the Hermes one-shot runs and the S9 client (exited on their own). Not touched: omp.exe PIDs 32988, 43184, 14360, 16684; the AuditGatewayE2E stack under `target-audit-e2e` (a2ad 12532, 23176, nats 49260, omp 57888, stub 2676); the user's Hermes gateway (pid 60820) and its hermes.exe processes. Listeners on 4262, 9495, 9930, 18796, 9922, 9921 and 18797 were checked after cleanup: none.
+
+Nothing committed; no source changed.
