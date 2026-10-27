@@ -80,6 +80,19 @@ impl AcpDriver {
         }
         let _ = thread.join();
     }
+
+    /// Kills the agent process tree and keeps the actor running; the next `start` spawns the
+    /// agent again (0009-036). Replies once the tree is down.
+    fn kill(&self, grace: Duration) {
+        let (reply, done) = mpsc::channel();
+        if self
+            .tx
+            .send(Msg::Command(Command::Kill(grace, reply)))
+            .is_ok()
+        {
+            let _ = done.recv();
+        }
+    }
 }
 
 /// Capability record for a profile (0009-011). Approval modes are the modes that run without
@@ -157,7 +170,7 @@ impl Backend for AcpDriver {
     }
 
     fn shutdown(&mut self, grace: Duration) -> Result<(), BackendError> {
-        self.stop(grace);
+        self.kill(grace);
         Ok(())
     }
 }

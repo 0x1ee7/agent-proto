@@ -342,7 +342,6 @@ impl Backend for MockBackend {
         let mut state = lock(&self.state);
         state.log.push(Command::Shutdown(grace));
         state.terminate_all(|| crash_outcome("agent shut down with an open turn"));
-        state.alive = false;
         Ok(())
     }
 }

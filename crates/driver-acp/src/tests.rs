@@ -715,6 +715,23 @@ fn cancel_grace_expiry_kills_tree_0009_036() {
 }
 
 #[test]
+fn kill_then_start_respawns_agent_0009_036() {
+    let mut f = open(harness(agent).hanging(), config());
+    f.driver.start(start("silent", "t1", None)).expect("start");
+    await_frame(&f.rec, |r| method(r) == "session/prompt");
+    f.driver.shutdown(Duration::from_millis(100)).expect("kill");
+    let events = drain(&f.rx);
+    assert_eq!(outcome(&events), Outcome::Canceled);
+    assert_eq!(f.counters.kills.load(Ordering::SeqCst), 1);
+    f.driver
+        .start(start("hello", "t2", None))
+        .expect("next turn respawns the agent");
+    let events = drain(&f.rx);
+    assert_eq!(outcome(&events), Outcome::Completed);
+    assert_eq!(f.counters.spawns.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn idle_timeout_fails_turn_backend_timeout_0009_024() {
     let mut cfg = config();
     cfg.turn_idle_timeout = Duration::from_millis(300);
@@ -948,10 +965,18 @@ fn shutdown_cancels_turn_and_kills_tree_0009_059_0009_060() {
     let events = drain(&f.rx);
     assert_eq!(outcome(&events), Outcome::Canceled);
     assert_eq!(f.counters.kills.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        f.driver.start(start("hello", "t2", None)),
-        Err(BackendError::Closed)
-    );
+}
+
+#[test]
+fn drop_kills_tree_terminally_0009_060() {
+    let mut cfg = config();
+    cfg.shutdown_grace = Duration::from_millis(100);
+    let mut f = open(harness(agent).hanging(), cfg);
+    f.driver.start(start("silent", "t1", None)).expect("start");
+    await_frame(&f.rec, |r| method(r) == "session/prompt");
+    drop(f.driver);
+    assert_eq!(f.counters.kills.load(Ordering::SeqCst), 1);
+    assert_eq!(f.counters.spawns.load(Ordering::SeqCst), 1);
 }
 
 /// omp-style session: a `write` to the `xd://mcp__a2abus_a2a_send` route under `always-ask-cached`

@@ -43,6 +43,8 @@ pub(crate) enum Command {
     Cancel(TurnRef, Sender<Result<(), BackendError>>),
     Health(Sender<Health>),
     Shutdown(Duration, Sender<()>),
+    /// Ends the agent process tree; the actor keeps running (0009-036).
+    Kill(Duration, Sender<()>),
 }
 
 /// Everything the actor receives.
@@ -175,6 +177,8 @@ pub(crate) struct Core {
     restarts: u32,
     exits: VecDeque<Instant>,
     respawn_at: Option<Instant>,
+    /// Set by a worker-initiated kill: no idle respawn until the next turn starts (0009-036).
+    hold_idle_start: bool,
     sessions: HashMap<String, String>,
     /// Peer-tools binding each session was created with (RFC-0015 [0015-084]), keyed by context.
     bindings: HashMap<String, Option<PeerTools>>,
@@ -219,6 +223,7 @@ impl Core {
             restarts: 0,
             exits: VecDeque::new(),
             respawn_at: None,
+            hold_idle_start: false,
             sessions: HashMap::new(),
             bindings: HashMap::new(),
             turn: None,
@@ -302,6 +307,10 @@ impl Core {
                 self.shutdown(grace);
                 let _ = reply.send(());
                 return false;
+            }
+            Command::Kill(grace, reply) => {
+                self.kill(grace);
+                let _ = reply.send(());
             }
         }
         true
@@ -460,8 +469,14 @@ impl Core {
     /// Starts the agent while no turn is open, so backend health is known before work arrives
     /// (0012-009, 0004-015). An idle exit respawns after the backoff (0009-061). Nothing starts
     /// while `start` would refuse the approval mode (0009-064).
+    /// Nothing starts after a worker-initiated kill until the next turn (0009-036).
     fn ensure_process(&mut self) {
-        if self.conn.is_some() || self.closed || self.failed || self.unhealthy {
+        if self.conn.is_some()
+            || self.closed
+            || self.failed
+            || self.unhealthy
+            || self.hold_idle_start
+        {
             return;
         }
         if self.respawn_at.is_some_and(|at| Instant::now() < at) {
@@ -534,11 +549,14 @@ impl Core {
             terminator: spawned.terminator,
             stderr_tail: spawned.stderr_tail,
         });
-        if self.spawned_once {
+        // A respawn after an unexpected exit is a restart (0009-061). A respawn after a
+        // worker-initiated kill is not: the worker already ended that turn.
+        if self.spawned_once && self.respawn_at.is_some() {
             self.restarts += 1;
         }
         self.spawned_once = true;
         self.respawn_at = None;
+        self.hold_idle_start = false;
         self.init = InitState::Initializing;
         self.set_phase(Phase::AwaitInit);
         self.send_rpc(Rpc::Initialize, "initialize", acp::initialize_params());
@@ -1489,6 +1507,17 @@ impl Core {
         self.finish(outcome);
         self.down_reason = Some("driver shut down".to_owned());
         self.closed = true;
+        self.close_conn(grace);
+    }
+
+    /// Ends the agent process tree for a worker-initiated stop and keeps the actor running.
+    /// The open turn ends Canceled (0009-036). The next start spawns the agent again; a
+    /// deliberate kill is not an unexpected exit, so it sets no backoff (0009-061).
+    fn kill(&mut self, grace: Duration) {
+        let outcome = self.take_outcome(Outcome::Canceled);
+        self.finish(outcome);
+        self.down_reason = Some("agent process killed by the worker".to_owned());
+        self.hold_idle_start = true;
         self.close_conn(grace);
     }
 }

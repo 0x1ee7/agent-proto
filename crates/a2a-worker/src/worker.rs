@@ -591,8 +591,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
     }
 
-    /// Kills the backend and ends the open turn with `reason`. A killed backend
-    /// stays dead, so later starts answer Closed and end BACKEND_CRASHED (0009-059).
+    /// Kills the backend and ends the open turn with `reason`. The next start on this
+    /// backend spawns the agent again (0009-036).
     fn kill(
         &mut self,
         task: &str,
@@ -613,6 +613,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             return;
         }
         self.cancel_deadlines.remove(task);
+        // The worker stopped this backend itself. Clearing `live_seen` keeps the next health
+        // check from reading the stop as a live backend dropping under a later turn (0006-017).
+        self.live_seen = false;
         if let Err(err) = self.backend.shutdown(Duration::ZERO) {
             self.audit(Some(task), format!("SHUTDOWN_FAILED: {err}"));
         }
