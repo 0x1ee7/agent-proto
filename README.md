@@ -25,6 +25,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Live tests (real `nats-server`, real omp / Claude adapter / Hermes with local stub models) are ignored by default; see `docs/spikes/e2e-m1.md` and `spikes/*/README.md`.
 
+Every component's commands, native and Docker, are listed in [DEV.md](DEV.md).
+
 ## Status
 
 See `docs/spikes/e2e-m1.md` for what has been verified live and what has not. The RFCs are `Proposed`; implementation requirement coverage is tracked by test names that carry the requirement ID.
