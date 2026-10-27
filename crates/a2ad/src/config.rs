@@ -13,6 +13,8 @@ use a2a_types::ids::{AgentId, TenantId};
 use a2a_workspace::{NonGitPolicy, WorkspaceMode};
 use serde::Deserialize;
 
+use crate::hosts::logging::LogSettings;
+
 /// The only accepted `config_version` (0012-001).
 pub const CONFIG_VERSION: i64 = 1;
 
@@ -33,6 +35,10 @@ const DEFAULT_BUS_BINARY: &str = "nats-server";
 const DEFAULT_DRAIN_MS: u64 = 15_000;
 const DEFAULT_GRACE_MS: u64 = 10_000;
 const MAX_SHUTDOWN_MS: u64 = 3_600_000;
+/// Default `log.level` (an EnvFilter directive, RFC-0013 0013-038).
+const DEFAULT_LOG_LEVEL: &str = "info";
+/// Default `log.format` (RFC-0013 0013-039).
+const DEFAULT_LOG_FORMAT: &str = "text";
 const DEFAULT_OPERATOR: &str = "tui";
 const OPERATORS: [&str; 2] = ["tui", "cli"];
 const DEFAULT_APPROVAL: &str = "ask-all";
@@ -309,6 +315,7 @@ pub struct Config {
     grace: Duration,
     health_listen: SocketAddr,
     bus: BusSettings,
+    log: LogSettings,
     agents: Vec<AgentSpec>,
 }
 
@@ -391,6 +398,12 @@ impl Config {
         let health_listen = loopback_socket(&health_text, "[supervisor]", "health_listen")?;
 
         let bus = build_bus(decode_table(&root, "bus", "[bus]")?.unwrap_or_default())?;
+        let raw_log: RawLog = decode_table(&root, "log", "[log]")?.unwrap_or_default();
+        let log = LogSettings::new(
+            raw_log.level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL),
+            raw_log.format.as_deref().unwrap_or(DEFAULT_LOG_FORMAT),
+        )
+        .map_err(|detail| ConfigError::new("[log]", detail))?;
 
         let raw_agents = raw_agent_tables(&root)?;
         let mut agents = Vec::with_capacity(raw_agents.len());
@@ -408,6 +421,7 @@ impl Config {
             grace: Duration::from_millis(grace_ms),
             health_listen,
             bus,
+            log,
             agents,
         })
     }
@@ -458,6 +472,12 @@ impl Config {
     #[must_use]
     pub fn bus(&self) -> &BusSettings {
         &self.bus
+    }
+
+    /// The validated `[log]` settings (RFC-0013 0013-038, 0013-039).
+    #[must_use]
+    pub fn log(&self) -> &LogSettings {
+        &self.log
     }
 
     /// Every `[[agent]]` in configuration order.
@@ -559,6 +579,13 @@ struct RawBus {
     sha256: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLog {
+    level: Option<String>,
+    format: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWorkspace {
@@ -624,12 +651,13 @@ struct RawAgent {
 // ---------- decoding helpers --------------------------------------------------------
 
 fn check_root_keys(root: &toml::Table) -> Result<(), ConfigError> {
-    const ALLOWED: [&str; 6] = [
+    const ALLOWED: [&str; 7] = [
         "config_version",
         "tenant",
         "paths",
         "supervisor",
         "bus",
+        "log",
         "agent",
     ];
     for key in root.keys() {
@@ -1516,6 +1544,19 @@ mod tests {
         let omp = cfg.agent("omp").unwrap();
         assert_eq!(omp.approval_mode.as_deref(), Some("ask-exec"));
         assert!(!omp.dangerous);
+    }
+
+    #[test]
+    fn req_0013_038_log_table_validated() {
+        let cfg = parse(&doc("")).unwrap();
+        assert_eq!(cfg.log().level(), "info");
+        assert_eq!(cfg.log().format(), crate::hosts::logging::LogFormat::Text);
+        let set = parse(&doc("[log]\nlevel = \"debug\"\nformat = \"json\"\n")).unwrap();
+        assert_eq!(set.log().level(), "debug");
+        assert_eq!(set.log().format(), crate::hosts::logging::LogFormat::Json);
+        let bad_format = parse(&doc("[log]\nformat = \"xml\"\n")).unwrap_err();
+        assert_eq!(bad_format.table, "[log]");
+        assert!(parse(&doc("[log]\nlevl = \"debug\"\n")).is_err());
     }
 
     #[test]

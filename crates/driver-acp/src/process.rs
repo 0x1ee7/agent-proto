@@ -3,15 +3,20 @@
 //! The actor talks to agents only through [`Spawner`], so tests can substitute
 //! in-memory pipes for real processes.
 
-use std::io::{self, Read, Write};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::LaunchSpec;
+use crate::redact::redact;
 
 /// Maximum stderr bytes kept for crash detail.
 const STDERR_TAIL_BYTES: usize = 2048;
+/// Largest stderr read without a newline; bounds the line buffer.
+const MAX_LOG_LINE: usize = 4096;
+/// Characters of one stderr line that reach the log.
+const MAX_LOG_CHARS: usize = 512;
 
 /// Termination handle for one agent process tree.
 pub(crate) trait Terminator: Send {
@@ -19,6 +24,8 @@ pub(crate) trait Terminator: Send {
     fn wait_exit(&mut self, timeout: Duration) -> bool;
     /// Kills the process and its descendants. Best effort, idempotent.
     fn kill_tree(&mut self);
+    /// Exit status of the reaped process, e.g. `exit status: 3`. None while it runs or when unknown.
+    fn exit_description(&self) -> Option<String>;
 }
 
 /// A freshly spawned agent with its three standard streams.
@@ -60,10 +67,18 @@ impl Spawner for OsSpawner {
         let stderr = take(child.stderr.take(), "stderr")?;
         let stderr_tail = Arc::new(Mutex::new(Vec::new()));
         drain_stderr(stderr, Arc::clone(&stderr_tail));
+        let program = spec
+            .program
+            .file_name()
+            .map_or_else(|| "?".to_owned(), |n| n.to_string_lossy().into_owned());
+        tracing::info!(target: "driver_acp::child", program = %program, pid = child.id(), "agent process spawned");
         Ok(Spawned {
             stdin: Box::new(ChildStdinWriter(stdin)),
             stdout: Box::new(ChildStdoutReader(stdout)),
-            terminator: Box::new(ChildTerminator { child }),
+            terminator: Box::new(ChildTerminator {
+                child,
+                status: None,
+            }),
             stderr_tail,
         })
     }
@@ -92,28 +107,57 @@ impl Read for ChildStdoutReader {
     }
 }
 
-fn drain_stderr(mut stderr: ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
+fn drain_stderr(stderr: ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
     std::thread::spawn(move || {
-        let mut chunk = [0u8; 512];
+        let mut reader = BufReader::new(stderr);
         loop {
-            match stderr.read(&mut chunk) {
+            let mut line = Vec::new();
+            match (&mut reader)
+                .take(MAX_LOG_LINE as u64)
+                .read_until(b'\n', &mut line)
+            {
                 Ok(0) | Err(_) => return,
-                Ok(n) => {
-                    if let Ok(mut buf) = tail.lock() {
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.len() > STDERR_TAIL_BYTES {
-                            let excess = buf.len() - STDERR_TAIL_BYTES;
-                            buf.drain(..excess);
-                        }
-                    }
+                Ok(_) => {
+                    keep_tail(&tail, &line);
+                    log_stderr_line(&line);
                 }
             }
         }
     });
 }
 
+fn keep_tail(tail: &Mutex<Vec<u8>>, bytes: &[u8]) {
+    if let Ok(mut buf) = tail.lock() {
+        buf.extend_from_slice(bytes);
+        if buf.len() > STDERR_TAIL_BYTES {
+            let excess = buf.len() - STDERR_TAIL_BYTES;
+            buf.drain(..excess);
+        }
+    }
+}
+
+/// Logs one stderr line redacted; error-like lines at warn, the rest at debug (target `driver_acp::child`).
+fn log_stderr_line(line: &[u8]) {
+    let text = String::from_utf8_lossy(line);
+    let text: String = text.trim_end().chars().take(MAX_LOG_CHARS).collect();
+    if text.is_empty() {
+        return;
+    }
+    let shown = redact(&text);
+    let lower = shown.to_ascii_lowercase();
+    if ["error", "panic", "fatal"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        tracing::warn!(target: "driver_acp::child", line = %shown, "agent stderr");
+    } else {
+        tracing::debug!(target: "driver_acp::child", line = %shown, "agent stderr");
+    }
+}
+
 struct ChildTerminator {
     child: Child,
+    status: Option<ExitStatus>,
 }
 
 impl Terminator for ChildTerminator {
@@ -121,7 +165,10 @@ impl Terminator for ChildTerminator {
         let deadline = Instant::now() + timeout;
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return true,
+                Ok(Some(status)) => {
+                    self.status = Some(status);
+                    return true;
+                }
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -134,7 +181,13 @@ impl Terminator for ChildTerminator {
         let pid = self.child.id();
         kill_group(pid);
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(status) = self.child.wait() {
+            self.status = Some(status);
+        }
+    }
+
+    fn exit_description(&self) -> Option<String> {
+        self.status.map(|status| status.to_string())
     }
 }
 
@@ -170,3 +223,62 @@ fn kill_group(pid: u32) {
 
 #[cfg(not(any(unix, windows)))]
 fn kill_group(_pid: u32) {}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    /// A child that writes one stderr line and exits with status 3.
+    fn failing_child() -> LaunchSpec {
+        #[cfg(unix)]
+        let (program, args, env) = (
+            PathBuf::from("/bin/sh"),
+            vec![
+                OsString::from("-c"),
+                OsString::from("echo boom >&2; exit 3"),
+            ],
+            Vec::new(),
+        );
+        #[cfg(windows)]
+        let (program, args, env) = {
+            let root = std::env::var_os("SYSTEMROOT").unwrap_or_else(|| "C:\\Windows".into());
+            (
+                PathBuf::from(&root).join("System32").join("cmd.exe"),
+                vec![
+                    OsString::from("/C"),
+                    OsString::from("echo boom 1>&2 & exit 3"),
+                ],
+                vec![(OsString::from("SYSTEMROOT"), root)],
+            )
+        };
+        LaunchSpec {
+            program,
+            args,
+            env,
+            cwd: std::env::temp_dir(),
+        }
+    }
+
+    #[test]
+    fn exit_status_and_stderr_tail_are_observable_after_stdout_closes_0009_023() {
+        let mut spawned = OsSpawner.spawn(&failing_child()).expect("spawn");
+        let mut sink = Vec::new();
+        spawned.stdout.read_to_end(&mut sink).expect("stdout EOF");
+        assert!(spawned.terminator.wait_exit(Duration::from_secs(10)));
+        let status = spawned.terminator.exit_description().expect("reaped");
+        assert!(status.contains('3'), "exit status names code 3: {status}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let tail = spawned.stderr_tail.lock().expect("tail").clone();
+            if String::from_utf8_lossy(&tail).contains("boom") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "stderr tail reached the driver");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}

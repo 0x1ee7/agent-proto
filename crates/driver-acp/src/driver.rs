@@ -107,6 +107,7 @@ impl Backend for AcpDriver {
         let dead = Health {
             live: false,
             restarts: 0,
+            reason: Some("agent driver stopped".to_owned()),
         };
         let (reply, answer) = mpsc::channel();
         if self.tx.send(Msg::Command(Command::Health(reply))).is_err() {

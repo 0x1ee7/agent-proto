@@ -10,9 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 use a2a_worker::backend::{
-    Backend, BackendError, BackendEvent, ChannelSink, FaultKind, InputPart, Outcome,
-    PermissionAnswer, PermissionRequest, Protocol, ReasonToken, RequestId, SessionHandle,
-    StartTurn, StatusPayload, TurnRef, UsageSource,
+    Backend, BackendError, BackendEvent, ChannelSink, FaultKind, InputPart, Outcome, PeerTools,
+    PermissionAnswer, PermissionRequest, Protocol, ReasonToken, RequestId, SecretText,
+    SessionHandle, StartTurn, StatusPayload, TurnRef, UsageSource,
 };
 use a2a_worker::backend_contract::check_turn_stream;
 use serde_json::{Value, json};
@@ -294,6 +294,7 @@ fn start(text: &str, turn: &str, session: Option<&str>) -> StartTurn {
         context_id: "ctx-1".to_owned(),
         input: vec![InputPart::Text(text.to_owned())],
         origin: "peer-test".to_owned(),
+        peer_tools: None,
         deadline_ms: u64::MAX,
         session: session.map(SessionHandle::new),
     }
@@ -760,6 +761,113 @@ fn restore_uses_session_load_when_advertised_0009_013() {
     assert!(!rec.iter().any(|r| method(r) == "session/new"));
 }
 
+/// A peer-tools binding with fixed base64url-shaped fields and absolute paths.
+fn peer() -> PeerTools {
+    PeerTools {
+        slot: "c2xvdA".to_owned(),
+        grant_id: "Z3JhbnQ".to_owned(),
+        grant_credential: SecretText::new("Y3JlZA"),
+        endpoint: std::env::temp_dir().join("a2abus-endpoint"),
+        shim_path: std::env::temp_dir().join("a2abus-mcp-shim"),
+    }
+}
+
+/// The exact RFC-0015 [0015-084] `mcpServers` array for [`peer`].
+fn expected_servers(peer: &PeerTools) -> Value {
+    json!([{
+        "name": "a2abus",
+        "command": peer.shim_path.to_string_lossy(),
+        "args": [
+            "--grant", "Z3JhbnQ",
+            "--endpoint", peer.endpoint.to_string_lossy(),
+            "--slot", "c2xvdA",
+        ],
+        "env": [{"name": "A2ABUS_MCP_GRANT", "value": "Y3JlZA"}],
+    }])
+}
+
+fn start_with_peer(
+    text: &str,
+    turn: &str,
+    session: Option<&str>,
+    peer_tools: Option<PeerTools>,
+) -> StartTurn {
+    StartTurn {
+        peer_tools,
+        ..start(text, turn, session)
+    }
+}
+
+#[test]
+fn peer_tools_entry_reaches_session_new_0015_084() {
+    let peer = peer();
+    let mut f = open(harness(agent), config());
+    f.driver
+        .start(start_with_peer("hello", "t1", None, Some(peer.clone())))
+        .expect("start");
+    drain(&f.rx);
+    let new = await_frame(&f.rec, |r| method(r) == "session/new");
+    assert_eq!(new["params"]["mcpServers"], expected_servers(&peer));
+}
+
+#[test]
+fn peer_tools_entry_reaches_session_load_0015_084() {
+    let peer = peer();
+    let mut f = open(harness(agent), config());
+    f.driver
+        .start(start_with_peer(
+            "hello",
+            "t1",
+            Some("s-old"),
+            Some(peer.clone()),
+        ))
+        .expect("start");
+    drain(&f.rx);
+    let load = await_frame(&f.rec, |r| method(r) == "session/load");
+    assert_eq!(load["params"]["mcpServers"], expected_servers(&peer));
+    assert_eq!(load["params"]["sessionId"], "s-old");
+}
+
+#[test]
+fn peer_tools_none_passes_empty_servers_0015_085() {
+    let mut f = open(harness(agent), config());
+    f.driver.start(start("hello", "t1", None)).expect("start");
+    drain(&f.rx);
+    let new = await_frame(&f.rec, |r| method(r) == "session/new");
+    assert_eq!(new["params"]["mcpServers"], json!([]));
+}
+
+#[test]
+fn peer_tools_with_operator_servers_refused_0015_084() {
+    let mut cfg = config();
+    cfg.mcp_servers = vec![json!({"name": "operator"})];
+    let mut f = open(harness(agent), cfg);
+    let result = f
+        .driver
+        .start(start_with_peer("hello", "t1", None, Some(peer())));
+    assert!(matches!(result, Err(BackendError::Unsupported(_))));
+    let event = f.rx.recv_timeout(WAIT).expect("fault event");
+    assert!(matches!(
+        event,
+        BackendEvent::Fault {
+            kind: FaultKind::ConfigRefused,
+            ..
+        }
+    ));
+    assert!(!lock(&f.rec).iter().any(|r| method(r) == "initialize"));
+}
+
+#[test]
+fn peer_tools_binding_change_refused_0015_084() {
+    let mut f = open(harness(agent), config());
+    f.driver
+        .start(start_with_peer("hello", "t1", None, Some(peer())))
+        .expect("first start");
+    drain(&f.rx);
+    let second = f.driver.start(start_with_peer("again", "t2", None, None));
+    assert!(matches!(second, Err(BackendError::Unsupported(_))));
+}
+
 #[test]
 fn restore_not_found_becomes_new_session_with_notice_0009_013() {
     let mut f = open(harness(load_not_found), config());
@@ -830,4 +938,97 @@ fn shutdown_cancels_turn_and_kills_tree_0009_059_0009_060() {
         f.driver.start(start("hello", "t2", None)),
         Err(BackendError::Closed)
     );
+}
+
+/// omp-style session: a `write` to the `xd://mcp__a2abus_a2a_send` route under `always-ask-cached`
+/// is relayed as a form elicitation; the tool then completes and the turn ends.
+fn omp_mcp_write(rec: &Rec, frame: &Value) -> Step {
+    if let Some(frames) = base(frame) {
+        return Step::Emit(frames);
+    }
+    match method(frame) {
+        "session/prompt" => Step::Emit(vec![
+            session_update(
+                "s-1",
+                json!({"sessionUpdate": "tool_call", "toolCallId": "w1", "kind": "edit",
+                       "title": "write xd://mcp__a2abus_a2a_send", "status": "pending"}),
+            ),
+            request(
+                70,
+                "elicitation/create",
+                elicitation_params("Allow tool: write xd://mcp__a2abus_a2a_send"),
+            ),
+        ]),
+        // The driver's answer to the elicitation: the tool runs, then the turn finishes.
+        "" => {
+            let mut frames = vec![
+                session_update(
+                    "s-1",
+                    json!({"sessionUpdate": "tool_call_update", "toolCallId": "w1",
+                           "kind": "edit", "status": "completed"}),
+                ),
+                session_update(
+                    "s-1",
+                    json!({"sessionUpdate": "agent_message_chunk",
+                           "content": {"type": "text", "text": "done"}}),
+                ),
+            ];
+            if let Step::Emit(more) = finish(rec, "end_turn") {
+                frames.extend(more);
+            }
+            Step::Emit(frames)
+        }
+        _ => Step::Emit(vec![]),
+    }
+}
+
+#[test]
+fn omp_mcp_route_write_approval_keeps_driver_live_0009_024_0009_032() {
+    let mut cfg = config();
+    cfg.turn_idle_timeout = Duration::from_millis(300);
+    let mut f = open(harness(omp_mcp_write), cfg);
+    f.driver
+        .start(start("mcp-write", "t1", None))
+        .expect("start");
+    let (request, mut seen) = until_permission_events(&f.rx);
+    assert_eq!(request.tool_kind, "form-elicitation");
+    assert!(request.tool_title.contains("xd://mcp__a2abus_a2a_send"));
+    // The approval outlasts the idle limit: the driver stays live, the turn stays open.
+    thread::sleep(Duration::from_millis(600));
+    let health = f.driver.health();
+    assert!(health.live);
+    assert!(health.reason.is_none());
+    f.driver
+        .resolve_permission(
+            &request.request_id,
+            PermissionAnswer::Selected {
+                option_id: "allow-once".to_owned(),
+            },
+        )
+        .expect("resolve");
+    seen.extend(drain(&f.rx));
+    assert_eq!(outcome(&seen), Outcome::Completed);
+    assert!(!seen.iter().any(|e| matches!(e, BackendEvent::Fault { .. })));
+    let answer = response_to(&f.rec, 70);
+    assert_eq!(
+        answer["result"],
+        json!({"action": "accept", "content": {"value": "Approve Once"}})
+    );
+    assert!(seen.iter().any(|e| matches!(
+        e,
+        BackendEvent::Status { payload: StatusPayload::Progress(p), .. } if p.contains("\"kind\":\"edit\"") && p.contains("mcp__a2abus_a2a_send")
+    )));
+}
+
+#[test]
+fn approval_wait_is_bounded_by_permission_timeout_not_idle_0009_024_0009_033() {
+    let mut cfg = config();
+    cfg.turn_idle_timeout = Duration::from_millis(200);
+    cfg.permission_timeout = Duration::from_millis(600);
+    let mut f = open(harness(agent), cfg);
+    f.driver.start(start("perm", "t1", None)).expect("start");
+    let events = drain(&f.rx);
+    assert_eq!(outcome(&events), Outcome::Completed);
+    let answer = response_to(&f.rec, 50);
+    assert_eq!(answer["result"]["outcome"]["outcome"], json!("cancelled"));
 }

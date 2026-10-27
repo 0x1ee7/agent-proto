@@ -291,10 +291,28 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         reason: StopReason,
         now: u64,
     ) -> Result<Vec<Effect>, WorkerError> {
+        self.commit_turn_end_with_detail(task, reason, None, now)
+    }
+
+    /// Ends a turn like [`Self::commit_turn_end`], carrying the backend's failure detail
+    /// into the failure record (RFC-0005 0005-053).
+    pub(crate) fn commit_turn_end_with_detail(
+        &mut self,
+        task: &str,
+        reason: StopReason,
+        detail: Option<serde_json::Value>,
+        now: u64,
+    ) -> Result<Vec<Effect>, WorkerError> {
+        // Every stop that is not a clean end carries a cause, so a FAILED record is never empty.
+        let detail = detail.or_else(|| {
+            (reason != StopReason::EndTurn).then(|| {
+                crate::worker::cause("BACKEND_STOPPED", &format!("backend stopped: {reason:?}"))
+            })
+        });
         let result = match self.publish_artifacts(task, now) {
             Ok(None) => self
                 .tasks
-                .backend_stopped(task, reason, now)
+                .backend_stopped_with_detail(task, reason, detail, now)
                 .map_err(WorkerError::from),
             Ok(Some(token)) => self.fail_workspace(task, token, now),
             Err(err) => Err(err),

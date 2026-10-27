@@ -86,6 +86,8 @@ pub struct Worker<B: Bus, D: Backend, S: TaskStore> {
     pub(crate) cancel_deadlines: BTreeMap<String, u64>,
     /// Completed turns whose end waits for open delegated children (0015-067).
     pub(crate) deferred_ends: BTreeMap<String, StopReason>,
+    /// Blocking sends awaiting their reply (0002-050).
+    pub(crate) held: Vec<crate::rpc::Held>,
     /// Backend permission requests keyed by the approval request id that answers them.
     pub(crate) permissions: BTreeMap<String, Vec<Offered>>,
     pub(crate) restarts_seen: u32,
@@ -162,6 +164,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             tasks,
             pending: BTreeMap::new(),
             queue: VecDeque::new(),
+            held: Vec::new(),
             open: BTreeMap::new(),
             deferred_ends: BTreeMap::new(),
             cancel_deadlines: BTreeMap::new(),
@@ -247,12 +250,13 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             .map(|(task, _)| task.clone())
             .collect();
         for task in due {
-            let effects = self.kill(&task, StopReason::Cancelled, now)?;
+            let effects = self.kill(&task, StopReason::Cancelled, None, now)?;
             self.run(effects, now)?;
         }
         let effects = self.tasks.expire_due(now)?;
         let effects = self.expire(effects, now)?;
         self.run(effects, now)?;
+        self.release_held(now).await?;
         self.pump_delegation(now).await?;
         self.flush_outbox(now).await?;
         self.publish_presence(now, false).await
@@ -292,10 +296,17 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             .as_ref()
             .and_then(|p| p.next_wakeup(now, self.backend.health().live));
         let delegation = self.delegation.as_ref().map(|d| d.wakeup(now));
-        [self.tasks.next_wakeup(now), cancel, presence, delegation]
-            .into_iter()
-            .flatten()
-            .min()
+        let held = self.held.iter().map(|entry| entry.wait.until).min();
+        [
+            self.tasks.next_wakeup(now),
+            cancel,
+            presence,
+            delegation,
+            held,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Sets draining. New submissions answer DRAINING; in-flight tasks continue (0005-050).
@@ -390,7 +401,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Effect::CancelBackend { task_id, grace_ms } => {
                 self.cancel_turn(&task_id, grace_ms, now)
             }
-            Effect::KillBackend { task_id } => self.kill(&task_id, StopReason::Cancelled, now),
+            Effect::KillBackend { task_id } => {
+                self.kill(&task_id, StopReason::Cancelled, None, now)
+            }
             Effect::AnswerApproval {
                 request_id, answer, ..
             } => {
@@ -473,7 +486,13 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         };
         let Some(pending) = self.pending.remove(task) else {
             // Recovered SUBMITTED task whose input was never persisted (see AGENTS.md).
-            out.extend(self.tasks.backend_stopped(task, StopReason::Crashed, now)?);
+            let detail = cause("RECOVERED", "task recovered without its persisted input");
+            out.extend(self.tasks.backend_stopped_with_detail(
+                task,
+                StopReason::Crashed,
+                Some(detail),
+                now,
+            )?);
             return Ok(out);
         };
         let peer_tools = self.bind_peer_tools(task)?;
@@ -481,7 +500,13 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Ok(input) => input,
             Err(err) => {
                 self.audit(Some(task), format!("UNTRUSTED_INPUT_REJECTED: {err}"));
-                out.extend(self.commit_turn_end(task, StopReason::Unknown, now)?);
+                let detail = cause("UNTRUSTED_INPUT_REJECTED", &err.to_string());
+                out.extend(self.commit_turn_end_with_detail(
+                    task,
+                    StopReason::Unknown,
+                    Some(detail),
+                    now,
+                )?);
                 return Ok(out);
             }
         };
@@ -500,22 +525,29 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             }
             Err(err) => {
                 self.audit(Some(task), format!("BACKEND_START_FAILED: {err}"));
-                out.extend(self.commit_turn_end(task, start_failure(&err), now)?);
+                let detail = cause("BACKEND_START_FAILED", &err.to_string());
+                out.extend(self.commit_turn_end_with_detail(
+                    task,
+                    start_failure(&err),
+                    Some(detail),
+                    now,
+                )?);
             }
         }
         Ok(out)
     }
 
-    /// Ends an open turn with `reason` and starts the next queued task.
-    fn close_turn(
+    /// Ends an open turn with `reason` and `detail`, then starts the next queued task.
+    fn close_turn_with_detail(
         &mut self,
         task: &str,
         reason: StopReason,
+        detail: Option<serde_json::Value>,
         now: u64,
     ) -> Result<Vec<Effect>, WorkerError> {
         self.open.remove(task);
         self.cancel_deadlines.remove(task);
-        let mut out = self.commit_turn_end(task, reason, now)?;
+        let mut out = self.commit_turn_end_with_detail(task, reason, detail, now)?;
         out.extend(self.dispatch_next(now)?);
         Ok(out)
     }
@@ -530,7 +562,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             return Ok(Vec::new());
         }
         if grace_ms == 0 {
-            return self.kill(task, StopReason::Cancelled, now);
+            return self.kill(task, StopReason::Cancelled, None, now);
         }
         match self.backend.cancel(&TurnRef::new(task)) {
             Ok(()) => {
@@ -539,7 +571,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                     .or_insert(now.saturating_add(grace_ms));
                 Ok(Vec::new())
             }
-            Err(BackendError::Closed) => self.close_turn(task, StopReason::Crashed, now),
+            Err(BackendError::Closed) => {
+                let detail = cause("BACKEND_CLOSED", "backend closed during cancel");
+                self.close_turn_with_detail(task, StopReason::Crashed, Some(detail), now)
+            }
             Err(err) => {
                 // The turn is still open; the kill deadline bounds how long it may run.
                 self.audit(Some(task), format!("CANCEL_FAILED: {err}"));
@@ -557,13 +592,14 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         &mut self,
         task: &str,
         reason: StopReason,
+        detail: Option<serde_json::Value>,
         now: u64,
     ) -> Result<Vec<Effect>, WorkerError> {
         if !self.open.contains_key(task) {
             return Ok(Vec::new());
         }
         self.stop_session(task);
-        self.close_turn(task, reason, now)
+        self.close_turn_with_detail(task, reason, detail, now)
     }
 
     /// Stops the open session for `task` without recording an end state. The caller commits it.
@@ -606,10 +642,21 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             return Ok(Vec::new());
         }
         self.restarts_seen = health.restarts;
+        let text = match (health.live, health.reason.as_deref()) {
+            (false, Some(reason)) => format!("backend not live: {reason}"),
+            (false, None) => "backend not live".to_owned(),
+            (true, _) => "backend restarted; the open turn was lost".to_owned(),
+        };
+        let detail = cause("BACKEND_NOT_LIVE", &text);
         let open: Vec<String> = self.open.keys().cloned().collect();
         let mut out = Vec::new();
         for task in open {
-            out.extend(self.close_turn(&task, StopReason::Crashed, now)?);
+            out.extend(self.close_turn_with_detail(
+                &task,
+                StopReason::Crashed,
+                Some(detail.clone()),
+                now,
+            )?);
         }
         Ok(out)
     }
@@ -640,9 +687,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             FaultKind::Internal => StopReason::Unknown,
         };
         let open: Vec<String> = self.open.keys().cloned().collect();
+        let carried = serde_json::json!({"kind": format!("{kind:?}"), "detail": detail});
         let mut out = Vec::new();
         for task in open {
-            out.extend(self.close_turn(&task, reason, now)?);
+            out.extend(self.close_turn_with_detail(&task, reason, Some(carried.clone()), now)?);
         }
         Ok(out)
     }
@@ -662,7 +710,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
         if event_no != prev + 1 {
             self.audit(Some(&turn), "BACKEND_EVENT_GAP: turn killed");
-            return self.kill(&turn, StopReason::Unknown, now);
+            let detail = cause("BACKEND_EVENT_GAP", "backend event sequence has a gap");
+            return self.kill(&turn, StopReason::Unknown, Some(detail), now);
         }
         self.open.insert(turn.clone(), event_no);
         match event {
@@ -729,7 +778,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                     self.deferred_ends.insert(turn, reason);
                     return Ok(Vec::new());
                 }
-                self.close_turn(&turn, reason, now)
+                let detail = wire::outcome_detail(&outcome);
+                self.close_turn_with_detail(&turn, reason, detail, now)
             }
             BackendEvent::Fault { .. } => Ok(Vec::new()),
         }
@@ -938,6 +988,14 @@ fn tier_of(tool_kind: &str) -> Tier {
         "delete" | "move" => Tier::DeleteOrMove,
         _ => Tier::Exec,
     }
+}
+
+/// The cause a FAILED record carries (RFC-0005 0005-049): `{"kind", "detail"}` with the
+/// text redacted by a2a-security. A redaction error is replaced by a fixed marker, never by
+/// the raw text.
+pub(crate) fn cause(kind: &str, text: &str) -> serde_json::Value {
+    let detail = a2a_security::redact::redact(text).unwrap_or_else(|_| "[redacted]".to_owned());
+    serde_json::json!({ "kind": kind, "detail": detail })
 }
 
 fn start_failure(err: &BackendError) -> StopReason {

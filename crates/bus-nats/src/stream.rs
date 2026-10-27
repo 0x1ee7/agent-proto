@@ -2,9 +2,10 @@
 //! dedupe, and durable push consumers with explicit acknowledgement.
 //!
 //! A stream is not chosen by this binding from the subject. A subject is stored in
-//! whichever JetStream stream captures it; `append` and `consume` check the stream's
-//! own subject list before they touch it.
+//! whichever JetStream stream captures it. `append` names the stream it expects; the
+//! server refuses a publish that another stream captures, so `append` reads no stream info.
 
+use std::error::Error as _;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,7 @@ use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, ReplayPolicy};
 use async_nats::jetstream::context::{PublishError, PublishErrorKind};
 use async_nats::jetstream::publish::PublishAck as JsAck;
 use async_nats::jetstream::stream::Stream;
+use async_nats::jetstream::{Error as JsError, ErrorCode};
 use bus_api::bus::Consumer;
 use bus_api::error::BusError;
 use bus_api::headers::Headers;
@@ -36,24 +38,11 @@ use crate::wire::{check_budget, inbound_headers, to_header_map};
 /// Header carrying the JetStream dedupe key (`Nats-Msg-Id`).
 pub(crate) const NATS_MSG_ID: &str = "Nats-Msg-Id";
 
+/// Header naming the stream a publish must land in (`Nats-Expected-Stream`).
+pub(crate) const NATS_EXPECTED_STREAM: &str = "Nats-Expected-Stream";
+
 /// Heartbeat interval of push consumers, so a stalled delivery is noticed.
 const IDLE_HEARTBEAT: Duration = Duration::from_secs(5);
-
-/// True when the NATS subject pattern `pattern` matches the literal `subject`.
-/// `*` matches one token; `>` matches one or more trailing tokens.
-pub(crate) fn pattern_matches(pattern: &str, subject: &str) -> bool {
-    let mut pattern_tokens = pattern.split('.');
-    let mut subject_tokens = subject.split('.');
-    loop {
-        match (pattern_tokens.next(), subject_tokens.next()) {
-            (Some(">"), Some(_)) => return true,
-            (Some("*"), Some(_)) => {}
-            (Some(p), Some(s)) if p == s => {}
-            (None, None) => return true,
-            _ => return false,
-        }
-    }
-}
 
 /// True when every subject matched by `filter` is also matched by `captured`.
 /// Both are NATS subject patterns; a filter wider than the capture is refused.
@@ -183,21 +172,15 @@ pub(crate) async fn append(
     msg_id: &MsgId,
 ) -> Result<PublishAck, BusError> {
     check_budget(headers, &payload)?;
-    let handle = open_stream(bus, stream).await?;
-    let captured = handle
-        .cached_info()
-        .config
-        .subjects
-        .iter()
-        .any(|pattern| pattern_matches(pattern, subject.as_str()));
-    if !captured {
-        return Err(BusError::Absent);
-    }
     let mut map = to_header_map(headers);
     map.insert(NATS_MSG_ID, msg_id.as_str());
+    map.insert(NATS_EXPECTED_STREAM, stream.as_str());
     let ack = publish_durable(bus, subject.as_str(), map, payload)
         .await?
-        .map_err(|err| errors::js_publish(&err))?;
+        .map_err(|err| match stream_mismatch(&err) {
+            true => BusError::Absent,
+            false => errors::js_publish(&err),
+        })?;
     if ack.duplicate {
         return Err(BusError::Duplicate {
             original_seq: StreamSeq::new(ack.sequence),
@@ -207,6 +190,14 @@ pub(crate) async fn append(
         stream: Some(stream.clone()),
         seq: Some(StreamSeq::new(ack.sequence)),
     })
+}
+
+/// True when JetStream refused the publish because another stream captures the subject
+/// (error 10060, `Nats-Expected-Stream` mismatch). Nothing was stored.
+fn stream_mismatch(err: &PublishError) -> bool {
+    err.source()
+        .and_then(|source| source.downcast_ref::<JsError>())
+        .is_some_and(|error| error.error_code() == ErrorCode::STREAM_NOT_MATCH)
 }
 
 /// Durable push consumer over one stream. Each delivery carries its ack handle.
@@ -329,18 +320,7 @@ pub(crate) async fn consume(
 
 #[cfg(test)]
 mod tests {
-    use super::{pattern_covers, pattern_matches};
-
-    // 0011-013: a publish is stored by the stream whose subjects capture it.
-    #[test]
-    fn req_0011_013_capture_matches_wildcards() {
-        assert!(pattern_matches("suite.>", "suite.a"));
-        assert!(pattern_matches("suite.>", "suite.a.b"));
-        assert!(pattern_matches("suite.*", "suite.a"));
-        assert!(!pattern_matches("suite.*", "suite.a.b"));
-        assert!(!pattern_matches("suite.>", "suite"));
-        assert!(!pattern_matches("ret.>", "suite.a"));
-    }
+    use super::pattern_covers;
 
     // 0011-040: a consumer filter the stream does not capture is refused.
     #[test]

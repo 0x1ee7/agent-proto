@@ -754,12 +754,28 @@ impl<S: TaskStore> Tasks<S> {
             }
             TaskState::Working => {
                 plan.rec.session_alive = false;
-                plan.fail(Some(state), FailureCode::BackendCrashed, None, now)?;
+                plan.fail(
+                    Some(state),
+                    FailureCode::BackendCrashed,
+                    Self::system_cause(
+                        "BACKEND_LOST",
+                        "backend session was lost before the turn ended",
+                    ),
+                    now,
+                )?;
             }
             TaskState::InputRequired => {
                 plan.rec.session_alive = false;
                 if plan.book.open_for_task(task_id) == 0 {
-                    plan.fail(Some(state), FailureCode::ApprovalTimeout, None, now)?;
+                    plan.fail(
+                        Some(state),
+                        FailureCode::ApprovalTimeout,
+                        Self::system_cause(
+                            "APPROVAL_TIMEOUT",
+                            "approval window expired while the backend was unavailable",
+                        ),
+                        now,
+                    )?;
                 }
             }
             _ => return Ok(Vec::new()),
@@ -1219,6 +1235,12 @@ impl<S: TaskStore> Tasks<S> {
         self.commit(plan)
     }
 
+    /// The `{"kind", "detail"}` cause recorded when the core itself ends a task (RFC-0005 0005-049).
+    /// Only fixed text is passed here, so nothing needs redaction.
+    fn system_cause(kind: &str, text: &str) -> Option<String> {
+        Some(serde_json::json!({ "kind": kind, "detail": text }).to_string())
+    }
+
     /// Fails a WORKING task from the sender side when a peer-call send is refused with
     /// LOOP_DETECTED (RFC-0015 [0015-057]). Only LOOP_DETECTED is accepted. The commit
     /// cancels open children, including unsettled remote ones (0015-068), and emits
@@ -1411,7 +1433,15 @@ impl<S: TaskStore> Tasks<S> {
         let task_id = plan.rec.task_id.clone();
         if !plan.rec.session_alive {
             plan.book_mut().close_task(&task_id);
-            plan.fail(Some(state), FailureCode::BackendCrashed, None, now)?;
+            plan.fail(
+                Some(state),
+                FailureCode::BackendCrashed,
+                Self::system_cause(
+                    "SESSION_DEAD",
+                    "backend session ended before the approval was decided",
+                ),
+                now,
+            )?;
             self.commit(plan)?;
             return Err(TaskError::Approval(Refusal::NotApplicable));
         }
@@ -1603,9 +1633,19 @@ impl<S: TaskStore> Tasks<S> {
         if state == TaskState::Working && plan.rec.cancel_due_ms.is_some_and(|due| due <= now) {
             plan.move_to(Some(state), TaskState::Canceled, None, None, now)?;
         } else if state == TaskState::InputRequired && self.approvals.expired_for_task(task_id) {
-            plan.fail(Some(state), FailureCode::ApprovalTimeout, None, now)?;
+            plan.fail(
+                Some(state),
+                FailureCode::ApprovalTimeout,
+                Self::system_cause("APPROVAL_TIMEOUT", "approval window expired"),
+                now,
+            )?;
         } else if plan.rec.deadline_ms <= now {
-            plan.fail(Some(state), FailureCode::DeadlineExceeded, None, now)?;
+            plan.fail(
+                Some(state),
+                FailureCode::DeadlineExceeded,
+                Self::system_cause("DEADLINE_EXCEEDED", "task deadline reached"),
+                now,
+            )?;
         } else {
             return Err(TaskError::Invalid("kill window has not expired"));
         }

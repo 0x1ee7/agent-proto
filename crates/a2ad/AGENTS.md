@@ -8,7 +8,8 @@ Uses: `bus-nats` (provisioning and JetStream connections), `a2a-audit`, `a2a-sec
 
 - Unsafe code exists only in module `platform` (RFC-0012 [0012-060]): `#![deny(unsafe_code)]` at the crate root, `#[allow(unsafe_code)]` on `pub mod platform`, and a SAFETY comment on every `unsafe` block.
 - Validate the whole configuration before starting anything (0012-004). Unknown keys are refused. `[[agent]] id = "bus"` is refused: the broker is configured in `[bus]` (0010-001).
-- Provider keys are never read or forwarded unless listed in `env_allow` (0012-026, 0012-062). Child environment carries `A2AB_*` identity variables and paths only; seed bytes and grant credentials never appear in argv or environment (0012-027).
+- Provider keys are never read or forwarded unless listed in `env_allow` (0012-026, 0012-062). Child environment carries `A2AB_*` identity variables and paths only, plus the log filter variables `A2AB_LOG` and `RUST_LOG` forwarded from the parent (0013-038). Seed bytes and grant credentials never appear in argv or environment (0012-027).
+- `[log]` (optional): `level` (EnvFilter directive, default `info`) and `format` (`text` or `json`, default `text`), validated at load (0013-038, 0013-039). Child stdout/stderr logs are opened with `platform::open_log_for_append`, which shares delete on Windows so the host can rotate them.
 - One supervisor per state directory (0012-005): `run/supervisor.lock` via `fd-lock`; the pid is in `run/supervisor.pid`.
 - Probes are loopback-only and send no credentials (0012-010). Worker readiness is a local ready file written by the worker host.
 - Stop order: close the child's stdin (lifeline), then the graceful signal, then forced kill only after grace (0012-014, 0012-016, 0012-061). Windows uses CTRL_BREAK for workers and job-object termination for forced stop (0012-017, 0012-064).

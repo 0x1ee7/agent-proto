@@ -784,6 +784,7 @@ pub fn run_worker(
             HostError::Config(format!("`{}` is not a configured worker", agent.as_str()))
         })?;
     let state = config.state_dir();
+    hosts::logging::init(state, agent.as_str(), config.log())?;
     let tenant = config.tenant().clone();
     let agent_dir = state.join("agents").join(&spec.id);
     let run_dir = state.join("run").join(&spec.id);

@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use a2a_worker::backend::{
-    Cost, Gauges, Outcome, PermissionOption, ReasonToken, UsageSample, UsageSource,
+    Cost, Gauges, Outcome, PeerTools, PermissionOption, ReasonToken, UsageSample, UsageSource,
 };
 use serde_json::{Value, json};
 
@@ -41,6 +41,57 @@ pub(crate) fn session_params(cwd: &Path, mcp_servers: &[Value], session_id: Opti
         map.insert("sessionId".to_owned(), Value::String(id.to_owned()));
     }
     params
+}
+
+/// The `mcpServers` array for a session (RFC-0015 [0015-084], [0015-085]). With a peer-tools
+/// binding it is exactly the shim entry; without one it is the operator list (empty by default).
+pub(crate) fn mcp_servers(config_servers: &[Value], peer: Option<&PeerTools>) -> Vec<Value> {
+    match peer {
+        Some(peer) => vec![peer_tools_entry(peer)],
+        None => config_servers.to_vec(),
+    }
+}
+
+/// The stdio entry for the peer-tools shim (RFC-0015 [0015-084]). The grant credential appears
+/// only in `env`; the returned value must not be logged.
+pub(crate) fn peer_tools_entry(peer: &PeerTools) -> Value {
+    json!({
+        "name": "a2abus",
+        "command": peer.shim_path.to_string_lossy(),
+        "args": [
+            "--grant", peer.grant_id,
+            "--endpoint", peer.endpoint.to_string_lossy(),
+            "--slot", peer.slot,
+        ],
+        "env": [{"name": "A2ABUS_MCP_GRANT", "value": peer.grant_credential.expose()}],
+    })
+}
+
+/// Why a peer-tools binding cannot be used with this configuration, or `None` if it can.
+/// Refusals are checked at Start, before any child is spawned (RFC-0015 [0015-084]).
+pub(crate) fn peer_tools_refusal(
+    operator_servers: &[Value],
+    peer: Option<&PeerTools>,
+) -> Option<&'static str> {
+    let peer = peer?;
+    if !operator_servers.is_empty() {
+        return Some("operator mcp_servers must be empty when peer tools are bound");
+    }
+    if !peer.shim_path.is_absolute() || !peer.endpoint.is_absolute() {
+        return Some("peer tools shim and endpoint paths must be absolute");
+    }
+    let base64url = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    if !base64url(&peer.slot) || !base64url(&peer.grant_id) {
+        return Some("peer tools slot and grant id must be base64url");
+    }
+    if !base64url(peer.grant_credential.expose()) {
+        return Some("peer tools grant credential must be base64url");
+    }
+    None
 }
 
 /// Params for `session/prompt` with a single text block.
@@ -534,5 +585,35 @@ mod tests {
         assert_eq!(params["cwd"], "/work");
         assert!(params["mcpServers"].is_array());
         assert_eq!(params["sessionId"], "s1");
+    }
+
+    #[test]
+    fn peer_tools_refusal_names_bad_fields_0015_084() {
+        let peer = |shim: &str, slot: &str, cred: &str| PeerTools {
+            slot: slot.to_owned(),
+            grant_id: "Z3JhbnQ".to_owned(),
+            grant_credential: a2a_worker::backend::SecretText::new(cred),
+            endpoint: std::env::temp_dir().join("ep"),
+            shim_path: std::path::PathBuf::from(shim),
+        };
+        let abs = std::env::temp_dir()
+            .join("shim")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(peer_tools_refusal(&[], None), None);
+        assert_eq!(
+            peer_tools_refusal(&[], Some(&peer(&abs, "c2xvdA", "Y3JlZA"))),
+            None
+        );
+        assert!(peer_tools_refusal(&[], Some(&peer("shim", "c2xvdA", "Y3JlZA"))).is_some());
+        assert!(peer_tools_refusal(&[], Some(&peer(&abs, "bad slot", "Y3JlZA"))).is_some());
+        assert!(peer_tools_refusal(&[], Some(&peer(&abs, "c2xvdA", ""))).is_some());
+    }
+
+    #[test]
+    fn mcp_servers_follow_binding_0015_085() {
+        let operator = vec![json!({"name": "op"})];
+        assert_eq!(mcp_servers(&[], None), Vec::<Value>::new());
+        assert_eq!(mcp_servers(&operator, None), operator);
     }
 }

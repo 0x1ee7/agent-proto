@@ -50,6 +50,8 @@ a2a-client = { version = "0.1.0", path = "../a2a-client" }
 bus-api = { version = "0.1.0", path = "../bus-api" }
 bytes = "1.12.1"
 a2a-core = { version = "0.1.0", path = "../a2a-core" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29.0", features = ["process", "signal", "fs"] }

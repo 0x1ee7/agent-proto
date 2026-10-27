@@ -55,7 +55,7 @@ pub(crate) const OPERATOR: &str = "operator";
 pub(crate) const OBSERVER: &str = "observer";
 /// Configured working directory approvals report (0006-006); never the process cwd.
 pub(crate) const WORK_DIR: &str = "agent-work";
-const EVENT_STREAM: &str = "EV";
+const EVENT_STREAM: &str = "A2AB_EV_acme";
 const TTL_MS: u64 = 60_000;
 const MAX_POLLS: usize = 500_000;
 /// Default approval expiry (RFC-0006, `DEFAULT_EXPIRY_MS`).
@@ -334,7 +334,7 @@ fn grants() -> Vec<Grant> {
         tenant: tenant(),
         publish: vec![rpc.clone()],
         serve: Vec::new(),
-        streams: Vec::new(),
+        streams: vec![stream()],
     };
     vec![
         Grant {
@@ -445,6 +445,18 @@ pub(crate) async fn call(
     body: RequestBody,
     extensions: Vec<String>,
 ) -> Reply {
+    call_ttl(bus, sender, op, body, extensions, TTL_MS).await
+}
+
+/// As [`call`], with the request's time-to-live set to `ttl_ms`.
+pub(crate) async fn call_ttl(
+    bus: &MemBus,
+    sender: &str,
+    op: Op,
+    body: RequestBody,
+    extensions: Vec<String>,
+    ttl_ms: u64,
+) -> Reply {
     let parts = RequestParts {
         tenant: tenant(),
         agent: agent(WORKER),
@@ -452,7 +464,7 @@ pub(crate) async fn call(
         sender: agent(sender),
         origin: None,
         ts_ms: now_ms(bus),
-        ttl_ms: TTL_MS,
+        ttl_ms,
         traceparent: None,
         tracestate: None,
         extensions,
@@ -519,6 +531,10 @@ pub(crate) async fn send_text(
     let body = RequestBody::SendMessage(pb::SendMessageRequest {
         tenant: TENANT.to_owned(),
         message: Some(message(context_id, task_id, vec![text_part(text)])),
+        configuration: Some(pb::SendMessageConfiguration {
+            return_immediately: true,
+            ..Default::default()
+        }),
         ..Default::default()
     });
     let reply = call(bus, REQUESTER, Op::Send, body, Vec::new()).await;
@@ -569,6 +585,21 @@ pub(crate) fn failure_code(task: &pb::Task) -> Option<String> {
     };
     match failure.fields.get("code")?.kind.as_ref()? {
         Kind::StringValue(code) => Some(code.clone()),
+        _ => None,
+    }
+}
+
+/// Detail text the Worker attached to a FAILED task (`a2abus.failure.detail.message`).
+pub(crate) fn failure_detail(task: &pb::Task) -> Option<String> {
+    let meta = task.status.as_ref()?.message.as_ref()?.metadata.as_ref()?;
+    let Kind::StructValue(failure) = meta.fields.get(FAILURE_KEY)?.kind.as_ref()? else {
+        return None;
+    };
+    let Kind::StructValue(detail) = failure.fields.get("detail")?.kind.as_ref()? else {
+        return None;
+    };
+    match detail.fields.get("message")?.kind.as_ref()? {
+        Kind::StringValue(text) => Some(text.clone()),
         _ => None,
     }
 }

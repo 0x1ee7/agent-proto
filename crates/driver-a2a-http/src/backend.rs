@@ -127,6 +127,7 @@ impl Backend for HttpBackend {
         Health {
             live: self.shared.live.load(Ordering::SeqCst),
             restarts: 0,
+            reason: None,
         }
     }
 

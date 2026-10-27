@@ -38,6 +38,7 @@ fn start_turn(text: &str) -> StartTurn {
         context_id: "live-ctx".to_owned(),
         input: vec![InputPart::Text(text.to_owned())],
         origin: "live-operator".to_owned(),
+        peer_tools: None,
         deadline_ms: u64::MAX,
         session: None,
     }
@@ -84,7 +85,8 @@ fn reply_text(events: &[BackendEvent]) -> String {
 
 /// omp 18.12.6 over `--mode acp`, isolated with `PI_CODING_AGENT_DIR=.spikes/omp-acp/agent`
 /// and the stub on `127.0.0.1:18765` (see `spikes/omp-acp/README.md`).
-/// Requires `DRIVER_ACP_OMP_BIN` = absolute path of the omp executable.
+/// Requires `DRIVER_ACP_OMP_BIN` = absolute path of the omp executable. Optional:
+/// `DRIVER_ACP_OMP_WORKSPACE` and `DRIVER_ACP_OMP_CONFIG_DIR` override the spike paths.
 #[test]
 #[ignore = "live: omp --mode acp; stub on 127.0.0.1:18765; needs DRIVER_ACP_OMP_BIN"]
 fn live_omp_plain_turn_completes_0009_025() {
@@ -93,9 +95,10 @@ fn live_omp_plain_turn_completes_0009_025() {
             .expect("set DRIVER_ACP_OMP_BIN to the absolute path of omp"),
     );
     let root = spike_root().join("omp-acp");
-    let workspace = root.join("live-ws");
+    let workspace = env_or("DRIVER_ACP_OMP_WORKSPACE", root.join("live-ws"));
+    let config_dir = env_or("DRIVER_ACP_OMP_CONFIG_DIR", root.join("agent"));
     std::fs::create_dir_all(&workspace).expect("live workspace");
-    let config = AcpDriverConfig::new(Profile::Omp, program, workspace, root.join("agent"));
+    let config = AcpDriverConfig::new(Profile::Omp, program, workspace, config_dir);
     let events = run_turn(config, "hello");
     check_turn_stream(&events, Protocol::Acp).expect("turn stream obeys the seam contract");
     assert_eq!(terminal_outcome(&events), Outcome::Completed);

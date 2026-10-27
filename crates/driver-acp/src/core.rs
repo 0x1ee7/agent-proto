@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use a2a_worker::backend::{
-    BackendError, BackendEvent, BackendSink, FaultKind, Health, InputPart, Outcome,
+    BackendError, BackendEvent, BackendSink, FaultKind, Health, InputPart, Outcome, PeerTools,
     PermissionAnswer, PermissionOption, PermissionRequest, ReasonToken, RequestId, SessionHandle,
     StartTurn, StatusPayload, TurnRef, UsageSample, UsageSource,
 };
@@ -26,6 +26,8 @@ use crate::redact::{detail, redact};
 
 /// Window over which unexpected exits are counted (0009-061).
 const EXIT_WINDOW: Duration = Duration::from_secs(600);
+/// How long an unexpected exit waits for the reaped status before the tree is killed (0009-023).
+const EXIT_OBSERVE: Duration = Duration::from_millis(500);
 /// Unexpected exits inside [`EXIT_WINDOW`] that mark the driver unhealthy (0009-061).
 const UNHEALTHY_EXITS: usize = 5;
 /// Ceiling for restart backoff (0009-061).
@@ -107,6 +109,7 @@ struct Turn {
     override_outcome: Option<Outcome>,
     open_tools: HashMap<String, OpenTool>,
     grace_deadline: Option<Instant>,
+    peer_tools: Option<PeerTools>,
 }
 
 /// A JSON-RPC request we sent, awaiting its response.
@@ -115,11 +118,13 @@ enum Rpc {
     NewSession {
         turn_gen: u64,
         context_id: String,
+        peer_tools: Option<PeerTools>,
     },
     Restore {
         turn_gen: u64,
         context_id: String,
         session_id: String,
+        peer_tools: Option<PeerTools>,
     },
     Prompt {
         turn_gen: u64,
@@ -160,11 +165,19 @@ pub(crate) struct Core {
     failed: bool,
     unhealthy: bool,
     closed: bool,
+    /// Why the agent is not live, recorded at each flip (surfaced as `Health.reason`).
+    down_reason: Option<String>,
+    /// Last health flags logged, so only changes reach the log.
+    live_logged: bool,
+    /// Kind and method of the last inbound frame, for health logs (no params).
+    last_seen: String,
     spawned_once: bool,
     restarts: u32,
     exits: VecDeque<Instant>,
     respawn_at: Option<Instant>,
     sessions: HashMap<String, String>,
+    /// Peer-tools binding each session was created with (RFC-0015 [0015-084]), keyed by context.
+    bindings: HashMap<String, Option<PeerTools>>,
     turn: Option<Turn>,
     turn_gen: u64,
     rpc: HashMap<i64, Rpc>,
@@ -196,11 +209,15 @@ impl Core {
             failed: false,
             unhealthy: false,
             closed: false,
+            down_reason: None,
+            live_logged: false,
+            last_seen: "none".to_owned(),
             spawned_once: false,
             restarts: 0,
             exits: VecDeque::new(),
             respawn_at: None,
             sessions: HashMap::new(),
+            bindings: HashMap::new(),
             turn: None,
             turn_gen: 0,
             rpc: HashMap::new(),
@@ -252,6 +269,7 @@ impl Core {
                 }
             }
             self.tick();
+            self.observe_health();
         }
     }
 
@@ -284,13 +302,24 @@ impl Core {
     }
 
     fn health(&self) -> Health {
+        let live = self.conn.is_some()
+            && self.init == InitState::Ready
+            && !self.failed
+            && !self.unhealthy
+            && !self.closed;
+        let reason = (!live).then(|| {
+            self.down_reason.clone().unwrap_or_else(|| {
+                if self.conn.is_none() {
+                    "agent process is not running".to_owned()
+                } else {
+                    "agent is starting".to_owned()
+                }
+            })
+        });
         Health {
-            live: self.conn.is_some()
-                && self.init == InitState::Ready
-                && !self.failed
-                && !self.unhealthy
-                && !self.closed,
+            live,
             restarts: self.restarts,
+            reason,
         }
     }
 
@@ -319,6 +348,29 @@ impl Core {
         if let Some(turn) = self.turn.as_mut() {
             turn.phase = phase;
         }
+    }
+
+    /// Logs each change of driver liveness with the flags behind it (target `driver_acp`).
+    fn observe_health(&mut self) {
+        let health = self.health();
+        if health.live == self.live_logged {
+            return;
+        }
+        self.live_logged = health.live;
+        let reason = health.reason.as_deref().map(redact).unwrap_or_default();
+        tracing::info!(
+            target: "driver_acp",
+            live = health.live,
+            conn = self.conn.is_some(),
+            init = ?self.init,
+            failed = self.failed,
+            unhealthy = self.unhealthy,
+            closed = self.closed,
+            restarts = self.restarts,
+            reason = %reason,
+            last_seen = %self.last_seen,
+            "agent health changed"
+        );
     }
 
     fn touch(&mut self) {
@@ -353,6 +405,21 @@ impl Core {
             });
             return Err(BackendError::Unsupported(reason));
         }
+        let bound = self.bindings.get(&cmd.context_id);
+        let peer_refusal =
+            acp::peer_tools_refusal(&self.config.mcp_servers, cmd.peer_tools.as_ref()).or_else(
+                || {
+                    (bound.is_some_and(|b| *b != cmd.peer_tools))
+                        .then_some("peer tools binding changed for an existing session")
+                },
+            );
+        if let Some(reason) = peer_refusal {
+            self.emit(BackendEvent::Fault {
+                kind: FaultKind::ConfigRefused,
+                detail: reason.to_owned(),
+            });
+            return Err(BackendError::Unsupported(reason));
+        }
         let text = cmd
             .input
             .iter()
@@ -378,6 +445,7 @@ impl Core {
             override_outcome: None,
             open_tools: HashMap::new(),
             grace_deadline: None,
+            peer_tools: cmd.peer_tools,
         });
         self.advance();
         Ok(())
@@ -393,6 +461,7 @@ impl Core {
                 return;
             }
             if let Err(error) = self.spawn_process() {
+                self.down_reason = Some(format!("agent could not be spawned: {error}"));
                 self.note_exit();
                 let outcome = self.take_outcome(Outcome::Failed {
                     reason: ReasonToken::BackendUnavailable,
@@ -416,6 +485,7 @@ impl Core {
         let spec = self.config.launch_spec();
         let spawned = self.spawner.spawn(&spec).map_err(|e| e.to_string())?;
         self.generation += 1;
+        self.down_reason = None;
         let generation = self.generation;
         let stdout = spawned.stdout;
         let tx = self.tx.clone();
@@ -467,16 +537,15 @@ impl Core {
                 ("", false)
             };
             if reachable {
-                let params = acp::session_params(
-                    &self.config.workspace,
-                    &self.config.mcp_servers,
-                    Some(&sid),
-                );
+                let peer_tools = self.turn.as_ref().and_then(|t| t.peer_tools.clone());
+                let servers = acp::mcp_servers(&self.config.mcp_servers, peer_tools.as_ref());
+                let params = acp::session_params(&self.config.workspace, &servers, Some(&sid));
                 self.send_rpc(
                     Rpc::Restore {
                         turn_gen: generation,
                         context_id,
                         session_id: sid,
+                        peer_tools,
                     },
                     method,
                     params,
@@ -494,11 +563,14 @@ impl Core {
         };
         let generation = turn.generation;
         let context_id = turn.context_id.clone();
-        let params = acp::session_params(&self.config.workspace, &self.config.mcp_servers, None);
+        let peer_tools = turn.peer_tools.clone();
+        let servers = acp::mcp_servers(&self.config.mcp_servers, peer_tools.as_ref());
+        let params = acp::session_params(&self.config.workspace, &servers, None);
         self.send_rpc(
             Rpc::NewSession {
                 turn_gen: generation,
                 context_id,
+                peer_tools,
             },
             "session/new",
             params,
@@ -585,6 +657,20 @@ impl Core {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let id = value.get("id").cloned();
+        let kind = match (method.is_some(), id.is_some()) {
+            (true, true) => "request",
+            (true, false) => "notification",
+            _ => "response",
+        };
+        self.last_seen = format!(
+            "{kind} {}",
+            method
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .take(64)
+                .collect::<String>()
+        );
         match (method, id) {
             (Some(method), Some(id)) => {
                 let params = value.get("params").cloned().unwrap_or(Value::Null);
@@ -617,12 +703,14 @@ impl Core {
             Rpc::NewSession {
                 turn_gen,
                 context_id,
-            } => self.on_new_session(turn_gen, &context_id, outcome),
+                peer_tools,
+            } => self.on_new_session(turn_gen, &context_id, peer_tools, outcome),
             Rpc::Restore {
                 turn_gen,
                 context_id,
                 session_id,
-            } => self.on_restore(turn_gen, &context_id, &session_id, outcome),
+                peer_tools,
+            } => self.on_restore(turn_gen, &context_id, &session_id, peer_tools, outcome),
             Rpc::Prompt { turn_gen } => self.on_prompt(turn_gen, outcome),
         }
     }
@@ -645,7 +733,9 @@ impl Core {
                     "agent answered protocol version {version:?}; expected 1"
                 )),
             });
-            self.fail_startup("unsupported ACP protocol version".to_owned());
+            self.fail_startup(format!(
+                "agent answered protocol version {version:?}; expected 1"
+            ));
             return;
         }
         self.caps = acp::server_caps(&init);
@@ -657,6 +747,7 @@ impl Core {
 
     /// Fails the open turn with BACKEND_UNAVAILABLE and closes the process (0009-072).
     fn fail_startup(&mut self, text: String) {
+        self.down_reason = Some(text.clone());
         self.close_conn(self.config.shutdown_grace);
         self.note_exit();
         let outcome = self.take_outcome(Outcome::Failed {
@@ -667,7 +758,13 @@ impl Core {
         self.finish(outcome);
     }
 
-    fn on_new_session(&mut self, turn_gen: u64, context_id: &str, outcome: Result<Value, Value>) {
+    fn on_new_session(
+        &mut self,
+        turn_gen: u64,
+        context_id: &str,
+        peer_tools: Option<PeerTools>,
+        outcome: Result<Value, Value>,
+    ) {
         match outcome {
             Ok(result) => {
                 let Some(sid) = result
@@ -679,6 +776,8 @@ impl Core {
                     return;
                 };
                 self.sessions.insert(context_id.to_owned(), sid.clone());
+                self.bindings
+                    .insert(context_id.to_owned(), peer_tools.clone());
                 if self.is_current_awaiting_session(turn_gen) {
                     self.bind_session(context_id, &sid);
                     self.send_prompt();
@@ -696,12 +795,14 @@ impl Core {
         turn_gen: u64,
         context_id: &str,
         session_id: &str,
+        peer_tools: Option<PeerTools>,
         outcome: Result<Value, Value>,
     ) {
         match outcome {
             Ok(_) => {
                 self.sessions
                     .insert(context_id.to_owned(), session_id.to_owned());
+                self.bindings.insert(context_id.to_owned(), peer_tools);
                 if self.is_current_awaiting_session(turn_gen) {
                     self.bind_session(context_id, session_id);
                     self.send_prompt();
@@ -913,6 +1014,7 @@ impl Core {
         let Some(pending) = self.perms.remove(request_id) else {
             return;
         };
+        self.touch();
         let result = match (&pending.kind, answer) {
             (PendingKind::Permission { offered }, PermissionAnswer::Selected { option_id })
                 if offered.contains(&option_id) =>
@@ -1125,7 +1227,9 @@ impl Core {
         };
         let phase = turn.phase;
         let grace_expired = turn.grace_deadline.is_some_and(|g| g <= now);
-        let idle_expired = now >= turn.last_activity + self.config.turn_idle_timeout;
+        // While an approval is pending the agent waits on the operator; only its deadline runs (0009-024 reading).
+        let idle_expired =
+            self.perms.is_empty() && now >= turn.last_activity + self.config.turn_idle_timeout;
         if phase == Phase::Canceling {
             if grace_expired {
                 self.grace_expired();
@@ -1146,7 +1250,9 @@ impl Core {
                     consider(grace);
                 }
             } else {
-                consider(turn.last_activity + self.config.turn_idle_timeout);
+                if self.perms.is_empty() {
+                    consider(turn.last_activity + self.config.turn_idle_timeout);
+                }
             }
             if turn.phase == Phase::AwaitSpawn && self.conn.is_none() {
                 if let Some(at) = self.respawn_at {
@@ -1179,6 +1285,7 @@ impl Core {
 
     /// Cancel grace expired: kill the process tree and end the turn (0009-036).
     fn grace_expired(&mut self) {
+        self.down_reason = Some("cancel grace expired; agent process killed".to_owned());
         self.close_conn(Duration::ZERO);
         self.note_exit();
         let outcome = self.take_outcome(Outcome::Canceled);
@@ -1198,12 +1305,10 @@ impl Core {
             })
             .unwrap_or_default();
         let phase = self.phase();
-        self.close_conn(Duration::ZERO);
-        let text = if tail.trim().is_empty() {
-            reason.to_owned()
-        } else {
-            format!("{reason}: {}", tail.trim())
-        };
+        let status = self.close_conn(EXIT_OBSERVE);
+        tracing::warn!(target: "driver_acp::child", cause = reason, status = ?status, "agent process ended unexpectedly");
+        let text = stream_end_text(reason, status.as_deref(), &tail);
+        self.down_reason = Some(text.clone());
         self.emit(BackendEvent::Fault {
             kind: FaultKind::StreamEnded,
             detail: detail(&text),
@@ -1229,10 +1334,14 @@ impl Core {
     }
 
     /// Closes stdin, waits up to `grace`, then kills the tree (0009-059, 0009-060).
-    fn close_conn(&mut self, grace: Duration) {
+    /// Returns the exit status only if the process exited on its own within `grace`.
+    fn close_conn(&mut self, grace: Duration) -> Option<String> {
+        let mut status = None;
         if let Some(mut conn) = self.conn.take() {
             conn.stdin = None;
-            if !conn.terminator.wait_exit(grace) {
+            if conn.terminator.wait_exit(grace) {
+                status = conn.terminator.exit_description();
+            } else {
                 conn.terminator.kill_tree();
             }
         }
@@ -1242,8 +1351,10 @@ impl Core {
             resume: false,
         };
         self.sessions.clear();
+        self.bindings.clear();
         self.rpc.clear();
         self.perms.clear();
+        status
     }
 
     /// Records an unexpected exit and schedules the next respawn (0009-061).
@@ -1259,6 +1370,7 @@ impl Core {
         }
         if self.exits.len() >= UNHEALTHY_EXITS {
             self.unhealthy = true;
+            self.down_reason = Some("agent exited too often; driver unhealthy".to_owned());
             self.respawn_at = None;
         } else {
             self.respawn_at = Some(now + restart_delay(self.exits.len()));
@@ -1311,9 +1423,24 @@ impl Core {
     fn shutdown(&mut self, grace: Duration) {
         let outcome = self.take_outcome(Outcome::Canceled);
         self.finish(outcome);
+        self.down_reason = Some("driver shut down".to_owned());
         self.closed = true;
         self.close_conn(grace);
     }
+}
+
+/// Text of a `StreamEnded` fault: reason, then the reaped exit status, then the stderr tail (0009-023).
+fn stream_end_text(reason: &str, status: Option<&str>, tail: &str) -> String {
+    let mut text = reason.to_owned();
+    if let Some(status) = status {
+        text.push_str(&format!(" ({status})"));
+    }
+    let tail = tail.trim();
+    if !tail.is_empty() {
+        text.push_str(": ");
+        text.push_str(tail);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1327,5 +1454,17 @@ mod tests {
         assert_eq!(restart_delay(3), Duration::from_secs(4));
         assert_eq!(restart_delay(4), Duration::from_secs(8));
         assert_eq!(restart_delay(20), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn stream_end_detail_carries_status_and_stderr_0009_023() {
+        assert_eq!(
+            stream_end_text("agent stdout closed", Some("exit status: 3"), "boom\n"),
+            "agent stdout closed (exit status: 3): boom"
+        );
+        assert_eq!(
+            stream_end_text("agent stdout closed", None, "  "),
+            "agent stdout closed"
+        );
     }
 }

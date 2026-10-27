@@ -78,8 +78,7 @@ pub fn permissions(
                 return Err(reject());
             }
             let me = agent.as_str();
-            // Account info (`$JS.API.INFO`) is queried at connect for the M1 profile check.
-            let mut read = vec!["$JS.API.INFO".to_owned()];
+            let mut read = Vec::new();
             for stream in [
                 ev.clone(),
                 kv_stream(&cards),
@@ -177,8 +176,12 @@ pub fn permissions(
             }
             let archiver = format!("{audit}.{ARCHIVER_CONSUMER}");
             admin.extend([
+                // async-nats names the filter subject in the create subject:
+                // `CONSUMER.CREATE.<stream>.<durable>.<filter>` (RFC-0010 0010-054).
                 format!("$JS.API.CONSUMER.CREATE.{archiver}"),
+                format!("$JS.API.CONSUMER.CREATE.{archiver}.>"),
                 format!("$JS.API.CONSUMER.DURABLE.CREATE.{archiver}"),
+                format!("$JS.API.CONSUMER.DURABLE.CREATE.{archiver}.>"),
                 format!("$JS.API.CONSUMER.INFO.{archiver}"),
                 format!("$JS.API.CONSUMER.DELETE.{archiver}"),
                 format!("$JS.API.CONSUMER.MSG.NEXT.{archiver}"),
@@ -216,9 +219,12 @@ fn read_bundle(stream: &str) -> Vec<String> {
     ]
 }
 
+/// Account info (`$JS.API.INFO`) is queried by every binding at connect for the M1
+/// profile check (`connection::connect`), so every role may publish it.
 /// Adds the read subjects to a publish list; read subjects are published to
 /// the JetStream API and are therefore part of the publish allow-list.
 fn with(mut publish: Vec<String>, read: Vec<String>) -> Vec<String> {
+    publish.push("$JS.API.INFO".to_owned());
     publish.extend(read);
     publish
 }
@@ -364,6 +370,55 @@ mod tests {
                 .any(|s| s == "$JS.API.STREAM.DELETE.A2AB_EV_local")
         );
         assert!(!p.publish.iter().any(|s| s.starts_with("$KV.")));
+    }
+
+    // Every binding queries account info at connect (`connection::connect`), so every
+    // role, including the supervisor, may publish `$JS.API.INFO`.
+    #[test]
+    fn req_0010_064_every_role_may_query_account_info() {
+        let t = tenant();
+        for (role, identity) in [
+            (Role::Agent, "omp-1"),
+            (Role::Gateway, "gateway"),
+            (Role::Operator, "tui"),
+            (Role::Supervisor, "supervisor"),
+        ] {
+            let p = permissions(role, identity, &t).expect("role");
+            assert!(
+                has(&p.publish, "$JS.API.INFO"),
+                "{role:?} lacks $JS.API.INFO"
+            );
+        }
+    }
+
+    // NATS wildcard matching of a publish subject against an allow-list pattern. A `>`
+    // in the pattern matches one or more remaining tokens, including a literal `>`.
+    fn nats_matches(pattern: &str, subject: &str) -> bool {
+        let mut want = pattern.split('.');
+        let mut got = subject.split('.');
+        loop {
+            match (want.next(), got.next()) {
+                (Some(">"), Some(_)) => return true,
+                (Some("*"), Some(_)) => {}
+                (Some(w), Some(g)) if w == g => {}
+                (None, None) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    // 0010-054: async-nats creates the archiver with its filter in the create subject
+    // (`CONSUMER.CREATE.<stream>.<durable>.<filter>`), so the supervisor may publish it.
+    #[test]
+    fn req_0010_054_archiver_create_with_filter_is_allowed() {
+        let p = permissions(Role::Supervisor, "supervisor", &tenant()).expect("supervisor");
+        let create = "$JS.API.CONSUMER.CREATE.A2A_AUDIT_local.audit-archiver.a2a.v1.local.audit.>";
+        assert!(p.publish.iter().any(|s| nats_matches(s, create)));
+        let durable =
+            "$JS.API.CONSUMER.DURABLE.CREATE.A2A_AUDIT_local.audit-archiver.a2a.v1.local.audit.>";
+        assert!(p.publish.iter().any(|s| nats_matches(s, durable)));
+        let other = "$JS.API.CONSUMER.CREATE.A2A_AUDIT_local.other-consumer.a2a.v1.local.audit.>";
+        assert!(!p.publish.iter().any(|s| nats_matches(s, other)));
     }
 
     // 0010-011: identities are fixed per role; an agent may not take a reserved name.

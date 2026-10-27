@@ -131,6 +131,45 @@ pub(crate) fn mesh(spec: Spec) -> Mesh {
     }
 }
 
+/// Kills the parent worker without shutdown and reopens it on the same task store
+/// (0015-063): the reopened worker reconciles the open turns and children it finds.
+pub(crate) fn restart_parent(mesh: Mesh) -> Mesh {
+    let Mesh {
+        bus,
+        parent,
+        parent_store,
+        child,
+        parent_mock,
+        child_mock,
+    } = mesh;
+    drop(parent);
+    // The dead instance's presence lease lapses before the agent id is reclaimed.
+    bus.control().advance(Duration::from_secs(31)).unwrap();
+    let (backend, _mock) = MockBackend::new(capabilities());
+    let mut reopened = node(
+        &bus,
+        PARENT,
+        backend,
+        Allowance::default(),
+        parent_store.clone(),
+    );
+    reopened
+        .attach_delegation(DelegationConfig::new(
+            endpoint_name(PARENT),
+            SHIM,
+            vec![agent(CHILD)],
+        ))
+        .unwrap();
+    Mesh {
+        bus,
+        parent: reopened,
+        parent_store,
+        child,
+        parent_mock,
+        child_mock,
+    }
+}
+
 fn capabilities() -> Capabilities {
     Capabilities {
         protocol: Protocol::Acp,
@@ -482,6 +521,10 @@ pub(crate) async fn submit_to(bus: &MemBus, target: &str, text: &str) -> pb::Tas
                 content: Some(pb::part::Content::Text(text.to_owned())),
                 ..Default::default()
             }],
+            ..Default::default()
+        }),
+        configuration: Some(pb::SendMessageConfiguration {
+            return_immediately: true,
             ..Default::default()
         }),
         ..Default::default()

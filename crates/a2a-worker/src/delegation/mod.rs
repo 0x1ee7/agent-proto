@@ -41,6 +41,21 @@ pub(crate) const IPC_POLL_MS: u64 = 100;
 /// Interval between `get` polls of a non-terminal remote child.
 pub(crate) const CHILD_POLL_MS: u64 = 250;
 
+/// Idempotency ledger keyed by (parent task id, idempotency key) (0015-048).
+pub(crate) type Ledger = BTreeMap<(String, String), String>;
+
+/// Reads a string field of a journal record; a missing field means the journal is corrupt.
+fn journal_str<'a>(record: &'a serde_json::Value, name: &str) -> Result<&'a str, WorkerError> {
+    record
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(corrupt_journal)
+}
+
+fn corrupt_journal() -> WorkerError {
+    WorkerError::Config("delegation journal is corrupt")
+}
+
 const DEFAULT_MAX_INFLIGHT: u32 = 4;
 const DEFAULT_MAX_SENDS_PER_MIN: u32 = 30;
 const DEFAULT_MAX_CALLS_PER_MIN: u32 = 120;
@@ -228,8 +243,6 @@ pub(crate) struct Binding {
     slot: String,
     grant_id: String,
     credential: String,
-    /// Idempotency key to the child's local task id (0015-048).
-    keys: BTreeMap<String, String>,
     calls: Window,
     sends: Window,
 }
@@ -268,6 +281,8 @@ pub(crate) struct Delegation<B: Bus> {
     pub(crate) client: Client<Arc<B>>,
     /// Children keyed by local child task id.
     children: BTreeMap<String, Child>,
+    /// Idempotency ledger: (parent task, idempotency key) to the child's local id (0015-048).
+    ledger: Ledger,
 }
 
 /// Peer-call state kept on the worker (RFC-0015).
@@ -347,16 +362,83 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             self.config.agent.clone(),
         )
         .map_err(|_| WorkerError::Config("delegation client unavailable"))?;
+        let (ledger, children) = self.replay_journal()?;
+        // Cancels queued by recovery (0015-063) survive the attach and flush on the next pump.
+        let cancels = std::mem::take(&mut self.peers.cancels);
         self.peers = peers;
+        self.peers.cancels = cancels;
         self.delegation = Some(Delegation {
             config,
             own: self.config.agent.clone(),
             _server: server,
             requests,
             client,
-            children: BTreeMap::new(),
+            ledger,
+            children,
         });
         Ok(())
+    }
+
+    /// Rebuilds the idempotency ledger and the child table from the delegation journal
+    /// (0015-062, 0015-063). Only children whose send was journaled as `sent` are restored;
+    /// a `prepared` record without `sent` never reached the peer, so it has no child to
+    /// resume. Restored children are polled and canceled through the normal delegation path.
+    fn replay_journal(&self) -> Result<(Ledger, BTreeMap<String, Child>), WorkerError> {
+        let now = self.clock.now_ms().ok_or(WorkerError::Clock)?;
+        let records: Vec<serde_json::Value> = self
+            .tasks
+            .extensions(JOURNAL_OWNER)
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut prepared: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let mut ledger = Ledger::new();
+        let mut children = BTreeMap::new();
+        for record in records {
+            let child = journal_str(&record, "child")?.to_owned();
+            match journal_str(&record, "phase")? {
+                "prepared" => {
+                    prepared.insert(child, record);
+                }
+                "sent" => {
+                    let entry = prepared.get(&child).ok_or_else(corrupt_journal)?;
+                    let remote = TaskId::parse(journal_str(&record, "remote")?)
+                        .map_err(|_| corrupt_journal())?;
+                    let parent = journal_str(entry, "parent")?.to_owned();
+                    let key = journal_str(entry, "key")?.to_owned();
+                    let target = AgentId::parse(journal_str(entry, "target")?)
+                        .map_err(|_| corrupt_journal())?;
+                    let chain_length = entry
+                        .get("hop")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|hop| u32::try_from(hop).ok())
+                        .ok_or_else(corrupt_journal)?;
+                    let deadline = entry
+                        .get("deadline")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(corrupt_journal)?;
+                    ledger.insert((parent.clone(), key), child.clone());
+                    children.insert(
+                        child,
+                        Child {
+                            parent,
+                            target,
+                            remote,
+                            context_id: journal_str(entry, "context")?.to_owned(),
+                            chain_length,
+                            state: TaskState::Submitted,
+                            cancel_requested: false,
+                            settled: None,
+                            waiters: Vec::new(),
+                            next_poll: now.saturating_add(CHILD_POLL_MS),
+                            deadline,
+                        },
+                    );
+                }
+                _ => return Err(corrupt_journal()),
+            }
+        }
+        Ok((ledger, children))
     }
 
     /// Stops delegation (RFC-0015 0015-074): revokes every grant, answers pending
@@ -412,7 +494,6 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                     slot,
                     grant_id,
                     credential,
-                    keys: BTreeMap::new(),
                     calls: Window::default(),
                     sends: Window::default(),
                 },

@@ -64,6 +64,7 @@ pub fn run_gateway(config: &Config, control: &HostControl) -> Result<(), HostErr
         .iter()
         .find(|agent| agent.kind == Kind::Gateway)
         .ok_or_else(|| HostError::Config("no gateway agent is configured".to_owned()))?;
+    hosts::logging::init(config.state_dir(), &spec.id, config.log())?;
     let path = spec.gateway_config.as_ref().ok_or_else(|| {
         HostError::Config("gateway_config is required for the in-process gateway".to_owned())
     })?;

@@ -207,3 +207,101 @@ fn req_0005_054_contexts_run_concurrently_and_each_context_stays_fifo() {
         );
     });
 }
+
+/// 0005-031: the backend's fault detail survives on the FAILED task's failure metadata, so the
+/// caller can see why the backend stopped (for example a refused connection).
+#[test]
+fn req_0005_031_fault_detail_is_kept_on_failed_task() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold]);
+        let task = submit(bus, "faulted").await;
+        wait_for_state(bus, &task.id, pb::TaskState::Working).await;
+        mock.fault(
+            crate::backend::FaultKind::StreamEnded,
+            "Couldn't connect to 127.0.0.1:18765 (connection refused)",
+        );
+        let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        assert!(
+            format!("{failed:?}").contains("connection refused"),
+            "failure metadata lost the backend detail: {failed:?}"
+        );
+    });
+}
+
+/// 0005-031: a terminal failure's own detail is kept on the FAILED task, not only a stream fault's.
+#[test]
+fn req_0005_031_terminal_failure_detail_is_kept() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Terminal(crate::backend::Outcome::Failed {
+            reason: crate::backend::ReasonToken::BackendCrashed,
+            health_class: None,
+            detail: "exit status 1: Couldn't connect to 127.0.0.1:18765".to_owned(),
+        })]);
+        let task = submit(bus, "terminal detail").await;
+        let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        assert!(
+            format!("{failed:?}").contains("Couldn't connect"),
+            "terminal failure lost its detail: {failed:?}"
+        );
+    });
+}
+
+/// 0005-049, 0005-053: a backend that stops being live fails its open turn with a detail that
+/// carries the driver's reason.
+#[test]
+fn req_0005_053_health_not_live_fails_turn_with_detail() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold]);
+        let task = submit(bus, "health").await;
+        wait_for_state(bus, &task.id, pb::TaskState::Working).await;
+        mock.go_down("connection to agent lost");
+        advance(bus, 1);
+        let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        assert_eq!(failure_code(&failed).as_deref(), Some("BACKEND_CRASHED"));
+        let detail = failure_detail(&failed).expect("health failure carries a detail");
+        assert!(
+            detail.contains("backend not live: connection to agent lost"),
+            "health failure detail: {detail}"
+        );
+    });
+}
+
+/// 0005-049: a backend that exits mid-turn fails the task with its own non-empty detail.
+#[test]
+fn req_0005_049_backend_exit_fails_turn_with_detail() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold]);
+        let task = submit(bus, "exit").await;
+        wait_for_state(bus, &task.id, pb::TaskState::Working).await;
+        mock.crash("agent exited with status 1");
+        let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        let detail = failure_detail(&failed).expect("backend exit carries a detail");
+        assert!(detail.contains("agent exited with status 1"), "{detail}");
+    });
+}
+
+/// 0005-041, 0005-049: a deadline failure carries a non-null detail.
+#[test]
+fn req_0005_049_deadline_failure_carries_detail() {
+    const DEADLINE_MS: u64 = 10_000;
+    let mut rig = rig_with(ApprovalMode::AskAll, DEADLINE_MS);
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold]);
+        let task = submit(bus, "slow").await;
+        wait_for_state(bus, &task.id, pb::TaskState::Working).await;
+        advance(bus, DEADLINE_MS);
+        let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        assert_eq!(failure_code(&failed).as_deref(), Some("DEADLINE_EXCEEDED"));
+        let detail = failure_detail(&failed).expect("deadline failure carries a detail");
+        assert!(detail.contains("task deadline reached"), "{detail}");
+    });
+}

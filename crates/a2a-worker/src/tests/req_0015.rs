@@ -316,7 +316,11 @@ fn req_0015_055_child_usage_is_charged_from_terminal_metadata() {
         expect_result(finished(&mut first).await);
         // The child's share is the remaining 50 tokens; spending all of it exhausts the child.
         let mut second = ipc_call(&tools, send_frame(CHILD, "y", "k2", Wait::Blocking));
-        assert_eq!(refusal(finished(&mut second).await), reason::CHILD_FAILED);
+        // 0015-070: the call is refused with the child's own code, BUDGET_EXHAUSTED.
+        assert_eq!(
+            refusal(finished(&mut second).await),
+            reason::BUDGET_EXHAUSTED
+        );
         // Spending the parent's allowance ends the parent, so its grant and slot are gone (0015-073).
         let mut third = ipc_call(&tools, send_frame(CHILD, "z", "k3", Wait::Blocking));
         let err = refusal(finished(&mut third).await);
@@ -681,7 +685,10 @@ fn req_0015_063_journal_holds_one_entry_per_child_with_allowance() {
         .unwrap()
         .iter()
         .map(|raw| String::from_utf8_lossy(raw).into_owned())
-        .filter(|text| text.contains(crate::delegation::JOURNAL_OWNER))
+        .filter(|text| {
+            text.contains(crate::delegation::JOURNAL_OWNER)
+                && text.contains(r#""phase":"prepared""#)
+        })
         .collect();
     assert_eq!(entries.len(), 1, "one journal entry per created child");
     assert!(
@@ -689,4 +696,40 @@ fn req_0015_063_journal_holds_one_entry_per_child_with_allowance() {
         "entry carries the allowance"
     );
     assert!(entries[0].contains(CHILD), "entry names the child target");
+}
+
+/// 0015-063, 0015-068, 0005-031: a parent restarted with an open child fails with
+/// BACKEND_CRASHED and cancels its open child exactly once.
+#[test]
+fn req_0015_063_restart_cancels_open_child_once() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.child_mock.enqueue(vec![Step::Hold]);
+    m.parent_mock.enqueue(vec![Step::Hold]);
+    let parent_id = drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "restart").await;
+        let tools = peer_tools(&h.parent).await;
+        let _call = ipc_call(&tools, send_frame(CHILD, "long", "k1", Wait::Blocking));
+        peer_tools(&h.child).await;
+        // Let the parent record the child's `sent` entry before the crash (0015-062).
+        for _ in 0..200 {
+            yield_now().await;
+        }
+        parent.id
+    });
+    let mut m = restart_parent(m);
+    let h = m.handles();
+    drive_mesh(&mut m, async move {
+        until_state(&h.bus, PARENT, &parent_id, pb::TaskState::Failed).await;
+        while !cancel_seen(&h.child) {
+            yield_now().await;
+        }
+    });
+    let cancels = m
+        .child_mock
+        .commands()
+        .iter()
+        .filter(|c| matches!(c, crate::mock::Command::Cancel(_)))
+        .count();
+    assert_eq!(cancels, 1, "the open child is canceled exactly once");
 }

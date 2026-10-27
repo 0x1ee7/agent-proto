@@ -120,12 +120,15 @@ pub struct Capabilities {
 }
 
 /// Liveness and restart state answered to `Health` (section 4.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Health {
     /// Whether the agent process or peer connection is up.
     pub live: bool,
     /// Number of driver-side restarts since the driver was created.
     pub restarts: u32,
+    /// Why the backend is not live, if the driver knows (RFC-0005 0005-053). Unredacted; the
+    /// worker redacts it before it reaches a failure record.
+    pub reason: Option<String>,
 }
 
 /// Input content for a turn. M1 drivers forward text only.

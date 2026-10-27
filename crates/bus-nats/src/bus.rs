@@ -78,12 +78,18 @@ impl Bus for NatsBus {
         pattern: &SubjectPattern,
     ) -> Result<Self::Requests, BusError> {
         self.check_who(who)?;
-        let subscriber = self
-            .client()
+        let client = self.client();
+        let subscriber = client
             .subscribe(pattern.as_str().to_owned())
             .await
             .map_err(|_| errors::unavailable(reason::SUBSCRIBE_FAILED))?;
-        Ok(NatsRequests::new(subscriber, self.client().clone()))
+        // Subscribing only queues the SUB; the flush makes the server register it before a
+        // request from another connection can be routed, so no request sees `NoResponder`.
+        client
+            .flush()
+            .await
+            .map_err(|_| errors::unavailable(reason::SUBSCRIBE_FAILED))?;
+        Ok(NatsRequests::new(subscriber, client.clone()))
     }
 
     async fn append(

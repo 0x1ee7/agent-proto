@@ -17,11 +17,11 @@ use bus_api::bus::{Bus, Consumer, Watch};
 use bus_api::error::BusError;
 use bus_api::headers::Headers;
 use bus_api::message::{StartPosition, WatchEvent};
-use bus_api::name::{ConsumerName, Key, KeyPrefix, StreamName, Subject, SubjectPattern};
+use bus_api::name::{ConsumerName, Key, KeyPrefix, MsgId, StreamName, Subject, SubjectPattern};
 use bus_nats::NatsBus;
 use bus_nats::config::{NatsConfig, Seed};
 use bus_nats::connect;
-use bus_nats::layout::ev_stream;
+use bus_nats::layout::{PRESENCE, audit_stream, ev_stream, kv_bucket, kv_stream};
 use bus_nats::provision::{SUPERVISOR, provision};
 use bytes::Bytes;
 use support::factory::{NatsFactory, provision_suite};
@@ -145,6 +145,64 @@ fn req_0010_060_agent_cannot_publish_foreign_event_subject() {
         bus.publish(&fx.client, &own, &headers, Bytes::from_static(b"own"))
             .await
             .expect("own event subject publishes");
+    });
+}
+
+/// 0010-060: an agent appends its own audit record. The binding decides the capture from
+/// the layout, so the agent needs no `STREAM.INFO` on the audit stream it may not read.
+#[test]
+#[ignore = "live: needs nats-server"]
+fn req_0010_060_agent_appends_own_audit_without_stream_info() {
+    let rt = runtime();
+    let (server, fx) = start(&rt);
+    provision_local(&rt, &server, &fx);
+    let client = fx.client.name().expect("client name").to_owned();
+    rt.block_on(async {
+        let bus = connect_as(&server, &fx, &client).await;
+        let stream = StreamName::parse(&audit_stream(&fx.local)).expect("audit stream");
+        let subject =
+            Subject::parse(&format!("a2a.v1.{}.audit.{client}", fx.local)).expect("audit subject");
+        let msg_id = MsgId::parse("req-0010-060-audit").expect("msg id");
+        bus.append(
+            &fx.client,
+            &stream,
+            &subject,
+            &Headers::new(),
+            Bytes::from_static(b"audit"),
+            &msg_id,
+        )
+        .await
+        .expect("own audit append");
+    });
+}
+
+/// 0011-013: `append` names the stream it expects. The server refuses a subject another
+/// stream captures (`Nats-Expected-Stream` mismatch), reported as `Absent`, so an audit
+/// record cannot land in the event stream.
+#[test]
+#[ignore = "live: needs nats-server"]
+fn req_0011_013_append_to_uncaptured_stream_is_absent() {
+    let rt = runtime();
+    let (server, fx) = start(&rt);
+    provision_local(&rt, &server, &fx);
+    let client = fx.client.name().expect("client name").to_owned();
+    rt.block_on(async {
+        let bus = connect_as(&server, &fx, &client).await;
+        let stream = StreamName::parse(&ev_stream(&fx.local)).expect("event stream");
+        let subject =
+            Subject::parse(&format!("a2a.v1.{}.audit.{client}", fx.local)).expect("audit subject");
+        let msg_id = MsgId::parse("req-0011-013-absent").expect("msg id");
+        let refused = bus
+            .append(
+                &fx.client,
+                &stream,
+                &subject,
+                &Headers::new(),
+                Bytes::from_static(b"audit"),
+                &msg_id,
+            )
+            .await;
+        assert_eq!(refused.err(), Some(BusError::Absent));
     });
 }
 
@@ -343,5 +401,53 @@ fn req_0010_031_ttl_expiry_then_create_recreates() {
             .expect("get after update");
         assert_eq!(entry.value, Bytes::from_static(b"v4"));
         assert_eq!(entry.revision, third);
+    });
+}
+
+#[test]
+#[ignore = "live: needs nats-server"]
+fn req_0010_031_existing_presence_bucket_gains_message_ttl() {
+    let rt = runtime();
+    let (server, fx) = start(&rt);
+    let presence = kv_bucket(&fx.local, PRESENCE);
+    rt.block_on(async {
+        let seed = server.seed(SUPERVISOR).expect("supervisor seed");
+        let client = async_nats::ConnectOptions::with_nkey(seed)
+            .name(SUPERVISOR)
+            .custom_inbox_prefix(format!("_INBOX.{SUPERVISOR}"))
+            .connect(server.url())
+            .await
+            .expect("supervisor client");
+        let js = async_nats::jetstream::new(client);
+        // The fixtures do not create the presence bucket; absence is fine.
+        let _ = js.delete_stream(kv_stream(&presence)).await;
+        js.create_key_value(async_nats::jetstream::kv::Config {
+            bucket: presence.clone(),
+            history: 1,
+            storage: async_nats::jetstream::stream::StorageType::File,
+            num_replicas: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("legacy presence bucket");
+        let legacy = js
+            .get_stream(kv_stream(&presence))
+            .await
+            .expect("legacy stream");
+        assert!(!legacy.cached_info().config.allow_message_ttl);
+
+        let supervisor = connect_as(&server, &fx, SUPERVISOR).await;
+        provision(&supervisor).await.expect("provision reconciles");
+
+        let stream = js
+            .get_stream(kv_stream(&presence))
+            .await
+            .expect("presence stream");
+        let config = &stream.cached_info().config;
+        assert!(config.allow_message_ttl, "presence must honour Nats-TTL");
+        assert_eq!(
+            config.subject_delete_marker_ttl,
+            Some(Duration::from_secs(60))
+        );
     });
 }

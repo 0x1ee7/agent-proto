@@ -125,6 +125,7 @@ pub async fn provision(bus: &NatsBus) -> Result<(), ProvisionError> {
         )),
     )
     .await?;
+    ensure_message_ttl(js, &kv_stream(&presence)).await?;
 
     let claims = kv_bucket(tenant, CLAIMS);
     ensure(
@@ -182,6 +183,26 @@ async fn ensure<T, E: Display>(
         return Ok(());
     }
     create.await.map(drop).map_err(step(what))
+}
+
+/// Enables per-message TTL on an existing presence bucket. `ensure` keeps an existing
+/// stream unchanged, so a bucket created before the setting would ignore `Nats-TTL`
+/// and never expire its leases (0010-031).
+async fn ensure_message_ttl(js: &jetstream::Context, stream: &str) -> Result<(), ProvisionError> {
+    let existing = js
+        .get_stream(stream)
+        .await
+        .map_err(step("presence bucket TTL"))?;
+    let mut config = existing.cached_info().config.clone();
+    if config.allow_message_ttl && config.subject_delete_marker_ttl == Some(PRESENCE_MARKER_TTL) {
+        return Ok(());
+    }
+    config.allow_message_ttl = true;
+    config.subject_delete_marker_ttl = Some(PRESENCE_MARKER_TTL);
+    js.update_stream(config)
+        .await
+        .map_err(step("presence bucket TTL"))?;
+    Ok(())
 }
 
 /// Configuration of the events stream (0010-024).

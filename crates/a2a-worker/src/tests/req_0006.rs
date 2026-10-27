@@ -178,3 +178,21 @@ fn req_0006_006_approval_carries_working_directory_and_mode() {
         assert_eq!(request.workspace_mode, "per-session");
     });
 }
+
+/// 0006-017, 0005-049: an approval that expires fails the task with APPROVAL_TIMEOUT and a
+/// non-null detail.
+#[test]
+fn req_0006_017_approval_timeout_fails_task_with_detail() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![permission("p1", "edit"), completed()]);
+        let task = submit(bus, "write").await;
+        wait_for_state(bus, &task.id, pb::TaskState::InputRequired).await;
+        advance(bus, APPROVAL_EXPIRY_MS);
+        let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        assert_eq!(failure_code(&failed).as_deref(), Some("APPROVAL_TIMEOUT"));
+        let detail = failure_detail(&failed).expect("approval timeout carries a detail");
+        assert!(detail.contains("approval window expired"), "{detail}");
+    });
+}

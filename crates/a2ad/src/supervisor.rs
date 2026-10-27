@@ -547,10 +547,7 @@ impl Supervisor {
             .current_dir(&state)
             .stdin(Stdio::piped());
         let log_path = state.join(LOGS_DIR).join(format!("{}.log", spec.id));
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
+        let log = platform::open_log_for_append(&log_path)?;
         platform::restrict_to_owner(&log_path, false)?;
         command
             .stdout(Stdio::from(log.try_clone()?))
@@ -901,8 +898,13 @@ fn remove_delegation_artifacts(delegation: Option<&PreparedDelegation>) {
     }
 }
 
-/// Environment for a child: parent minus provider keys (0012-062) and parent `A2AB_*`,
-/// plus the agent's `env` table, plus `extra` (supervisor-set `A2AB_*`).
+/// Log-filter variables forwarded from the parent to children (RFC-0013 0013-038): the host
+/// resolves `A2AB_LOG`, then `RUST_LOG`, then `[log] level`.
+const FORWARDED_LOG_ENV: [&str; 2] = ["A2AB_LOG", "RUST_LOG"];
+
+/// Environment for a child: parent minus provider keys (0012-062) and parent `A2AB_*` other
+/// than [`FORWARDED_LOG_ENV`], plus the agent's `env` table, plus `extra` (supervisor-set
+/// `A2AB_*`).
 #[must_use]
 pub fn child_env(
     parent: &[(String, String)],
@@ -912,7 +914,9 @@ pub fn child_env(
     let mut out: Vec<(String, String)> = parent
         .iter()
         .filter(|(key, _)| {
-            !key.starts_with("A2AB_")
+            let identity_ok =
+                !key.starts_with("A2AB_") || FORWARDED_LOG_ENV.contains(&key.as_str());
+            identity_ok
                 && (spec.passthrough_all
                     || !is_provider_key(key)
                     || spec.env_allow.iter().any(|allowed| allowed == key))
@@ -1214,6 +1218,21 @@ mod tests {
                 .any(|(key, value)| key == "ANTHROPIC_API_KEY" && value == "k1")
         );
         assert!(!env.iter().any(|(key, _)| key == "OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn req_0013_038_log_overrides_forwarded_to_children() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let config = fixture(state.path(), &fake_agent("peer", ""));
+        let spec = config.agent("peer").expect("agent").clone();
+        let parent = vec![
+            ("A2AB_LOG".to_owned(), "debug".to_owned()),
+            ("RUST_LOG".to_owned(), "warn".to_owned()),
+            ("A2AB_LEFTOVER".to_owned(), "x".to_owned()),
+        ];
+        let env = child_env(&parent, &spec, &[]);
+        let keys: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, vec!["A2AB_LOG", "RUST_LOG", "FAKE_CHILD_MARKER"]);
     }
 
     #[test]

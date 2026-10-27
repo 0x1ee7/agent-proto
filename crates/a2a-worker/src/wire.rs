@@ -55,7 +55,14 @@ pub fn failure_metadata(code: &str, detail: Option<&str>) -> Struct {
     let mut inner = HashMap::new();
     inner.insert("code".to_owned(), string_value(code));
     if let Some(detail) = detail {
-        inner.insert("detail".to_owned(), string_value(detail));
+        // RFC-0005 [0005-049]: `detail` is an object, so the text sits under `message`.
+        let fields = HashMap::from([("message".to_owned(), string_value(detail))]);
+        inner.insert(
+            "detail".to_owned(),
+            Value {
+                kind: Some(Kind::StructValue(Struct { fields })),
+            },
+        );
     }
     let mut top = HashMap::new();
     top.insert(
@@ -133,11 +140,10 @@ pub fn task_proto(view: &TaskView) -> pb::Task {
         .failure
         .as_ref()
         .and_then(|failure| failure_message(&view.task_id, &view.context_id, failure));
-    let metadata = view
-        .state
-        .is_terminal()
-        .then(|| usage_metadata(&view.usage))
-        .flatten();
+    let metadata = Some(event_metadata(
+        view.seq,
+        view.state.is_terminal().then_some(&view.usage),
+    ));
     let artifacts = view
         .artifacts
         .iter()
@@ -176,6 +182,32 @@ pub fn usage_metadata(usage: &BudgetUsage) -> Option<Struct> {
             },
         )]),
     })
+}
+
+/// Event metadata: the task sequence (RFC-0002 0002-042) and, on a terminal Status event, the
+/// hop's usage (RFC-0006 0006-041).
+#[allow(clippy::cast_precision_loss)]
+#[must_use]
+pub fn event_metadata(seq: u64, usage: Option<&BudgetUsage>) -> Struct {
+    let mut fields = usage
+        .and_then(usage_metadata)
+        .map(|s| s.fields)
+        .unwrap_or_default();
+    let body = Struct {
+        fields: HashMap::from([(
+            "seq".to_owned(),
+            Value {
+                kind: Some(Kind::NumberValue(seq as f64)),
+            },
+        )]),
+    };
+    fields.insert(
+        a2a_types::vocab::ext::SEQUENCE.to_owned(),
+        Value {
+            kind: Some(Kind::StructValue(body)),
+        },
+    );
+    Struct { fields }
 }
 
 /// Builds the `StreamResponse` for one committed event.
@@ -219,7 +251,7 @@ pub fn stream_response(
                             message,
                             timestamp: Some(timestamp(event.at_ms)),
                         }),
-                        metadata: usage.and_then(usage_metadata),
+                        metadata: Some(event_metadata(event.seq, usage)),
                     },
                 )),
             }
@@ -241,7 +273,7 @@ pub fn stream_response(
                     }),
                     append: !first_chunk,
                     last_chunk: *last_chunk,
-                    metadata: None,
+                    metadata: Some(event_metadata(event.seq, None)),
                 },
             )),
         },
@@ -264,6 +296,17 @@ pub fn stop_reason(outcome: &Outcome) -> StopReason {
             ReasonToken::AgentRefused => StopReason::Refusal,
             other => registry_or_unknown(*other),
         },
+    }
+}
+
+/// The failure detail a terminal outcome carries into the task record (0005-031), if any.
+#[must_use]
+pub fn outcome_detail(outcome: &Outcome) -> Option<serde_json::Value> {
+    match outcome {
+        Outcome::Failed { detail, .. } if !detail.is_empty() => {
+            Some(serde_json::Value::String(detail.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -356,8 +399,11 @@ mod tests {
             &inner.fields["code"].kind,
             Some(Kind::StringValue(s)) if s == "BACKEND_CRASHED"
         ));
+        let Some(Kind::StructValue(detail)) = &inner.fields["detail"].kind else {
+            panic!("detail must be an object (0005-049)");
+        };
         assert!(matches!(
-            &inner.fields["detail"].kind,
+            &detail.fields["message"].kind,
             Some(Kind::StringValue(s)) if s == "exit 1"
         ));
     }

@@ -79,6 +79,8 @@ struct State {
     log: Vec<Command>,
     alive: bool,
     restarts: u32,
+    /// Why the mock is not live, reported through `Health::reason`.
+    down_reason: Option<String>,
     ignore_cancel: bool,
 }
 
@@ -251,6 +253,7 @@ impl MockBackend {
             log: Vec::new(),
             alive: true,
             restarts: 0,
+            down_reason: None,
             ignore_cancel: false,
         }));
         (
@@ -272,6 +275,7 @@ impl Backend for MockBackend {
         Health {
             live: state.alive,
             restarts: state.restarts,
+            reason: state.down_reason.clone(),
         }
     }
 
@@ -383,6 +387,15 @@ impl MockControl {
         let mut state = lock(&self.state);
         state.terminate_all(|| crash_outcome(detail));
         state.alive = false;
+        state.down_reason = Some(detail.to_owned());
+    }
+
+    /// Marks the backend not live without ending its open turn, so the Worker's health check
+    /// must close the turn itself (RFC-0005 0005-053).
+    pub fn go_down(&self, reason: &str) {
+        let mut state = lock(&self.state);
+        state.alive = false;
+        state.down_reason = Some(reason.to_owned());
     }
 
     /// Simulates a driver restart: the backend is live again with an incremented restart count.
@@ -392,6 +405,7 @@ impl MockControl {
         state.open.clear();
         state.pending.clear();
         state.alive = true;
+        state.down_reason = None;
         state.restarts += 1;
     }
 

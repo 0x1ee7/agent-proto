@@ -188,6 +188,25 @@ pub fn path_length_ok(path: &Path, long_paths: bool) -> bool {
     long_paths || path.to_string_lossy().chars().count() <= MAX_PATH_CHARS
 }
 
+/// Opens `path` for appending, creating it if needed. On Windows the handle shares read, write
+/// and delete, so the host can rotate the file while the supervisor holds its stdout handle
+/// (RFC-0013 0013-039). Unix allows renaming an open file, so no share flags are needed there.
+///
+/// # Errors
+/// Returns the I/O error of the open call.
+pub fn open_log_for_append(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+        const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+        options.share_mode(SHARE_ALL);
+    }
+    options.open(path)
+}
+
 /// Restricts `path` to its owner (0012-024 Linux mode `0600`/`0700`; 0012-025/065 Windows
 /// DACL granting only the current user, with inheritance removed).
 ///

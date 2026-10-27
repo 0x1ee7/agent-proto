@@ -70,11 +70,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             return Ok(());
         }
         let blocking = matches!(params.wait, Wait::Blocking);
-        let replayed = self
-            .peers
-            .bindings
-            .get(task)
-            .and_then(|b| b.keys.get(&params.idempotency_key))
+        let replayed = d
+            .ledger
+            .get(&(task.to_owned(), params.idempotency_key.clone()))
             .cloned();
         if let Some(child_id) = replayed {
             replay(d, request, &child_id, blocking);
@@ -87,11 +85,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 return Ok(());
             }
         };
-        if let Some(binding) = self.peers.bindings.get_mut(task) {
-            binding
-                .keys
-                .insert(params.idempotency_key.clone(), child_id.clone());
-        }
+        d.ledger.insert(
+            (task.to_owned(), params.idempotency_key.clone()),
+            child_id.clone(),
+        );
         self.observe(d, &child_id, &remote, now, effects)?;
         replay(d, request, &child_id, blocking);
         Ok(())
@@ -123,11 +120,15 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
         // 0015-062: the child is recorded durably before its message is sent (0015-063 entry).
         let entry = serde_json::json!({
+            "phase": "prepared",
             "parent": task,
             "key": params.idempotency_key,
             "child": child_id,
             "target": prepared.target.as_str(),
             "allowance": allowance,
+            "context": prepared.context,
+            "hop": prepared.hop,
+            "deadline": prepared.deadline,
         });
         if self
             .tasks
@@ -154,6 +155,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             self.settle_unsent(task, &child_id, now, effects)?;
             return Ok(Err(unavailable()));
         };
+        self.tasks.append_extension(
+            super::JOURNAL_OWNER,
+            serde_json::json!({"phase": "sent", "child": child_id, "remote": remote_id.as_str()}),
+        )?;
         d.children.insert(
             child_id.clone(),
             Child {
@@ -219,7 +224,18 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Err(ClientError::LoopDetected) => {
                 let failed = self
                     .tasks
-                    .fail_parent(task, FailureCode::LoopDetected, None, now)
+                    .fail_parent(
+                        task,
+                        FailureCode::LoopDetected,
+                        Some(
+                            crate::worker::cause(
+                                "LOOP_DETECTED",
+                                "peer call refused: delegation loop",
+                            )
+                            .to_string(),
+                        ),
+                        now,
+                    )
                     .map_err(|_| unavailable())?;
                 effects.extend(failed);
                 return Err(IpcError::new(reason::LOOP_DETECTED));

@@ -37,6 +37,21 @@ pub(crate) struct Handled {
     last_seq: Option<u64>,
     applied: Vec<String>,
     replay: Vec<Outgoing>,
+    /// A blocking send whose reply waits for the task (0002-050).
+    hold: Option<Wait>,
+}
+
+/// The task a blocking send waits on, and the instant the reply is due regardless.
+pub(crate) struct Wait {
+    pub(crate) origin: String,
+    pub(crate) task_id: String,
+    pub(crate) until: u64,
+}
+
+/// A held blocking send awaiting its reply.
+pub(crate) struct Held {
+    pub(crate) inbound: Inbound,
+    pub(crate) wait: Wait,
 }
 
 /// A refused request. `Wire` answers the caller; `Fatal` means the worker cannot continue.
@@ -97,6 +112,7 @@ fn plain(response: Response) -> Handled {
         last_seq: None,
         applied: Vec::new(),
         replay: Vec::new(),
+        hold: None,
     }
 }
 
@@ -143,10 +159,28 @@ fn timestamp_ms(ts: &Timestamp) -> Option<u64> {
 }
 
 impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
-    /// Answers one accepted request: reply on success, a wire error on refusal, and
-    /// publishes any replay events after the reply.
+    /// Answers one accepted request: a blocking send with a task still in flight is held,
+    /// everything else is answered at once.
     pub(crate) async fn handle(&mut self, inbound: Inbound, now: u64) -> Result<(), WorkerError> {
         match self.route(&inbound.head, &inbound.body, now) {
+            Ok(Handled {
+                hold: Some(wait), ..
+            }) => {
+                self.held.push(Held { inbound, wait });
+                Ok(())
+            }
+            result => self.answer(inbound, result).await,
+        }
+    }
+
+    /// Writes the reply for a routed request: the success body, or a wire error on refusal,
+    /// then any replay events.
+    pub(crate) async fn answer(
+        &mut self,
+        inbound: Inbound,
+        result: Result<Handled, RpcError>,
+    ) -> Result<(), WorkerError> {
+        match result {
             Ok(handled) => {
                 let options = ReplyOptions {
                     last_seq: handled.last_seq,
@@ -183,6 +217,33 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 Err(err)
             }
         }
+    }
+
+    /// Answers held blocking sends whose task is terminal or input-required, or whose wait
+    /// is due (0002-050, 0005-046). A task that can no longer be read is answered at once.
+    pub(crate) async fn release_held(&mut self, now: u64) -> Result<(), WorkerError> {
+        for entry in std::mem::take(&mut self.held) {
+            let view = self.tasks.task(&entry.wait.origin, &entry.wait.task_id);
+            let due = match &view {
+                Ok(v) => {
+                    v.state.is_terminal() || v.state.is_interrupted() || now >= entry.wait.until
+                }
+                Err(_) => true,
+            };
+            if !due {
+                self.held.push(entry);
+                continue;
+            }
+            let result = view.map_err(RpcError::from).map(|v| Handled {
+                response: Response::Send(send_response(wire::task_proto(&v))),
+                last_seq: None,
+                applied: Vec::new(),
+                replay: Vec::new(),
+                hold: None,
+            });
+            self.answer(entry.inbound, result).await?;
+        }
+        Ok(())
     }
 
     fn route(
@@ -327,11 +388,24 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Admission::Stale => return Err(RpcError::wire(WireError::RequestExpired)),
         };
         let view = self.tasks.task(&head.origin, &task_id)?;
+        // 0002-050, 0005-046: a blocking send replies once the task is terminal or
+        // input-required, or at the earlier of the caller's and the task's deadline.
+        let immediate = req
+            .configuration
+            .as_ref()
+            .is_some_and(|config| config.return_immediately);
+        let settled = view.state.is_terminal() || view.state.is_interrupted();
+        let hold = (!immediate && !settled).then(|| Wait {
+            origin: head.origin.clone(),
+            task_id: task_id.clone(),
+            until: head.deadline_ms.min(view.deadline_ms),
+        });
         Ok(Handled {
             response: Response::Send(send_response(wire::task_proto(&view))),
             last_seq: None,
             applied,
             replay: Vec::new(),
+            hold,
         })
     }
 
@@ -375,6 +449,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             last_seq: None,
             applied: vec![APPROVAL.to_owned()],
             replay: Vec::new(),
+            hold: None,
         })
     }
 
@@ -468,6 +543,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             last_seq: Some(view.seq),
             applied: Vec::new(),
             replay,
+            hold: None,
         })
     }
 }

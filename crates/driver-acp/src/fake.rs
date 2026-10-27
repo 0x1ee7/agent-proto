@@ -203,6 +203,10 @@ impl Terminator for FakeTerminator {
         self.counters.kills.fetch_add(1, Ordering::SeqCst);
         self.state.killed.store(true, Ordering::SeqCst);
     }
+
+    fn exit_description(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Successful JSON-RPC response to request `id`.

@@ -4,6 +4,8 @@
 //! is read from the environment at start) or `file:<path>` (the file must be owner-only,
 //! RFC-0008 0008-066). Error messages name the reference kind, never its value.
 
+pub mod logging;
+
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
