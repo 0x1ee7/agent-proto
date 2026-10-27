@@ -319,6 +319,78 @@ fn req_0006_007_snapshots_carry_open_approval() {
     });
 }
 
+async fn list_as(bus: &MemBus, sender: &str) -> pb::ListTasksResponse {
+    let reply = call(
+        bus,
+        sender,
+        Op::List,
+        RequestBody::ListTasks(pb::ListTasksRequest {
+            tenant: TENANT.to_owned(),
+            ..Default::default()
+        }),
+        Vec::new(),
+    )
+    .await;
+    envelope::decode_reply::<pb::ListTasksResponse>(&reply).unwrap()
+}
+
+async fn get_as(bus: &MemBus, sender: &str, id: &str) -> Result<pb::Task, ReplyDecodeError> {
+    let body = RequestBody::GetTask(pb::GetTaskRequest {
+        tenant: TENANT.to_owned(),
+        id: id.to_owned(),
+        history_length: None,
+    });
+    let reply = call(bus, sender, Op::Get, body, Vec::new()).await;
+    envelope::decode_reply::<pb::Task>(&reply)
+}
+
+/// 0005-004, 0006-014: an operator identity (`cli`) lists and reads the open approval of a task
+/// created by another origin and decides it; an agent identity still sees nothing of that origin.
+#[test]
+fn req_0005_004_operator_lists_and_decides_approval_of_another_origin() {
+    let mut rig = rig();
+    let (bus, mock, store) = (&rig.bus, &rig.mock, &rig.store);
+    drive(&mut rig.worker, async {
+        let mut events = observer(bus, "obs-0005-004-operator").await;
+        mock.enqueue(vec![permission("p1", "edit"), completed()]);
+        // Origin `planner`, as a gateway peer's task would be for the operator.
+        let task = submit(bus, "write").await;
+        let (_, request) = next_approval(&mut events, &task.id).await;
+
+        // Another agent origin: scoped as before.
+        assert!(list_as(bus, OPERATOR).await.tasks.is_empty());
+        assert!(get_as(bus, OPERATOR, &task.id).await.is_err());
+
+        // The operator sees it, with the approval request.
+        let listed = list_as(bus, "cli").await;
+        let [listed_task] = listed.tasks.as_slice() else {
+            panic!("operator expected one task, got {}", listed.tasks.len());
+        };
+        assert_eq!(listed_task.id, task.id);
+        assert_eq!(
+            snapshot_approval(listed_task).map(|r| r.request_id),
+            Some(request.request_id.clone())
+        );
+        let got = get_as(bus, "cli", &task.id).await.unwrap();
+        assert_eq!(
+            snapshot_approval(&got).map(|r| r.request_id),
+            Some(request.request_id.clone())
+        );
+
+        // And decides it.
+        let digest = approval_digest(store, &request.request_id);
+        let body = decision_body(
+            &task.id,
+            &task.context_id,
+            &decision(&request, ALLOW_ONCE_ID, &digest),
+        );
+        let reply = call(bus, "cli", Op::Send, body, vec![APPROVAL.to_owned()]).await;
+        envelope::decode_reply::<pb::SendMessageResponse>(&reply).unwrap();
+        wait_for_state(bus, &task.id, pb::TaskState::Completed).await;
+        assert!(get_as(bus, OPERATOR, &task.id).await.is_err());
+    });
+}
+
 /// The approval request carried by a task snapshot's status message (0006-007).
 fn snapshot_approval(task: &pb::Task) -> Option<a2abus::ApprovalRequest> {
     let meta = task.status.as_ref()?.message.as_ref()?.metadata.as_ref()?;

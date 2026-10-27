@@ -19,6 +19,7 @@ use a2a_worker::backend::{
 use serde_json::Value;
 use tokio::runtime::Runtime;
 use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::card;
@@ -104,7 +105,6 @@ impl HttpBackend {
                 peer: AsyncMutex::new(None),
                 ownership: Mutex::new(ownership),
                 live: AtomicBool::new(true),
-                closed: AtomicBool::new(false),
             }),
             runtime: Some(runtime),
         })
@@ -131,21 +131,11 @@ impl Backend for HttpBackend {
         }
     }
 
-    /// Refuses exactly when `start` answers `Closed`. An unreachable peer is not a latched
-    /// failure: `live` returns once a call reaches the peer, and only a turn makes that call, so
-    /// a not-live backend stays startable (RFC-0014 [0014-029]).
-    fn can_start(&self) -> bool {
-        !self.shared.closed.load(Ordering::SeqCst)
-    }
-
     fn attach(&mut self, sink: Box<dyn BackendSink>) {
         *lock(&self.shared.sink) = Some(sink);
     }
 
     fn start(&mut self, start: StartTurn) -> Result<(), BackendError> {
-        if self.shared.closed.load(Ordering::SeqCst) {
-            return Err(BackendError::Closed);
-        }
         let runtime = self.runtime.as_ref().ok_or(BackendError::Closed)?;
         if lock(&self.shared.sink).is_none() {
             return Err(BackendError::NoSink);
@@ -159,17 +149,20 @@ impl Backend for HttpBackend {
             *open = Some(ActiveTurn {
                 turn: start.turn.clone(),
                 cancel: cancel_tx,
+                aborts: Vec::new(),
             });
         }
         let turn = start.turn.clone();
+        let opened = start.turn.clone();
         let shared = self.shared.clone();
         let emitter = Emitter {
             shared: shared.clone(),
             turn: turn.clone(),
             seq: Arc::new(AtomicU64::new(0)),
         };
-        runtime.spawn(async move {
-            let inner = tokio::spawn(drive(shared.clone(), emitter.clone(), start, cancel_rx));
+        let inner = runtime.spawn(drive(shared.clone(), emitter.clone(), start, cancel_rx));
+        let inner_abort = inner.abort_handle();
+        let outer = runtime.spawn(async move {
             let outcome = match inner.await {
                 Ok(outcome) => outcome,
                 Err(_) => failed(ReasonToken::BackendError, "driver task aborted"),
@@ -178,6 +171,11 @@ impl Backend for HttpBackend {
             shared.clear_open(&turn);
             emitter.terminal(outcome);
         });
+        if let Some(active) = lock(&self.shared.open).as_mut()
+            && active.turn == opened
+        {
+            active.aborts = vec![inner_abort, outer.abort_handle()];
+        }
         Ok(())
     }
 
@@ -200,25 +198,41 @@ impl Backend for HttpBackend {
         Ok(())
     }
 
+    /// Kills the open turn; the backend stays startable (the Worker's `kill` expects a respawn).
     fn shutdown(&mut self, grace: Duration) -> Result<(), BackendError> {
-        self.shared.closed.store(true, Ordering::SeqCst);
+        self.kill(grace);
+        Ok(())
+    }
+}
+
+impl Drop for HttpBackend {
+    /// The only terminal close: the runtime goes away with the backend.
+    fn drop(&mut self) {
+        self.kill(Duration::ZERO);
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl HttpBackend {
+    /// Ends the open turn: cancels it, waits up to `grace` for its own Terminal, then stops its
+    /// tasks and closes the slot with a failed Terminal. The runtime and the backend stay usable,
+    /// so the next `start` works (RFC-0009 [0009-036]).
+    fn kill(&self, grace: Duration) {
         if let Some(active) = lock(&self.shared.open).as_ref() {
             let _ = active.cancel.send(true);
         }
-        // Runtime shutdown drops suspended tasks, so wait for the cancelled turn to emit its
-        // Terminal first, bounded by `grace`.
         let deadline = Instant::now() + grace;
         while lock(&self.shared.open).is_some() && Instant::now() < deadline {
             std::thread::sleep(SHUTDOWN_POLL);
         }
-        if let Some(runtime) = self.runtime.take() {
-            // Tasks still running after the remaining grace are dropped.
-            runtime.shutdown_timeout(deadline.saturating_duration_since(Instant::now()));
-        }
-        self.shared.live.store(false, Ordering::SeqCst);
-        // Turns dropped by the timeout never emitted Terminal; close the slot with one.
+        // Tasks still running after the grace are stopped; they never emit their Terminal.
         let leftover = lock(&self.shared.open).take();
         if let Some(active) = leftover {
+            for handle in &active.aborts {
+                handle.abort();
+            }
             let emitter = Emitter {
                 shared: self.shared.clone(),
                 turn: active.turn,
@@ -229,7 +243,6 @@ impl Backend for HttpBackend {
                 "driver shut down before the turn finished",
             ));
         }
-        Ok(())
     }
 }
 
@@ -242,7 +255,6 @@ struct Shared {
     peer: AsyncMutex<Option<(Endpoint, Instant)>>,
     ownership: Mutex<TaskOwnership>,
     live: AtomicBool,
-    closed: AtomicBool,
 }
 
 impl Shared {
@@ -317,6 +329,8 @@ struct Endpoint {
 struct ActiveTurn {
     turn: TurnRef,
     cancel: watch::Sender<bool>,
+    /// Handles of the turn's tasks, so a kill that outlasts its grace can stop them.
+    aborts: Vec<AbortHandle>,
 }
 
 /// Emits events for one turn with a monotonically increasing `event_no` (0009-006).

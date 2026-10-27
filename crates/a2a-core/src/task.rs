@@ -1862,11 +1862,25 @@ impl<S: TaskStore> Tasks<S> {
 
     /// Lists the visible tasks of an origin (0005-044).
     pub fn list(&self, origin: &str, query: &ListQuery) -> Result<ListPage, TaskError> {
+        self.list_matching(Some(origin), query)
+    }
+
+    /// Lists the tasks of every origin, for an operator identity (0005-004: a task is visible to
+    /// its origin and to operators). The caller decides who is an operator.
+    pub fn list_all(&self, query: &ListQuery) -> Result<ListPage, TaskError> {
+        self.list_matching(None, query)
+    }
+
+    fn list_matching(
+        &self,
+        origin: Option<&str>,
+        query: &ListQuery,
+    ) -> Result<ListPage, TaskError> {
         let mut items: Vec<&TaskRecord> = self
             .tasks
             .values()
             .filter(|t| {
-                t.origin == origin
+                origin.is_none_or(|origin| t.origin == origin)
                     && query
                         .status_after_ms
                         .is_none_or(|after| t.updated_ms >= after)
@@ -2263,6 +2277,24 @@ mod tests {
             tasks.cancel(OTHER, &id, T0),
             Err(TaskError::NotFound)
         ));
+        assert!(
+            tasks
+                .list(OTHER, &ListQuery::default())
+                .expect("list")
+                .tasks
+                .is_empty()
+        );
+    }
+
+    /// 0005-004: operators see every origin's tasks; the origin-scoped list stays scoped.
+    #[test]
+    fn req_0005_004_operator_listing_spans_origins() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        let all = tasks.list_all(&ListQuery::default()).expect("list all");
+        assert_eq!(all.tasks.len(), 1);
+        assert_eq!(all.tasks[0].task_id, id);
+        assert_eq!(all.total_size, 1);
         assert!(
             tasks
                 .list(OTHER, &ListQuery::default())

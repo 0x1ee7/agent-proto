@@ -13,7 +13,7 @@ use a2a_core::task::{
 use a2a_security::error::{BusError, Reason};
 use a2a_types::extension::{Activation, ExtensionError, read_activated};
 use a2a_types::failure::FailureCode;
-use a2a_types::ids::{ContextId, TaskId};
+use a2a_types::ids::{AgentId, ContextId, TaskId};
 use a2a_types::proto::a2a as pb;
 use a2a_types::proto::a2abus;
 use a2a_types::vocab::ext::{APPROVAL, BUDGET};
@@ -497,10 +497,29 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         .map_err(RpcError::Security)
     }
 
+    /// True for the operator service identities `cli` and `tui` (RFC-0005 [0005-004]). The bus
+    /// authenticates the sender, and neither id can name an agent (RFC-0012 [0012-002]), so an
+    /// agent or a gateway peer cannot present it.
+    fn is_operator(head: &RequestHead) -> bool {
+        head.sender == AgentId::cli() || head.sender == AgentId::tui()
+    }
+
+    /// The origin under which a task read is made: the owner's for an operator, so the operator
+    /// sees the task wherever it came from (0005-004); the caller's own for everyone else.
+    fn read_origin(&self, head: &RequestHead, task_id: &str) -> String {
+        if Self::is_operator(head)
+            && let Some(owner) = self.tasks.task_owner(task_id)
+        {
+            return owner.origin;
+        }
+        head.origin.clone()
+    }
+
     fn get_task(&self, head: &RequestHead, req: &pb::GetTaskRequest) -> Result<Handled, RpcError> {
-        let view = self.tasks.task(&head.origin, &req.id)?;
+        let origin = self.read_origin(head, &req.id);
+        let view = self.tasks.task(&origin, &req.id)?;
         Ok(plain(Response::Task(
-            self.task_with_approval(&head.origin, &view)?,
+            self.task_with_approval(&origin, &view)?,
         )))
     }
 
@@ -559,11 +578,23 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             page_token: (!req.page_token.is_empty()).then(|| req.page_token.clone()),
             status_after_ms,
         };
-        let page = self.tasks.list(&head.origin, &query)?;
+        let operator = Self::is_operator(head);
+        let page = if operator {
+            self.tasks.list_all(&query)?
+        } else {
+            self.tasks.list(&head.origin, &query)?
+        };
         let tasks = page
             .tasks
             .iter()
-            .map(|view| self.task_with_approval(&head.origin, view))
+            .map(|view| {
+                let origin = if operator {
+                    self.read_origin(head, &view.task_id)
+                } else {
+                    head.origin.clone()
+                };
+                self.task_with_approval(&origin, view)
+            })
             .collect::<Result<Vec<pb::Task>, RpcError>>()?;
         Ok(plain(Response::Tasks(pb::ListTasksResponse {
             page_size: i32::try_from(tasks.len()).unwrap_or(i32::MAX),

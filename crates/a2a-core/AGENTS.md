@@ -69,3 +69,4 @@ principal is refused with `PERMISSION_DENIED`. Signatures (RFC-0007) are not imp
 - Service-parameter keys are lowercased on read; original case is not recoverable.
 - `decode_reply` accepts JSON when the reply declares it. `receive_event` honours
   `Config::accept_json`.
+- `Tasks::list_all` lists every origin's tasks for operator identities (0005-004); core never decides who is an operator, the Worker does. `Tasks::list` stays origin-scoped.

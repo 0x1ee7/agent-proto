@@ -699,40 +699,63 @@ fn req_0009_020_second_start_is_busy_and_cancel_before_task_id_is_canceled() {
     );
 }
 
+/// A hanging first turn, then a peer that answers: the shape of a worker `kill` followed by a
+/// later turn (RFC-0009 [0009-036]).
+fn hang_then_complete() -> Server {
+    let sends = Arc::new(AtomicUsize::new(0));
+    Server::start(None, move |seen| match seen.rpc_method() {
+        "SendMessage" => {
+            if sends.fetch_add(1, Ordering::SeqCst) == 0 {
+                Reply::Hang
+            } else {
+                task_reply(seen, COMPLETED, "", artifact("after kill"))
+            }
+        }
+        _ => unexpected(),
+    })
+}
+
 #[test]
-fn shutdown_ends_open_turn_refuses_start_and_reports_not_live() {
-    let server = Server::start(None, |_| Reply::Hang);
+fn req_0009_036_shutdown_cancels_open_turn_and_next_start_works() {
+    let server = hang_then_complete();
     let (mut backend, rx) = backend(&server.base, json!({}));
 
     start(&mut backend, "turn-1", "hi");
+    // Let the turn reach the peer, so the hung request is the first send.
+    std::thread::sleep(Duration::from_millis(300));
     backend.shutdown(Duration::from_secs(5)).expect("shutdown");
     let events = collect(&rx, "turn-1");
     check_all_turns_closed(&events).expect("closed");
     assert_eq!(terminal(&events), Outcome::Canceled);
-    assert_eq!(
-        backend.start(start_turn("turn-2", "hi")),
-        Err(BackendError::Closed)
-    );
-    assert!(!backend.health().live);
+    assert!(backend.can_start());
+
+    start(&mut backend, "turn-2", "again");
+    let events = collect(&rx, "turn-2");
+    check_turn_stream(&events, Protocol::A2aHttp).expect("contract");
+    assert_eq!(terminal(&events), Outcome::Completed);
 }
 
-/// A closed backend refuses every `start` with `Closed`, so it must say so through `can_start`;
-/// otherwise the Worker keeps its RPC subscription and accepts turns that can only fail
-/// (RFC-0014 [0014-029]).
+/// The Worker's kill uses a zero grace: the turn is closed with one failed Terminal at once, its
+/// tasks stop, and the backend is startable again.
 #[test]
-fn req_0014_029_closed_backend_cannot_start() {
-    let server = Server::start(None, |_| unexpected());
-    let (mut backend, _rx) = backend(&server.base, json!({}));
-    assert!(backend.can_start(), "a fresh backend can start");
+fn req_0009_036_zero_grace_kill_closes_turn_once_and_next_start_works() {
+    let server = hang_then_complete();
+    let (mut backend, rx) = backend(&server.base, json!({}));
 
-    backend.shutdown(Duration::from_secs(5)).expect("shutdown");
+    start(&mut backend, "turn-1", "hi");
+    // Let the turn reach the peer so the kill interrupts a live call.
+    std::thread::sleep(Duration::from_millis(300));
+    backend.shutdown(Duration::ZERO).expect("shutdown");
+    let events = collect(&rx, "turn-1");
+    check_all_turns_closed(&events).expect("closed");
+    assert!(matches!(terminal(&events), Outcome::Failed { .. }));
+    assert!(backend.can_start());
 
-    assert_eq!(
-        backend.start(start_turn("turn-1", "hi")),
-        Err(BackendError::Closed)
-    );
-    assert!(!backend.health().live);
-    assert!(!backend.can_start(), "can_start must refuse as start does");
+    start(&mut backend, "turn-2", "again");
+    let events = collect(&rx, "turn-2");
+    assert_eq!(terminal(&events), Outcome::Completed);
+    // The killed turn emitted nothing after its Terminal.
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
 }
 
 /// An unreachable peer is not a latched failure: the next turn is the probe that finds the peer
