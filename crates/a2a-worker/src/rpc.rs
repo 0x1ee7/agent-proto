@@ -1,0 +1,461 @@
+//! Inbound RPC handling. Each accepted request is mapped onto the task store, then
+//! answered exactly once. Replies are sent first; events that a subscription replays
+//! are published after the reply so the snapshot precedes them.
+
+use std::collections::BTreeSet;
+
+use a2a_core::budget::{self, Allowance};
+use a2a_core::envelope::{Inbound, ReplyOptions, RequestBody, RequestHead};
+use a2a_core::errors::{StatusExtras, WireError};
+use a2a_core::task::{Admission, Effect, ListQuery, Submission, TaskError, TaskStore};
+use a2a_types::extension::{Activation, ExtensionError, read_activated};
+use a2a_types::failure::FailureCode;
+use a2a_types::ids::ContextId;
+use a2a_types::proto::a2a as pb;
+use a2a_types::proto::a2abus;
+use a2a_types::vocab::ext::{APPROVAL, BUDGET};
+use bus_api::bus::Bus;
+use pbjson_types::{Struct, Timestamp};
+
+use crate::backend::{Backend, InputPart};
+use crate::error::WorkerError;
+use crate::wire;
+use crate::worker::{PendingTurn, Worker, artifact_key};
+use a2a_core::envelope::Outgoing;
+
+/// The typed body of a successful reply.
+pub(crate) enum Response {
+    Send(pb::SendMessageResponse),
+    Task(pb::Task),
+    Tasks(pb::ListTasksResponse),
+    Stream(pb::StreamResponse),
+}
+
+/// A successful outcome: the reply, reply metadata, and events to publish after it.
+pub(crate) struct Handled {
+    response: Response,
+    last_seq: Option<u64>,
+    applied: Vec<String>,
+    replay: Vec<Outgoing>,
+}
+
+/// A refused request. `Wire` answers the caller; `Fatal` means the worker cannot continue.
+pub(crate) enum RpcError {
+    Wire {
+        error: WireError,
+        detail: Option<&'static str>,
+    },
+    Fatal(WorkerError),
+}
+
+impl RpcError {
+    fn wire(error: WireError) -> Self {
+        Self::Wire {
+            error,
+            detail: None,
+        }
+    }
+
+    fn invalid(detail: &'static str) -> Self {
+        Self::Wire {
+            error: WireError::InvalidParams,
+            detail: Some(detail),
+        }
+    }
+
+    fn extension_invalid(detail: &'static str) -> Self {
+        Self::Wire {
+            error: WireError::ExtensionDataInvalid,
+            detail: Some(detail),
+        }
+    }
+}
+
+impl From<TaskError> for RpcError {
+    fn from(err: TaskError) -> Self {
+        match err {
+            TaskError::NotFound => Self::wire(WireError::TaskNotFound),
+            TaskError::ContextMismatch => Self::invalid("CONTEXT_MISMATCH"),
+            TaskError::NotActive => Self::invalid("TASK_NOT_ACTIVE"),
+            TaskError::Approval(refusal) => Self::invalid(refusal.detail()),
+            TaskError::Invalid(detail) => Self::invalid(detail),
+            TaskError::BadPageToken => Self::invalid("BAD_PAGE_TOKEN"),
+            TaskError::Budget(_) => Self::extension_invalid("BUDGET_INVALID"),
+            TaskError::Terminal | TaskError::NotCancelable => {
+                Self::wire(WireError::TaskNotCancelable)
+            }
+            TaskError::NotSubscribable => Self::wire(WireError::UnsupportedOperation),
+            TaskError::Draining => Self::wire(WireError::Draining),
+            other => Self::Fatal(WorkerError::from(other)),
+        }
+    }
+}
+
+fn plain(response: Response) -> Handled {
+    Handled {
+        response,
+        last_seq: None,
+        applied: Vec::new(),
+        replay: Vec::new(),
+    }
+}
+
+fn send_response(task: pb::Task) -> pb::SendMessageResponse {
+    pb::SendMessageResponse {
+        payload: Some(pb::send_message_response::Payload::Task(task)),
+    }
+}
+
+/// Reads extension data under `uri`, gated by activation. Malformed data is refused.
+fn marked<'a>(
+    metadata: Option<&'a Struct>,
+    uri: &str,
+    activation: &Activation,
+) -> Result<Option<&'a Struct>, RpcError> {
+    match metadata {
+        None => Ok(None),
+        Some(meta) => read_activated(meta, uri, activation).map_err(extension_error),
+    }
+}
+
+fn extension_error(err: ExtensionError) -> RpcError {
+    RpcError::Wire {
+        error: WireError::ExtensionDataInvalid,
+        detail: err.reason(),
+    }
+}
+
+fn budget_of(data: &Struct) -> Option<a2abus::Budget> {
+    serde_json::to_value(data)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn decision_of(value: &pbjson_types::Value) -> Option<a2abus::ApprovalDecision> {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// Milliseconds since the epoch for a non-negative timestamp; `None` otherwise.
+fn timestamp_ms(ts: &Timestamp) -> Option<u64> {
+    let secs = u64::try_from(ts.seconds).ok()?;
+    let nanos = u64::try_from(ts.nanos).ok()?;
+    secs.checked_mul(1000)?.checked_add(nanos / 1_000_000)
+}
+
+impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
+    /// Answers one accepted request: reply on success, a wire error on refusal, and
+    /// publishes any replay events after the reply.
+    pub(crate) async fn handle(&mut self, inbound: Inbound, now: u64) -> Result<(), WorkerError> {
+        match self.route(&inbound.head, &inbound.body, now) {
+            Ok(handled) => {
+                let options = ReplyOptions {
+                    last_seq: handled.last_seq,
+                    applied_extensions: handled.applied,
+                };
+                match &handled.response {
+                    Response::Send(body) => inbound.reply(body, &options),
+                    Response::Task(body) => inbound.reply(body, &options),
+                    Response::Tasks(body) => inbound.reply(body, &options),
+                    Response::Stream(body) => inbound.reply(body, &options),
+                }
+                .map_err(WorkerError::Reply)?;
+                for outgoing in handled.replay {
+                    if let Err(err) = self.publish(outgoing).await {
+                        self.audit(None, format!("REPLAY_PUBLISH_FAILED: {err}"));
+                    }
+                }
+                Ok(())
+            }
+            Err(RpcError::Wire { error, detail }) => {
+                let mut extras = StatusExtras::default();
+                if let Some(detail) = detail {
+                    extras
+                        .metadata
+                        .insert("detail".to_owned(), detail.to_owned());
+                }
+                inbound.fail(error, &extras).map_err(WorkerError::Bus)
+            }
+            Err(RpcError::Fatal(err)) => {
+                // No internal-error wire code exists (RFC-0002); OVERLOADED tells the caller to retry.
+                inbound
+                    .fail(WireError::Overloaded, &StatusExtras::default())
+                    .map_err(WorkerError::Bus)?;
+                Err(err)
+            }
+        }
+    }
+
+    fn route(
+        &mut self,
+        head: &RequestHead,
+        body: &RequestBody,
+        now: u64,
+    ) -> Result<Handled, RpcError> {
+        match body {
+            RequestBody::SendMessage(req) => self.send_message(head, req, now),
+            RequestBody::GetTask(req) => self.get_task(head, req),
+            RequestBody::ListTasks(req) => self.list_tasks(head, req),
+            RequestBody::CancelTask(req) => self.cancel_task(head, req, now),
+            RequestBody::SubscribeToTask(req) => self.subscribe(head, req, now),
+            RequestBody::PushCreate(_)
+            | RequestBody::PushGet(_)
+            | RequestBody::PushList(_)
+            | RequestBody::PushDelete(_) => {
+                Err(RpcError::wire(WireError::PushNotificationNotSupported))
+            }
+            RequestBody::GetExtendedAgentCard(_) => {
+                Err(RpcError::wire(WireError::ExtendedAgentCardNotConfigured))
+            }
+        }
+    }
+
+    fn send_message(
+        &mut self,
+        head: &RequestHead,
+        req: &pb::SendMessageRequest,
+        now: u64,
+    ) -> Result<Handled, RpcError> {
+        let message = req
+            .message
+            .as_ref()
+            .ok_or(RpcError::invalid("MESSAGE_REQUIRED"))?;
+        for part in &message.parts {
+            if marked(part.metadata.as_ref(), APPROVAL, &head.activation)?.is_some() {
+                return self.decide_request(head, message, part, now);
+            }
+        }
+        if !message.task_id.is_empty() {
+            return Err(RpcError::invalid("FOLLOW_UP_UNSUPPORTED"));
+        }
+        if message.parts.is_empty() {
+            return Err(RpcError::invalid("PARTS_REQUIRED"));
+        }
+        let mut input = Vec::with_capacity(message.parts.len());
+        let mut texts: Vec<&str> = Vec::with_capacity(message.parts.len());
+        for part in &message.parts {
+            match &part.content {
+                Some(pb::part::Content::Text(text)) => {
+                    texts.push(text.as_str());
+                    input.push(InputPart::Text(text.clone()));
+                }
+                _ => return Err(RpcError::wire(WireError::ContentTypeNotSupported)),
+            }
+        }
+        let context_id = if message.context_id.is_empty() {
+            ContextId::generate().as_str().to_owned()
+        } else {
+            ContextId::parse(&message.context_id)
+                .map_err(|_| RpcError::invalid("CONTEXT_ID_INVALID"))?
+                .as_str()
+                .to_owned()
+        };
+        let mut applied = Vec::new();
+        let (budget, budget_proto) =
+            match marked(message.metadata.as_ref(), BUDGET, &head.activation)? {
+                None => (None, None),
+                Some(data) => {
+                    let proto =
+                        budget_of(data).ok_or(RpcError::extension_invalid("BUDGET_INVALID"))?;
+                    let allowance = Allowance::from_proto(&proto);
+                    allowance
+                        .validate(true)
+                        .map_err(|_| RpcError::extension_invalid("BUDGET_INVALID"))?;
+                    applied.push(BUDGET.to_owned());
+                    (Some(allowance), Some(proto))
+                }
+            };
+        let agent = self.config.agent.as_str();
+        let fingerprint = budget::fingerprint(agent, texts.iter().copied());
+        let loop_detected = budget_proto
+            .as_ref()
+            .is_some_and(|proto| budget::chain_has_loop(&proto.chain, agent, &fingerprint));
+        let pressure = if loop_detected {
+            Some(FailureCode::LoopDetected)
+        } else if self.tasks.active_count() >= self.config.max_active {
+            Some(FailureCode::QueueFull)
+        } else {
+            None
+        };
+        let submission = Submission {
+            msg_id: head.msg_id.as_str().to_owned(),
+            origin: head.origin.clone(),
+            message_id: (!message.message_id.is_empty()).then(|| message.message_id.clone()),
+            context_id: Some(context_id.clone()),
+            sent_ms: now,
+            ttl_ms: head.deadline_ms.saturating_sub(now),
+            fingerprint,
+            budget,
+            incoming: None,
+            pressure,
+        };
+        let (admission, effects) = self.tasks.submit(submission, now)?;
+        let task_id = match admission {
+            Admission::Created { task_id } => {
+                let staged = effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::StartBackend { task_id: id } if *id == task_id));
+                if staged {
+                    let deadline_ms = self.tasks.task(&head.origin, &task_id)?.deadline_ms;
+                    self.pending.insert(
+                        task_id.clone(),
+                        PendingTurn {
+                            context_id,
+                            input,
+                            deadline_ms,
+                            origin: head.origin.clone(),
+                        },
+                    );
+                }
+                self.run(effects, now).map_err(RpcError::Fatal)?;
+                task_id
+            }
+            Admission::Existing { task_id } => task_id,
+            Admission::Stale => return Err(RpcError::wire(WireError::RequestExpired)),
+        };
+        let view = self.tasks.task(&head.origin, &task_id)?;
+        Ok(Handled {
+            response: Response::Send(send_response(wire::task_proto(&view))),
+            last_seq: None,
+            applied,
+            replay: Vec::new(),
+        })
+    }
+
+    /// Approval decision: a SendMessage that carries the approval extension (RFC-0006).
+    fn decide_request(
+        &mut self,
+        head: &RequestHead,
+        message: &pb::Message,
+        part: &pb::Part,
+        now: u64,
+    ) -> Result<Handled, RpcError> {
+        let Some(pb::part::Content::Data(value)) = &part.content else {
+            return Err(RpcError::extension_invalid("APPROVAL_DECISION_INVALID"));
+        };
+        let decision =
+            decision_of(value).ok_or(RpcError::extension_invalid("APPROVAL_DECISION_INVALID"))?;
+        if decision.task_id != message.task_id {
+            return Err(RpcError::invalid("APPROVAL_NOT_APPLICABLE"));
+        }
+        // Authority is the operator identity (0006-014), not the task's origin: the owning origin
+        // is resolved from the task id so an operator's own origin cannot hide the task.
+        let owner = self
+            .tasks
+            .task_owner(&decision.task_id)
+            .ok_or(TaskError::NotFound)?;
+        let view = self.tasks.task(&owner.origin, &decision.task_id)?;
+        if !message.context_id.is_empty() && message.context_id != view.context_id {
+            return Err(RpcError::invalid("CONTEXT_MISMATCH"));
+        }
+        let (_settled, effects) = self.tasks.decide(
+            &owner.origin,
+            &decision,
+            Some(head.sender.as_str()),
+            head.tenant.as_str(),
+            now,
+        )?;
+        self.run(effects, now).map_err(RpcError::Fatal)?;
+        let view = self.tasks.task(&owner.origin, &decision.task_id)?;
+        Ok(Handled {
+            response: Response::Send(send_response(wire::task_proto(&view))),
+            last_seq: None,
+            applied: vec![APPROVAL.to_owned()],
+            replay: Vec::new(),
+        })
+    }
+
+    fn get_task(&self, head: &RequestHead, req: &pb::GetTaskRequest) -> Result<Handled, RpcError> {
+        let view = self.tasks.task(&head.origin, &req.id)?;
+        Ok(plain(Response::Task(wire::task_proto(&view))))
+    }
+
+    fn list_tasks(
+        &self,
+        head: &RequestHead,
+        req: &pb::ListTasksRequest,
+    ) -> Result<Handled, RpcError> {
+        if !req.context_id.is_empty() || req.status != 0 {
+            return Err(RpcError::invalid("LIST_FILTER_UNSUPPORTED"));
+        }
+        let page_size = req
+            .page_size
+            .map(|n| usize::try_from(n).map_err(|_| RpcError::invalid("PAGE_SIZE_INVALID")))
+            .transpose()?;
+        let status_after_ms = match &req.status_timestamp_after {
+            None => None,
+            Some(ts) => {
+                Some(timestamp_ms(ts).ok_or(RpcError::invalid("STATUS_TIMESTAMP_INVALID"))?)
+            }
+        };
+        let query = ListQuery {
+            page_size,
+            page_token: (!req.page_token.is_empty()).then(|| req.page_token.clone()),
+            status_after_ms,
+        };
+        let page = self.tasks.list(&head.origin, &query)?;
+        let tasks: Vec<pb::Task> = page.tasks.iter().map(wire::task_proto).collect();
+        Ok(plain(Response::Tasks(pb::ListTasksResponse {
+            page_size: i32::try_from(tasks.len()).unwrap_or(i32::MAX),
+            tasks,
+            next_page_token: page.next_page_token.unwrap_or_default(),
+            total_size: i32::try_from(page.total_size).unwrap_or(i32::MAX),
+        })))
+    }
+
+    fn cancel_task(
+        &mut self,
+        head: &RequestHead,
+        req: &pb::CancelTaskRequest,
+        now: u64,
+    ) -> Result<Handled, RpcError> {
+        let effects = self.tasks.cancel(&head.origin, &req.id, now)?;
+        self.run(effects, now).map_err(RpcError::Fatal)?;
+        let view = self.tasks.task(&head.origin, &req.id)?;
+        Ok(plain(Response::Task(wire::task_proto(&view))))
+    }
+
+    /// Snapshot plus replay from `A2AB-After-Seq` (RFC-0002, L18). The snapshot is the reply;
+    /// the events follow it on the ev subject.
+    fn subscribe(
+        &mut self,
+        head: &RequestHead,
+        req: &pb::SubscribeToTaskRequest,
+        now: u64,
+    ) -> Result<Handled, RpcError> {
+        let _ = now;
+        let events = self
+            .tasks
+            .subscribe(&head.origin, &req.id, head.after_seq.unwrap_or(0))?;
+        let view = self.tasks.task(&head.origin, &req.id)?;
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut replay = Vec::with_capacity(events.len());
+        for event in &events {
+            let first = match artifact_key(event) {
+                Some(key) => !self.artifacts.contains(&key) && seen.insert(key),
+                None => false,
+            };
+            let response = match self.render(event, &view.context_id, first) {
+                Ok(response) => response,
+                Err(reason) => {
+                    self.audit(Some(&event.task_id), reason);
+                    continue;
+                }
+            };
+            match self.encode(&event.task_id, &event.msg_id, event.stream_ends(), response) {
+                Ok(outgoing) => replay.push(outgoing),
+                Err(err) => self.audit(Some(&event.task_id), format!("EVENT_NOT_ENCODABLE: {err}")),
+            }
+        }
+        let snapshot = pb::StreamResponse {
+            payload: Some(pb::stream_response::Payload::Task(wire::task_proto(&view))),
+        };
+        Ok(Handled {
+            response: Response::Stream(snapshot),
+            last_seq: Some(view.seq),
+            applied: Vec::new(),
+            replay,
+        })
+    }
+}
