@@ -63,7 +63,7 @@ Table 4.2: Transitions
 |---|---|---|---|---|
 | (create) | SUBMITTED | admission committed | - | [0005-024] |
 | (create) | REJECTED | admission refused (overload, quota) | RATE_LIMITED, QUEUE_FULL | [0005-028] |
-| (create) | FAILED | delegated task whose (agent, fingerprint) pair is already in the lineage; no backend start | LOOP_DETECTED | RFC-0006 [0006-045] |
+| (create) | FAILED | delegated task whose (agent, fingerprint) pair is already in the lineage, or whose receiving agent is already in the lineage (re-entrancy); no backend start | LOOP_DETECTED | RFC-0006 [0006-045], [0006-059] |
 | SUBMITTED | WORKING | backend session started | - | [0005-025] |
 | SUBMITTED | FAILED | backend could not start; workspace refused or lost; deadline reached | BACKEND_UNAVAILABLE, WORKSPACE_FAILED, DEADLINE_EXCEEDED | [0005-041], [0005-053] |
 | SUBMITTED | CANCELED | CancelTask | - | [0005-036] |
@@ -170,7 +170,7 @@ stateDiagram-v2
 | APPROVAL_TIMEOUT | FAILED | Approval expiry reached with no decision | 0005 (trigger), 0006 (expiry) |
 | APPROVAL_DENIED | FAILED | Operator denied and the backend ended the turn without success | 0006 |
 | BUDGET_EXHAUSTED | FAILED | A budget dimension is spent; the dimension is in detail | 0006 |
-| LOOP_DETECTED | FAILED | Cycle or repeated task fingerprint in the chain | 0006 |
+| LOOP_DETECTED | FAILED | Cycle, re-entry into an agent already in the chain, or repeated task fingerprint in the chain | 0006 |
 | CHILD_FAILED | FAILED | A delegated child ended FAILED; its code is in detail | 0006 |
 | BACKEND_CRASHED | FAILED | Backend exited, stopped responding, or was found mid-turn after restart | 0005 (rules), 0009 (detection) |
 | BACKEND_UNAVAILABLE | FAILED | Backend could not be started or initialized (driver spawn or initialize failure; peer unreachable at start) | 0009 |

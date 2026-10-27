@@ -108,8 +108,8 @@ The IPC types are defined in the `a2a-mcp` crate. They are not bus messages and 
 - [0015-054] The worker MUST evaluate a `send` in this order and stop at the first refusal, creating no child on refusal: (a) target is not in the peer allowlist, or is the worker's own agent id: `PERMISSION_DENIED`, with the same message for unknown and unlisted targets; (b) the origin breaker of RFC-0006 [0006-048] is open: `RATE_LIMITED` with detail `{"breaker": "open"}`; (c) the loop rule of [0015-057]: the delegating task fails with `LOOP_DETECTED`; (d) child preconditions of RFC-0006 [0006-033]: `BUDGET_EXHAUSTED` with detail `{"dimension": "<name>"}`; (e) rate limits of [0015-072]: `RATE_LIMITED`; (f) concurrency limits of [0015-071]: `QUEUE_FULL`.
 - [0015-055] The child allowance MUST be derived as RFC-0006 [0006-033] and [0006-034] require, with the same arithmetic as the `a2a-client` budget helper. Let `avail` = allowance - used - reserved. Then `child.max_hops = (max_hops - hops_used) - 1`, `child.max_depth = max_depth - 1`, `child.max_children = max_children - 1`, `child.max_tokens` and `child.max_cost_units` = `avail` (margin 0; the unlimited sentinel is kept), and `child.max_wall_ms` = `avail - 1000` (saturating). The worker MUST reserve the child allowance at creation and charge the child's final `BudgetUsage` to the parent at its terminal state.
 - [0015-056] The child's `Budget.chain` MUST be the delegating task's chain, root first, followed by one `Hop` naming the target agent and the fingerprint (RFC-0006 [0006-043]). Each task's `hops_used` MUST be incremented before that task's own backend turn (RFC-0006 [0006-036]); a child's first turn therefore sets its `hops_used` to 1.
-- [0015-057] The worker MUST compute the fingerprint of RFC-0006 [0006-044] over the target agent id and the normalized text. If the (target, fingerprint) pair already appears in the delegating task's chain, the worker MUST refuse the create with `LOOP_DETECTED` and fail the delegating task with `LOOP_DETECTED` (RFC-0006 [0006-045]).
-- [0015-058] Alternating delegations with different text are not loops (RFC-0006 [0006-046]). They are bounded by the hard caps of RFC-0006 [0006-042]: `max_hops`, `max_depth` and wall time.
+- [0015-057] The worker MUST compute the fingerprint of RFC-0006 [0006-044] over the target agent id and the normalized text. If the (target, fingerprint) pair already appears in the delegating task's chain, the worker MUST refuse the create with `LOOP_DETECTED` and fail the delegating task with `LOOP_DETECTED` (RFC-0006 [0006-045]). If the target agent id already appears in the delegating task's chain, the refusal is the same whatever the text (re-entrancy, RFC-0006 [0006-059]).
+- [0015-058] Alternating delegations are re-entrancies once they return to an agent already in the chain; the return is refused as in [0015-057] with `LOOP_DETECTED` (RFC-0006 [0006-046], [0006-059]). Only distinct-agent delegations reach the hard caps of RFC-0006 [0006-042]: `max_hops`, `max_depth` and wall time.
 - [0015-059] `a2a_send` without `contextId` MUST use the delegating task's `context_id`. A `contextId` supplied by the model MUST equal the delegating task's `context_id`; otherwise the call MUST be refused with `MALFORMED_MESSAGE`. The S1 case (RFC-0014 [0014-010]) therefore shares one context id.
 - [0015-060] The child Message MUST be sent with `A2AB-Sender` equal to the delegating worker's agent id (RFC-0002 [0002-011]). The worker MUST NOT set `A2AB-Origin`, which only the gateway may set (RFC-0002 [0002-014]). The child Message MUST carry `urn:a2abus:ext:budget:1` (the child `Budget`) and `urn:a2abus:ext:provenance:1` metadata naming the originating agent, the delegating task id and the hop number. Contexts are scoped to origin (RFC-0002 [0002-089]).
 - [0015-061] M1 child messages MUST NOT carry a `DelegationRef` (RFC-0007 section 4.8 tokens are scoped to a single task). The target agent's own approval policy governs the child (section 9, issue 4).
@@ -274,9 +274,12 @@ The shim returns this to omp as an MCP result, with the same framed text in `con
 
 Checks against case [0014-010]: parent and child reach COMPLETED; the review is an artifact on the child; both tasks share `context_id` `ctx-0193a6df`; the child's `hops_used` is 1.
 
+Context note: the child shares ctx-0193a6df with its parent ([0015-059]). If claude delegated back to omp in that context, the guard of [0015-115] fails the return at admission rather than letting it wait behind omp's open turn.
+
 Refusal example: a `send` to `codex`, which is not in omp's allowlist, returns `isError: true` with `PERMISSION_DENIED` and creates no child; the message is identical to the one for a nonexistent agent (section 4.6 [0015-054]).
 
 - [0015-114] The S1 run in section 5.2 SHOULD be executed end-to-end on the live omp and claude drivers before Milestone 1 acceptance; the spike result is the evidence.
+- [0015-115] In the S1 shared context, a child that delegates back to a chain member MUST NOT wait for the open turn: the receiving Worker creates the task FAILED with `LOOP_DETECTED` (RFC-0006 [0006-059]). Waiting would deadlock until the deadline, because turns are serialized per `context_id` (RFC-0009 [0009-020]).
 
 ## 6. Security considerations
 
@@ -286,7 +289,7 @@ Threats from `requirements.md` section 8 that this RFC addresses:
 - **T2 Confused deputy via delegation.** A child could use its own peers to reach further agents on the parent's behalf. Mitigations: each worker's peer allowlist is its own configuration and gives no transitive authority ([0015-112]); the chain is visible in the child's budget and provenance and in approval presentation ([0015-065]); child allowances are strictly smaller than the parent's ([0015-055]). M1 has no cross-task capability token (section 9, issue 4), so the residual is documented.
 - **T5 Credential leakage.** The shim holds no bus or provider credential ([0015-002], [0015-090]). The grant credential is never on a command line, in an `A2AB_*` value or in a log ([0015-081]), and is never forwarded to a child or peer ([0015-113]). Results and errors exclude paths, stack traces and credentials ([0015-036]).
 - **T14 Driver as privileged confused deputy.** The delegation endpoint exists only for agents with a delegation table ([0015-050]) and is reachable only by the worker's own OS user ([0015-004]). The worker, not the shim, is the only bus client ([0015-001]).
-- **T3 Ping-pong and cost runaway.** Loop rule ([0015-057]), hard caps ([0015-058]), the breaker ([0015-054]), concurrency and rate limits ([0015-071], [0015-072]).
+- **T3 Ping-pong and cost runaway.** Loop and re-entry rule ([0015-057]), hard caps for distinct-agent chains ([0015-058]), the breaker ([0015-054]), concurrency and rate limits ([0015-071], [0015-072]).
 - **T4 Replay.** Idempotency keys ([0015-048], [0015-062]) prevent duplicate children on retry.
 - **T9 Flooding.** Rate limits and in-flight caps refuse excess calls before any child is created ([0015-071], [0015-072]).
 - **T15 Approval bypass via native modes.** The shim exposes no approval answer. Child approvals are answered only on the child, by the operator ([0015-065]).
@@ -359,8 +362,8 @@ Levels: MUST = required for conformance of `a2a-mcp` and the worker delegation p
 | [0015-054] | Each refusal case (allowlist, self, breaker, loop, budget, rate, concurrency) creates no child and returns its reason | MUST |
 | [0015-055] | Child allowance equals the arithmetic of section 5.2 for the S1 example; unlimited sentinel preserved | MUST |
 | [0015-056] | S1 child chain is `[omp, claude]`; child `hops_used` 1 on first turn | MUST |
-| [0015-057] | Same (target, fingerprint) pair twice yields `LOOP_DETECTED` and fails the delegating task | MUST |
-| [0015-058] | Alternating different texts run until `max_hops`; end is `BUDGET_EXHAUSTED`, not `LOOP_DETECTED` | MUST |
+| [0015-057] | Target already in the delegating chain, with the same or different text, yields `LOOP_DETECTED` and fails the delegating task | MUST |
+| [0015-058] | Alternating A to B to A: the return is refused with `LOOP_DETECTED`; no child is created on the return; distinct-agent chains end by hard caps | MUST |
 | [0015-059] | Child shares the parent `context_id`; a different model-supplied `contextId` is refused | MUST |
 | [0015-060] | Child `A2AB-Sender` is the delegating agent; no `A2AB-Origin` is set; metadata keys present | MUST |
 | [0015-061] | Child message has no `DelegationRef` | MUST |
@@ -395,8 +398,9 @@ Levels: MUST = required for conformance of `a2a-mcp` and the worker delegation p
 | [0015-112] | Child with its own allowlist cannot reach a peer that only the parent could | MUST |
 | [0015-113] | Grant credential absent from child messages, peer messages and audit events | MUST |
 | [0015-114] | S1 end-to-end run (RFC-0014 [0014-010]) on the live omp and claude drivers | SHOULD |
+| [0015-115] | Child in the S1 shared context delegating back to omp is created FAILED LOOP_DETECTED at admission, with no queueing; both tasks terminal before the deadline | MUST |
 
-Note: the table above is the complete set of normative IDs of this RFC. IDs [0015-110] to [0015-113] are defined in section 6.1 and [0015-114] in section 5.2.
+Note: the table above is the complete set of normative IDs of this RFC. IDs [0015-110] to [0015-113] are defined in section 6.1, [0015-114] in section 5.2 and [0015-115] in section 5.2.
 
 ## 9. Open issues
 
