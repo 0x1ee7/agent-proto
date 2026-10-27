@@ -6,15 +6,19 @@ Protocol that carries the open A2A v1.0 protocol over a message bus (reference b
 
 | Path | Contents | Owner |
 |---|---|---|
-| `docs/requirements.md` | Requirements, decisions D1-D15, threat model | integrator |
-| `docs/rfcs/` | RFCs; start with `0000-process.md` and `0001-architecture.md` | RFC authors (one RFC per author at a time) |
+| `docs/requirements.md` | Requirements, decisions D1-D23, threat model (historical rationale) | integrator |
+| `docs/rfcs/` | RFCs 0000-0015 (normative); start with `0000-process.md` and `0001-architecture.md` | RFC authors (one RFC per author at a time) |
 | `docs/interop/` | Researched facts about A2A, Hermes, ACP, omp, Claude Code, NATS | research agents |
+| `docs/spikes/` | Observed results of spikes and the live end-to-end run | spike owners |
 | `proto/` | Protobuf for A2A-Bus extensions | integrator, with the owning RFC |
-| `crates/` | Rust workspace (layers and rules in RFC-0001) | crate owners |
+| `crates/` | Rust workspace (layers and rules in RFC-0001; each crate has its own AGENTS.md) | crate owners |
+| `spikes/` | Reproducible spike scripts and probes (not part of the workspace, not production code) | spike owners |
 
 ## Commands
 
-- Docs and protos only so far; no build. Rust workspace commands are added here when `crates/` exists: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace`.
+- Build and check: `cargo build --workspace`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`.
+- Live tests are `#[ignore]` and need tools under `.spikes/` (nats-server, stub servers, Node): see `spikes/*/README.md` and `docs/spikes/e2e-m1.md`; run with `-- --ignored`.
+- Run a crate's checks on its own while other agents work: `cargo test -p <crate>`, `cargo clippy -p <crate> --all-targets -- -D warnings`.
 
 ## Rules
 

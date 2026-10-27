@@ -1031,6 +1031,7 @@ dependencies = [
 name = "driver-acp"
 version = "0.1.0"
 dependencies = [
+ "a2a-core",
  "a2a-worker",
  "serde_json",
  "thiserror 2.0.21",
