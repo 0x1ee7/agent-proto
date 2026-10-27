@@ -239,6 +239,8 @@ pub enum EventBody {
     /// An artifact update (0005-022).
     Artifact {
         artifact_id: String,
+        /// True when the payload extends the stored artifact; false replaces it (A2A append).
+        append: bool,
         last_chunk: bool,
         payload: Vec<u8>,
     },
@@ -283,6 +285,39 @@ pub struct TaskOwner {
     pub context_id: String,
 }
 
+/// One artifact retained on a task (0005-022). `name` and `media_type` come from the
+/// artifact's first chunk or from its latest replacement; `payload` is the accumulated content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskArtifact {
+    /// Artifact id, unique within the task.
+    pub artifact_id: String,
+    /// Human readable name.
+    pub name: String,
+    /// Media type of the content.
+    pub media_type: String,
+    /// True once the artifact's last chunk has been appended or replaced in.
+    pub last_chunk: bool,
+    /// Accumulated content.
+    pub payload: Vec<u8>,
+}
+
+/// One appended or replacing chunk of an artifact (0005-022).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactChunk {
+    /// Artifact id, unique within the task.
+    pub artifact_id: String,
+    /// Human readable name.
+    pub name: String,
+    /// Media type of the content.
+    pub media_type: String,
+    /// True to extend the stored content; false to replace it (A2A append).
+    pub append: bool,
+    /// True when this is the artifact's last chunk.
+    pub last_chunk: bool,
+    /// Content bytes of this chunk.
+    pub payload: Vec<u8>,
+}
+
 /// Snapshot of a task for reads (0005-021).
 #[derive(Debug, Clone)]
 pub struct TaskView {
@@ -304,6 +339,8 @@ pub struct TaskView {
     pub deadline_ms: u64,
     /// Budget usage snapshot.
     pub usage: BudgetUsage,
+    /// Artifacts retained for the task, in creation order (0005-022).
+    pub artifacts: Vec<TaskArtifact>,
 }
 
 /// ListTasks query (0005-044).
@@ -357,6 +394,8 @@ struct TaskRecord {
     denied: bool,
     children: Vec<Child>,
     chain: Vec<StoredHop>,
+    #[serde(default)]
+    artifacts: Vec<TaskArtifact>,
 }
 
 /// Hop of the inbound chain in serializable form (the proto `Hop` has no serde).
@@ -384,6 +423,9 @@ pub struct ChildEnd {
     pub code: Option<String>,
     /// The child's final usage (0006-034).
     pub usage: Usage,
+    /// True when the delegating task's worker cancelled this child (0015-069). A child
+    /// that then ends CANCELED is cancelled by the parent and does not fail it.
+    pub cancelled_by_parent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -947,6 +989,7 @@ impl<S: TaskStore> Tasks<S> {
             cancel_requested: false,
             cancel_due_ms: None,
             denied: false,
+            artifacts: Vec::new(),
             children: Vec::new(),
             chain: s
                 .incoming
@@ -1150,22 +1193,64 @@ impl<S: TaskStore> Tasks<S> {
         self.commit(plan)
     }
 
-    /// Appends an artifact update as one event (0005-022). No state change.
+    /// Appends or replaces an artifact chunk as one event (0005-022) and retains the content on
+    /// the task. `append` extends an existing artifact and is refused once it is closed or when
+    /// its name or media type differ. Otherwise the chunk replaces the stored content and
+    /// metadata. Either form creates the artifact when its id is new.
     pub fn append_artifact(
         &mut self,
         task_id: &str,
-        artifact_id: String,
-        last_chunk: bool,
-        payload: Vec<u8>,
+        chunk: ArtifactChunk,
         now: u64,
     ) -> Result<(), TaskError> {
         let mut plan = self.plan(task_id)?;
         if plan.state() != TaskState::Working {
             return Err(active_error(plan.state()));
         }
+        let ArtifactChunk {
+            artifact_id,
+            name,
+            media_type,
+            append,
+            last_chunk,
+            payload,
+        } = chunk;
+        let position = plan
+            .rec
+            .artifacts
+            .iter()
+            .position(|a| a.artifact_id == artifact_id);
+        match position {
+            Some(index) if append => {
+                let stored = &mut plan.rec.artifacts[index];
+                if stored.last_chunk {
+                    return Err(TaskError::Invalid("artifact is already closed"));
+                }
+                if stored.name != name || stored.media_type != media_type {
+                    return Err(TaskError::Invalid("artifact metadata changed"));
+                }
+                stored.last_chunk = last_chunk;
+                stored.payload.extend_from_slice(&payload);
+            }
+            Some(index) => {
+                let stored = &mut plan.rec.artifacts[index];
+                stored.name = name;
+                stored.media_type = media_type;
+                stored.last_chunk = last_chunk;
+                stored.payload = payload.clone();
+            }
+            None => plan.rec.artifacts.push(TaskArtifact {
+                artifact_id: artifact_id.clone(),
+                name,
+                media_type,
+                last_chunk,
+                payload: payload.clone(),
+            }),
+        }
         plan.emit(
             EventBody::Artifact {
                 artifact_id,
+                append,
                 last_chunk,
                 payload,
             },
@@ -1328,7 +1413,13 @@ impl<S: TaskStore> Tasks<S> {
         let state = state_of(child.state);
         let code = child.failure.as_ref().map(|f| f.code.clone());
         let usage = *child.ledger.usage();
-        self.settle_with(parent_id, child_id, state, code, &usage, now)
+        let end = ChildEnd {
+            state,
+            code,
+            usage,
+            cancelled_by_parent: false,
+        };
+        self.settle_with(parent_id, child_id, end, now)
     }
 
     /// Settles a child that lives on another worker (RFC-0015, 0006-049). The
@@ -1340,18 +1431,22 @@ impl<S: TaskStore> Tasks<S> {
         end: ChildEnd,
         now: u64,
     ) -> Result<Vec<Effect>, TaskError> {
-        self.settle_with(parent_id, child_id, end.state, end.code, &end.usage, now)
+        self.settle_with(parent_id, child_id, end, now)
     }
 
     fn settle_with(
         &mut self,
         parent_id: &str,
         child_id: &str,
-        child_state: TaskState,
-        code: Option<String>,
-        usage: &Usage,
+        end: ChildEnd,
         now: u64,
     ) -> Result<Vec<Effect>, TaskError> {
+        let ChildEnd {
+            state: child_state,
+            code,
+            usage,
+            cancelled_by_parent,
+        } = end;
         if !child_state.is_terminal() {
             return Err(TaskError::Invalid("child task is not terminal"));
         }
@@ -1367,9 +1462,10 @@ impl<S: TaskStore> Tasks<S> {
         }
         entry.settled = true;
         let grant = entry.grant;
-        plan.rec.ledger.settle_child(&grant, usage);
+        plan.rec.ledger.settle_child(&grant, &usage);
         let parent_state = plan.state();
-        if child_state != TaskState::Completed && !parent_state.is_terminal() {
+        let parent_cancel = child_state == TaskState::Canceled && cancelled_by_parent;
+        if child_state != TaskState::Completed && !parent_cancel && !parent_state.is_terminal() {
             let code = code.unwrap_or_else(|| "CANCELED".to_owned());
             let detail =
                 serde_json::json!({"child_task_id": child_id, "child_code": code}).to_string();
@@ -1520,6 +1616,13 @@ impl<S: TaskStore> Tasks<S> {
     /// Reads one task for its origin (0005-004, 0005-021).
     pub fn task(&self, origin: &str, task_id: &str) -> Result<TaskView, TaskError> {
         Ok(view(self.visible(origin, task_id)?))
+    }
+
+    /// Unfiltered owner read of a task's retained artifacts (0005-022). `None` for an
+    /// unknown task.
+    #[must_use]
+    pub fn artifacts(&self, task_id: &str) -> Option<&[TaskArtifact]> {
+        self.tasks.get(task_id).map(|rec| rec.artifacts.as_slice())
     }
 
     /// Breaker status of an origin (RFC-0006 [0006-048]) for the RFC-0015 send path
@@ -1778,6 +1881,7 @@ fn view(rec: &TaskRecord) -> TaskView {
         updated_ms: rec.updated_ms,
         deadline_ms: rec.deadline_ms,
         usage: rec.ledger.usage_proto(),
+        artifacts: rec.artifacts.clone(),
     }
 }
 
@@ -2183,7 +2287,7 @@ mod tests {
         let mut tasks = fresh();
         let id = start(&mut tasks, "m1", T0);
         tasks
-            .append_artifact(&id, "a1".to_owned(), true, b"x".to_vec(), T0 + 1)
+            .append_artifact(&id, chunk("a1", true, b"x"), T0 + 1)
             .expect("artifact");
         tasks
             .backend_stopped(&id, StopReason::EndTurn, T0 + 2)
@@ -2236,7 +2340,7 @@ mod tests {
         let mut tasks = fresh();
         let id = start(&mut tasks, "m1", T0);
         tasks
-            .append_artifact(&id, "a1".to_owned(), true, Vec::new(), T0 + 1)
+            .append_artifact(&id, chunk("a1", true, b""), T0 + 1)
             .expect("artifact");
         let replay = tasks.subscribe(ORIGIN, &id, 1).expect("subscribe");
         assert_eq!(replay.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
@@ -2254,12 +2358,114 @@ mod tests {
         let mut tasks = fresh();
         let id = start(&mut tasks, "m1", T0);
         tasks
-            .append_artifact(&id, "a1".to_owned(), true, b"data".to_vec(), T0 + 1)
+            .append_artifact(&id, chunk("a1", true, b"data"), T0 + 1)
             .expect("artifact");
         assert_eq!(state(&tasks, &id), TaskState::Working);
         let last = tasks.events[&id].last().expect("event").clone();
         assert!(matches!(&last.body, EventBody::Artifact { .. }));
         assert!(!last.stream_ends());
+    }
+
+    fn chunk(artifact_id: &str, last_chunk: bool, payload: &[u8]) -> ArtifactChunk {
+        ArtifactChunk {
+            artifact_id: artifact_id.to_owned(),
+            name: "out.txt".to_owned(),
+            media_type: "text/plain".to_owned(),
+            append: true,
+            last_chunk,
+            payload: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn req_0005_022_chunks_accumulate_until_last_chunk() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks
+            .append_artifact(&id, chunk("a1", false, b"ab"), T0 + 1)
+            .expect("first chunk");
+        tasks
+            .append_artifact(&id, chunk("a1", true, b"cd"), T0 + 2)
+            .expect("last chunk");
+        assert_eq!(tasks.artifacts(&id).expect("known task").len(), 1);
+        let view = tasks.task(ORIGIN, &id).expect("view");
+        assert_eq!(view.artifacts.len(), 1);
+        let artifact = &view.artifacts[0];
+        assert_eq!(artifact.artifact_id, "a1");
+        assert_eq!(artifact.name, "out.txt");
+        assert_eq!(artifact.media_type, "text/plain");
+        assert_eq!(artifact.payload, b"abcd".to_vec());
+        assert!(artifact.last_chunk);
+    }
+
+    #[test]
+    fn req_0005_022_replace_overwrites_content_and_keeps_order() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks
+            .append_artifact(&id, chunk("a1", false, b"old"), T0 + 1)
+            .expect("a1");
+        tasks
+            .append_artifact(&id, chunk("a2", true, b"two"), T0 + 2)
+            .expect("a2");
+        let mut replace = chunk("a1", true, b"new");
+        replace.append = false;
+        tasks
+            .append_artifact(&id, replace, T0 + 3)
+            .expect("replace");
+        let view = tasks.task(ORIGIN, &id).expect("view");
+        let ids: Vec<&str> = view
+            .artifacts
+            .iter()
+            .map(|a| a.artifact_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a1", "a2"]);
+        assert_eq!(view.artifacts[0].payload, b"new".to_vec());
+        assert!(view.artifacts[0].last_chunk);
+        let last = tasks.events[&id].last().expect("event").clone();
+        assert!(matches!(
+            &last.body,
+            EventBody::Artifact { append: false, .. }
+        ));
+    }
+
+    #[test]
+    fn req_0005_022_append_refused_after_close_or_metadata_change() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks
+            .append_artifact(&id, chunk("a1", true, b"x"), T0 + 1)
+            .expect("close a1");
+        let closed = tasks
+            .append_artifact(&id, chunk("a1", true, b"y"), T0 + 2)
+            .expect_err("closed artifact");
+        assert!(matches!(closed, TaskError::Invalid(_)));
+        let mut renamed = chunk("a2", false, b"x");
+        tasks
+            .append_artifact(&id, renamed.clone(), T0 + 3)
+            .expect("open a2");
+        renamed.name = "other.txt".to_owned();
+        let changed = tasks
+            .append_artifact(&id, renamed, T0 + 4)
+            .expect_err("metadata change");
+        assert!(matches!(changed, TaskError::Invalid(_)));
+        let view = tasks.task(ORIGIN, &id).expect("view");
+        assert_eq!(view.artifacts[0].payload, b"x".to_vec());
+        assert_eq!(view.artifacts[1].payload, b"x".to_vec());
+    }
+
+    #[test]
+    fn req_0005_022_artifacts_survive_record_serialization() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks
+            .append_artifact(&id, chunk("a1", true, b"durable"), T0 + 1)
+            .expect("artifact");
+        let record = tasks.tasks.get(&id).expect("record");
+        let json = serde_json::to_string(record).expect("serialize");
+        let restored: TaskRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.artifacts, record.artifacts);
+        assert_eq!(restored.artifacts[0].payload, b"durable".to_vec());
     }
 
     #[test]
@@ -2692,6 +2898,7 @@ mod tests {
                     state: TaskState::Completed,
                     code: None,
                     usage: Usage::default(),
+                    cancelled_by_parent: false,
                 },
                 T0 + 1,
             )
@@ -2721,6 +2928,53 @@ mod tests {
                     state: TaskState::Failed,
                     code: Some("BACKEND_ERROR".to_owned()),
                     usage: Usage::default(),
+                    cancelled_by_parent: false,
+                },
+                T0 + 1,
+            )
+            .expect("settle");
+        assert_eq!(state(&tasks, &parent), TaskState::Failed);
+        assert_eq!(
+            failure_code(&tasks, &parent),
+            Some(FailureCode::ChildFailed)
+        );
+    }
+    #[test]
+    fn req_0015_069_parent_cancelled_child_does_not_fail_parent() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        let (child, _grant) = tasks.delegate(&parent).expect("delegate");
+        tasks
+            .settle_remote_child(
+                &parent,
+                &child,
+                ChildEnd {
+                    state: TaskState::Canceled,
+                    code: None,
+                    usage: Usage::default(),
+                    cancelled_by_parent: true,
+                },
+                T0 + 1,
+            )
+            .expect("settle");
+        assert_eq!(state(&tasks, &parent), TaskState::Working);
+        assert_eq!(failure_code(&tasks, &parent), None);
+    }
+
+    #[test]
+    fn req_0015_069_other_child_cancel_still_fails_parent() {
+        let mut tasks = fresh();
+        let parent = start(&mut tasks, "p", T0);
+        let (child, _grant) = tasks.delegate(&parent).expect("delegate");
+        tasks
+            .settle_remote_child(
+                &parent,
+                &child,
+                ChildEnd {
+                    state: TaskState::Canceled,
+                    code: None,
+                    usage: Usage::default(),
+                    cancelled_by_parent: false,
                 },
                 T0 + 1,
             )
@@ -2745,6 +2999,7 @@ mod tests {
                     state: TaskState::Working,
                     code: None,
                     usage: Usage::default(),
+                    cancelled_by_parent: false,
                 },
                 T0 + 1,
             ),
@@ -2758,6 +3013,7 @@ mod tests {
                     state: TaskState::Completed,
                     code: None,
                     usage: Usage::default(),
+                    cancelled_by_parent: false,
                 },
                 T0 + 1,
             ),
