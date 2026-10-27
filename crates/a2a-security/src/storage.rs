@@ -2,7 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use a2a_types::ids::AgentId;
@@ -10,7 +10,9 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, KeypairBytes};
 
 use crate::error::SecurityError;
 use crate::identity::{Ed25519Signer, Kid, Signer, encode_public_key};
-use crate::trust::{KeyStatus, OPERATOR_AGENT, Role, TrustEntry, TrustStore};
+use crate::trust::{
+    KeyStatus, MAX_TRUST_BYTES, OPERATOR_AGENT, Role, SCHEMA, TrustEntry, TrustStore,
+};
 
 const APP_DIR: &str = "a2abus";
 const KEY_DIR: &str = "keys";
@@ -357,6 +359,132 @@ pub fn generate_signer(
     Ok(signer)
 }
 
+/// Ensures the operator key exists and that `trust_path` names it, creating both on first use
+/// ([0007-006], [0007-010..012], [0007-020..021], [0012-043], [0012-058]). Returns the operator kid.
+///
+/// An absent trust file is created with its schema header and the new operator entry. A present file
+/// with exactly one active operator entry is reused unchanged once its key file loads. An operator
+/// entry whose key file is missing or unusable is refused and never overwritten. Key bytes are never
+/// returned or logged.
+pub fn ensure_operator_key(
+    trust_path: &Path,
+    creds_dir: &Path,
+    roots: &[PathBuf],
+) -> Result<Kid, SecurityError> {
+    let operator = AgentId::parse(OPERATOR_AGENT)
+        .map_err(|_| SecurityError::Invalid("operator agent id is invalid"))?;
+    match fs::symlink_metadata(trust_path) {
+        Ok(_) => {
+            check_trust_file(trust_path)?;
+            let text = read_limited(trust_path, MAX_TRUST_BYTES)?;
+            let store = TrustStore::parse(&text)?;
+            let operators: Vec<&TrustEntry> = store
+                .entries()
+                .filter(|entry| matches!(entry.role(), Role::Operator))
+                .collect();
+            match operators.as_slice() {
+                [] => provision_operator_key(trust_path, creds_dir, roots, &operator, &text),
+                [entry] if matches!(entry.status(), KeyStatus::Active) => {
+                    let kid = entry.kid().clone();
+                    let path = operator_key_path(creds_dir, &kid)?;
+                    load_key_file(&path, &store, &operator, roots)
+                        .map_err(|_| unusable_operator_key())?;
+                    Ok(kid)
+                }
+                _ => Err(SecurityError::Key(
+                    "trust file has no single active operator key; it was not replaced".to_owned(),
+                )),
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => provision_operator_key(
+            trust_path,
+            creds_dir,
+            roots,
+            &operator,
+            &format!("schema = \"{SCHEMA}\"\n"),
+        ),
+        Err(error) => Err(SecurityError::Io(error)),
+    }
+}
+
+fn unusable_operator_key() -> SecurityError {
+    SecurityError::Key(
+        "operator key file is missing or unusable; the trust file names it and it was not overwritten"
+            .to_owned(),
+    )
+}
+
+/// Creates the operator key file and writes `base` with the operator entry appended ([0007-006]).
+/// The trust text is validated before any file is created. A failure after the key file exists
+/// removes the key file.
+fn provision_operator_key(
+    trust_path: &Path,
+    creds_dir: &Path,
+    roots: &[PathBuf],
+    operator: &AgentId,
+    base: &str,
+) -> Result<Kid, SecurityError> {
+    let signer = Ed25519Signer::generate(operator)?;
+    let kid = signer.kid().clone();
+    let key_path = operator_key_path(creds_dir, &kid)?;
+    refuse_under_roots(&key_path, roots)?;
+    let pem = signer
+        .signing_key()
+        .to_pkcs8_pem(Default::default())
+        .map_err(|_| SecurityError::Key("PKCS#8 encoding failed".to_owned()))?;
+    let trust_text = with_operator_entry(base, &kid, &signer.public_key());
+    TrustStore::parse(&trust_text)?;
+    let trust_dir = trust_path
+        .parent()
+        .ok_or(SecurityError::Invalid("trust file has no parent directory"))?;
+    create_key_dir(trust_dir)?;
+    create_key_dir(creds_dir)?;
+    check_key_dir(creds_dir, roots)?;
+    write_private_file(&key_path, pem.as_bytes())?;
+    if let Err(error) = write_trust_atomically(trust_path, &trust_text) {
+        let _ = fs::remove_file(&key_path);
+        return Err(error);
+    }
+    Ok(kid)
+}
+
+/// Appends the operator `[[key]]` block to trust text `base`, adding a separating newline if needed.
+fn with_operator_entry(base: &str, kid: &Kid, public_key: &[u8; 32]) -> String {
+    let separator = if base.ends_with('\n') { "" } else { "\n" };
+    let pk = encode_public_key(public_key);
+    format!(
+        "{base}{separator}[[key]]\nkid = \"{kid}\"\nagent = \"{OPERATOR_AGENT}\"\nrole = \"operator\"\ntenants = [\"local\"]\npublic_key = \"{pk}\"\nstatus = \"active\"\n"
+    )
+}
+
+/// Creates an owner-only file, writes and syncs `bytes`, and removes the file if writing fails.
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), SecurityError> {
+    let mut file = create_private_file(path)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    written.map_err(|error| {
+        let _ = fs::remove_file(path);
+        SecurityError::Io(error)
+    })
+}
+
+/// Replaces the trust file with `text` through an owner-only temporary file in the same directory
+/// ([0007-012]). The temporary file is removed when any step fails.
+fn write_trust_atomically(path: &Path, text: &str) -> Result<(), SecurityError> {
+    let dir = path
+        .parent()
+        .ok_or(SecurityError::Invalid("trust file has no parent directory"))?;
+    let mut salt = [0u8; 8];
+    getrandom::fill(&mut salt).map_err(|_| SecurityError::Random)?;
+    let suffix = u64::from_le_bytes(salt);
+    let temp = dir.join(format!(".{TRUST_FILE}.{suffix:016x}.tmp"));
+    write_private_file(&temp, text.as_bytes())?;
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        SecurityError::Io(error)
+    })
+}
+
 /// Canonicalizes the nearest existing ancestor and refuses paths under a workspace root ([0007-014]).
 fn refuse_under_roots(path: &Path, roots: &[PathBuf]) -> Result<(), SecurityError> {
     let resolved = resolve_existing(path)?;
@@ -476,16 +604,23 @@ fn create_private_file(path: &Path) -> Result<fs::File, SecurityError> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    let user = current_user().map_err(SecurityError::Storage)?;
-    let grant = format!("{user}:F");
-    run_icacls(&[
-        path.as_os_str().to_owned(),
-        "/inheritance:r".into(),
-        "/grant:r".into(),
-        grant.into(),
-    ])
-    .map_err(SecurityError::Storage)?;
-    Ok(file)
+    let applied = current_user().and_then(|user| {
+        let grant = format!("{user}:F");
+        run_icacls(&[
+            path.as_os_str().to_owned(),
+            "/inheritance:r".into(),
+            "/grant:r".into(),
+            grant.into(),
+        ])
+    });
+    match applied {
+        Ok(_) => Ok(file),
+        Err(message) => {
+            drop(file);
+            let _ = fs::remove_file(path);
+            Err(SecurityError::Storage(message))
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -702,5 +837,123 @@ mod tests {
         assert_eq!(reloaded.kid(), signer.kid());
         assert_eq!(reloaded.sign_bytes(b"m"), signer.sign_bytes(b"m"));
         let _ = fs::remove_dir_all(&config);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("a2a-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn req_0007_006_first_call_creates_operator_key_and_trust_entry() {
+        let base = scratch("bootstrap-first");
+        let trust_path = base.join("config").join("trust.toml");
+        let creds = base.join("creds");
+        let kid = ensure_operator_key(&trust_path, &creds, &[]).expect("bootstrapped");
+        let key = operator_key_path(&creds, &kid).expect("operator kid");
+        assert!(key.starts_with(&creds) && key.is_file());
+        assert!(!base.join("config").join("keys").exists());
+        let trust = TrustStore::load(&trust_path).expect("trust file loads");
+        let entry = trust.entry(&kid.to_string()).expect("operator entry");
+        assert!(matches!(entry.role(), Role::Operator));
+        assert!(matches!(entry.status(), KeyStatus::Active));
+        assert_eq!(entry.agent().as_str(), OPERATOR_AGENT);
+        let operator = AgentId::parse(OPERATOR_AGENT).expect("id");
+        let loaded = load_key_file(&key, &trust, &operator, &[]).expect("key file loads");
+        assert_eq!(loaded.kid(), &kid);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn req_0007_006_second_call_returns_same_kid_and_changes_no_bytes() {
+        let base = scratch("bootstrap-second");
+        let trust_path = base.join("config").join("trust.toml");
+        let creds = base.join("creds");
+        let first = ensure_operator_key(&trust_path, &creds, &[]).expect("first call");
+        let key = operator_key_path(&creds, &first).expect("operator kid");
+        let trust_before = fs::read(&trust_path).expect("trust bytes");
+        let key_before = fs::read(&key).expect("key bytes");
+        let second = ensure_operator_key(&trust_path, &creds, &[]).expect("second call");
+        assert_eq!(second, first);
+        assert_eq!(fs::read(&trust_path).expect("trust bytes"), trust_before);
+        assert_eq!(fs::read(&key).expect("key bytes"), key_before);
+        let names: Vec<OsString> = fs::read_dir(base.join("config"))
+            .expect("config dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect();
+        assert_eq!(names, [OsString::from("trust.toml")]);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn req_0007_011_operator_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("bootstrap-mode");
+        let creds = base.join("creds");
+        let kid = ensure_operator_key(&base.join("config").join("trust.toml"), &creds, &[])
+            .expect("bootstrapped");
+        let key = operator_key_path(&creds, &kid).expect("operator kid");
+        let mode = fs::metadata(&key)
+            .expect("key metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn req_0007_014_operator_key_under_workspace_root_is_not_created() {
+        let base = scratch("bootstrap-root");
+        let root = base.join("workspace");
+        fs::create_dir_all(&root).expect("workspace root");
+        let creds = root.join("creds");
+        let trust_path = base.join("config").join("trust.toml");
+        let refused = ensure_operator_key(&trust_path, &creds, std::slice::from_ref(&root));
+        assert!(matches!(refused, Err(SecurityError::Invalid(_))));
+        assert!(!creds.exists());
+        assert!(!trust_path.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn req_0007_006_existing_operator_entry_without_key_file_is_refused() {
+        let base = scratch("bootstrap-missing");
+        let trust_path = base.join("config").join("trust.toml");
+        let creds = base.join("creds");
+        let kid = ensure_operator_key(&trust_path, &creds, &[]).expect("bootstrapped");
+        let key = operator_key_path(&creds, &kid).expect("operator kid");
+        let trust_before = fs::read(&trust_path).expect("trust bytes");
+        fs::remove_file(&key).expect("remove key");
+        let refused = ensure_operator_key(&trust_path, &creds, &[]);
+        assert!(matches!(
+            refused,
+            Err(SecurityError::Key(ref message)) if message.contains("not overwritten")
+        ));
+        assert!(!key.exists());
+        assert_eq!(fs::read(&trust_path).expect("trust bytes"), trust_before);
+        fs::write(&key, "not a key").expect("unusable key file");
+        let unusable = ensure_operator_key(&trust_path, &creds, &[]);
+        assert!(matches!(unusable, Err(SecurityError::Key(_))));
+        assert_eq!(fs::read_to_string(&key).expect("key text"), "not a key");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn req_0007_006_bootstrap_appends_to_existing_trust_file() {
+        let base = scratch("bootstrap-append");
+        let config = base.join("config");
+        fs::create_dir_all(&config).expect("config dir");
+        let trust_path = config.join("trust.toml");
+        let body = crate::testkit::key_block("alpha", 1, "");
+        write_private_file(&trust_path, crate::testkit::file(&body).as_bytes())
+            .expect("trust file");
+        let kid = ensure_operator_key(&trust_path, &base.join("creds"), &[]).expect("bootstrapped");
+        let trust = TrustStore::load(&trust_path).expect("trust file loads");
+        assert!(trust.entry(&kid.to_string()).is_some());
+        assert_eq!(trust.entries().count(), 2);
+        let _ = fs::remove_dir_all(&base);
     }
 }

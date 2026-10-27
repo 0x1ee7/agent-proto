@@ -309,6 +309,7 @@ pub struct BusSettings {
 pub struct Config {
     tenant: TenantId,
     state_dir: PathBuf,
+    trust_file: PathBuf,
     repos_root: Option<PathBuf>,
     operator_id: String,
     drain: Duration,
@@ -405,6 +406,13 @@ impl Config {
         )
         .map_err(|detail| ConfigError::new("[log]", detail))?;
 
+        let raw_security: RawSecurity =
+            decode_table(&root, "security", "[security]")?.unwrap_or_default();
+        let trust_file = match raw_security.trust_file {
+            Some(file) => absolute(&file, "[security]", "trust_file")?,
+            None => a2a_security::storage::trust_file(&state_dir),
+        };
+
         let raw_agents = raw_agent_tables(&root)?;
         let mut agents = Vec::with_capacity(raw_agents.len());
         for (index, raw) in raw_agents.into_iter().enumerate() {
@@ -415,6 +423,7 @@ impl Config {
         Ok(Self {
             tenant,
             state_dir,
+            trust_file,
             repos_root,
             operator_id,
             drain: Duration::from_millis(drain_ms),
@@ -436,6 +445,13 @@ impl Config {
     #[must_use]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// Trust file that holds the operator allowlist (RFC-0007 [0007-020]). Defaults to
+    /// `<state>/trust.toml`; `[security] trust_file` overrides it.
+    #[must_use]
+    pub fn trust_file(&self) -> &Path {
+        &self.trust_file
     }
 
     /// Root under which repositories may be configured, if any.
@@ -586,6 +602,13 @@ struct RawLog {
     format: Option<String>,
 }
 
+/// `[security]`: `trust_file` overrides the default `<state>/trust.toml` (RFC-0007 [0007-020]).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSecurity {
+    trust_file: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawWorkspace {
@@ -651,13 +674,14 @@ struct RawAgent {
 // ---------- decoding helpers --------------------------------------------------------
 
 fn check_root_keys(root: &toml::Table) -> Result<(), ConfigError> {
-    const ALLOWED: [&str; 7] = [
+    const ALLOWED: [&str; 8] = [
         "config_version",
         "tenant",
         "paths",
         "supervisor",
         "bus",
         "log",
+        "security",
         "agent",
     ];
     for key in root.keys() {
@@ -1465,6 +1489,24 @@ mod tests {
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
         Config::parse(text, state())
+    }
+
+    #[test]
+    fn req_0007_020_trust_file_defaults_to_state_dir() {
+        let cfg = parse(&doc("")).unwrap();
+        assert_eq!(cfg.trust_file(), cfg.state_dir().join("trust.toml"));
+    }
+
+    #[test]
+    fn req_0007_020_trust_file_override_is_read() {
+        let path = abs("operator-trust.toml").replace('\\', "\\\\");
+        let cfg = parse(&doc(&format!("\n[security]\ntrust_file = \"{path}\"\n"))).unwrap();
+        assert_eq!(cfg.trust_file(), Path::new(&abs("operator-trust.toml")));
+    }
+
+    #[test]
+    fn req_0007_020_security_table_is_strict() {
+        assert!(parse(&doc("\n[security]\nfile = \"x\"\n")).is_err());
     }
 
     #[test]

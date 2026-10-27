@@ -262,6 +262,13 @@ impl Supervisor {
     pub fn run(&mut self) -> Result<(), SupervisorError> {
         let state = self.config.state_dir().to_path_buf();
         creds::ensure_layout(&state)?;
+        let roots: Vec<PathBuf> = self
+            .config
+            .agents()
+            .iter()
+            .filter_map(|spec| spec.repo.clone())
+            .collect();
+        creds::ensure_operator(&state, self.config.trust_file(), &roots)?;
         self.check_path_budget()?;
         reclaim_stale(&state)?;
         let mut keys = Vec::new();
@@ -513,6 +520,10 @@ impl Supervisor {
             (
                 "A2AB_CREDS_FILE".to_owned(),
                 creds::seed_path(&state, &spec.id).display().to_string(),
+            ),
+            (
+                "A2AB_TRUST_FILE".to_owned(),
+                self.config.trust_file().display().to_string(),
             ),
         ];
         let delegation = if spec.is_worker() && !spec.delegation.peers.is_empty() {

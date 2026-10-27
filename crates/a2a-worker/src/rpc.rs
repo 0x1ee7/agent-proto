@@ -7,7 +7,9 @@ use std::collections::BTreeSet;
 use a2a_core::budget::{self, Allowance};
 use a2a_core::envelope::{Inbound, ReplyOptions, RequestBody, RequestHead};
 use a2a_core::errors::{StatusExtras, WireError};
-use a2a_core::task::{Admission, Effect, Incoming, ListQuery, Submission, TaskError, TaskStore};
+use a2a_core::task::{
+    Admission, Effect, EventBody, Incoming, ListQuery, Submission, TaskError, TaskStore, TaskView,
+};
 use a2a_types::extension::{Activation, ExtensionError, read_activated};
 use a2a_types::failure::FailureCode;
 use a2a_types::ids::{ContextId, TaskId};
@@ -455,7 +457,39 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
 
     fn get_task(&self, head: &RequestHead, req: &pb::GetTaskRequest) -> Result<Handled, RpcError> {
         let view = self.tasks.task(&head.origin, &req.id)?;
-        Ok(plain(Response::Task(wire::task_proto(&view))))
+        Ok(plain(Response::Task(self.task_with_approval(&head.origin, &view)?)))
+    }
+
+    /// The task snapshot with its open approval request, when the task awaits one (0006-007).
+    fn task_with_approval(&self, origin: &str, view: &TaskView) -> Result<pb::Task, RpcError> {
+        let mut task = wire::task_proto(view);
+        if let Some(body) = self.pending_approval(origin, view)? {
+            wire::attach_approval(&mut task, body);
+        }
+        Ok(task)
+    }
+
+    /// The open approval request of an INPUT_REQUIRED task, read from its status events. The
+    /// latest status event decides: a decision or expiry leaves INPUT_REQUIRED, and a peer's
+    /// input request (0005-008) carries no approval id.
+    fn pending_approval(&self, origin: &str, view: &TaskView) -> Result<Option<Struct>, RpcError> {
+        if view.state != pb::TaskState::InputRequired {
+            return Ok(None);
+        }
+        let events = self.tasks.subscribe(origin, &view.task_id, 0)?;
+        let latest_status = events.iter().rev().find_map(|event| match &event.body {
+            EventBody::Status { approval, .. } => Some(approval.as_deref()),
+            _ => None,
+        });
+        let Some(Some(request_id)) = latest_status else {
+            return Ok(None);
+        };
+        let Some(request) = self.tasks.approval_request(request_id) else {
+            return Ok(None);
+        };
+        wire::approval_metadata(&request)
+            .map(Some)
+            .map_err(|_| RpcError::invalid("APPROVAL_NOT_ENCODABLE"))
     }
 
     fn list_tasks(
@@ -482,7 +516,11 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             status_after_ms,
         };
         let page = self.tasks.list(&head.origin, &query)?;
-        let tasks: Vec<pb::Task> = page.tasks.iter().map(wire::task_proto).collect();
+        let tasks = page
+            .tasks
+            .iter()
+            .map(|view| self.task_with_approval(&head.origin, view))
+            .collect::<Result<Vec<pb::Task>, RpcError>>()?;
         Ok(plain(Response::Tasks(pb::ListTasksResponse {
             page_size: i32::try_from(tasks.len()).unwrap_or(i32::MAX),
             tasks,

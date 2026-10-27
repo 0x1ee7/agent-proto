@@ -196,3 +196,65 @@ fn req_0006_017_approval_timeout_fails_task_with_detail() {
         assert!(detail.contains("approval window expired"), "{detail}");
     });
 }
+
+/// 0006-007: GetTask and ListTasks carry the open approval of an INPUT_REQUIRED task, so a
+/// client that missed the event can still answer it; once the task completes the snapshot no
+/// longer carries it.
+#[test]
+fn req_0006_007_snapshots_carry_open_approval() {
+    let mut rig = rig();
+    let (bus, mock, store) = (&rig.bus, &rig.mock, &rig.store);
+    drive(&mut rig.worker, async {
+        let mut events = observer(bus, "obs-0006-007").await;
+        mock.enqueue(vec![permission("p1", "edit"), completed()]);
+        let task = submit(bus, "write").await;
+        let (_, request) = next_approval(&mut events, &task.id).await;
+
+        let got = get(bus, &task.id).await;
+        assert_eq!(
+            snapshot_approval(&got).map(|r| r.request_id),
+            Some(request.request_id.clone())
+        );
+
+        let reply = call(
+            bus,
+            REQUESTER,
+            Op::List,
+            RequestBody::ListTasks(pb::ListTasksRequest {
+                tenant: TENANT.to_owned(),
+                ..Default::default()
+            }),
+            Vec::new(),
+        )
+        .await;
+        let listed = envelope::decode_reply::<pb::ListTasksResponse>(&reply).unwrap();
+        let [listed_task] = listed.tasks.as_slice() else {
+            panic!("expected exactly one listed task, got {}", listed.tasks.len());
+        };
+        assert_eq!(
+            snapshot_approval(listed_task).map(|r| r.request_id),
+            Some(request.request_id.clone())
+        );
+
+        let digest = approval_digest(store, &request.request_id);
+        decide(
+            bus,
+            &task.id,
+            &task.context_id,
+            &decision(&request, ALLOW_ONCE_ID, &digest),
+        )
+        .await
+        .unwrap();
+        let done = wait_for_state(bus, &task.id, pb::TaskState::Completed).await;
+        assert!(snapshot_approval(&done).is_none());
+    });
+}
+
+/// The approval request carried by a task snapshot's status message (0006-007).
+fn snapshot_approval(task: &pb::Task) -> Option<a2abus::ApprovalRequest> {
+    let meta = task.status.as_ref()?.message.as_ref()?.metadata.as_ref()?;
+    let Kind::StructValue(data) = meta.fields.get(APPROVAL)?.kind.as_ref()? else {
+        return None;
+    };
+    serde_json::from_value(serde_json::to_value(data).ok()?).ok()
+}

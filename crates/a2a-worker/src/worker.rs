@@ -91,6 +91,8 @@ pub struct Worker<B: Bus, D: Backend, S: TaskStore> {
     /// Backend permission requests keyed by the approval request id that answers them.
     pub(crate) permissions: BTreeMap<String, Vec<Offered>>,
     pub(crate) restarts_seen: u32,
+    /// Whether the backend was live at the last health check (a start is not a loss).
+    pub(crate) live_seen: bool,
     /// `(task, artifact)` pairs already published; the next chunk is an append.
     pub(crate) artifacts: BTreeSet<(String, String)>,
     pub(crate) audit: Vec<AuditNote>,
@@ -148,7 +150,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         let pattern = rpc_pattern(&config)?;
         let requests = bus.serve(&config.principal, &pattern).await?;
         let (tasks, effects) = Tasks::open(store, config.tasks.clone(), now)?;
-        let restarts_seen = backend.health().restarts;
+        let initial = backend.health();
         let presence = config
             .publication
             .as_ref()
@@ -169,7 +171,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             deferred_ends: BTreeMap::new(),
             cancel_deadlines: BTreeMap::new(),
             permissions: BTreeMap::new(),
-            restarts_seen,
+            restarts_seen: initial.restarts,
+            live_seen: initial.live,
             artifacts: BTreeSet::new(),
             audit: Vec::new(),
             audit_sink: None,
@@ -638,10 +641,17 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
 
     fn check_health(&mut self, now: u64) -> Result<Vec<Effect>, WorkerError> {
         let health = self.backend.health();
-        if health.live && health.restarts == self.restarts_seen {
+        let restarted = health.restarts != self.restarts_seen;
+        let was_live = std::mem::replace(&mut self.live_seen, health.live);
+        self.restarts_seen = health.restarts;
+        // A backend that is still starting has no turn to lose: its turns wait for it. Only a
+        // live backend that stops, or a restart, drops the open turns.
+        if health.live && !restarted {
             return Ok(Vec::new());
         }
-        self.restarts_seen = health.restarts;
+        if !health.live && !was_live && !restarted {
+            return Ok(Vec::new());
+        }
         let text = match (health.live, health.reason.as_deref()) {
             (false, Some(reason)) => format!("backend not live: {reason}"),
             (false, None) => "backend not live".to_owned(),
@@ -687,7 +697,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             FaultKind::Internal => StopReason::Unknown,
         };
         let open: Vec<String> = self.open.keys().cloned().collect();
-        let carried = serde_json::json!({"kind": format!("{kind:?}"), "detail": detail});
+        let carried = cause(&format!("{kind:?}"), detail);
         let mut out = Vec::new();
         for task in open {
             out.extend(self.close_turn_with_detail(&task, reason, Some(carried.clone()), now)?);
@@ -995,7 +1005,7 @@ fn tier_of(tool_kind: &str) -> Tier {
 /// the raw text.
 pub(crate) fn cause(kind: &str, text: &str) -> serde_json::Value {
     let detail = a2a_security::redact::redact(text).unwrap_or_else(|_| "[redacted]".to_owned());
-    serde_json::json!({ "kind": kind, "detail": detail })
+    serde_json::Value::String(format!("{kind}: {detail}"))
 }
 
 fn start_failure(err: &BackendError) -> StopReason {

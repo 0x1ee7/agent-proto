@@ -9,6 +9,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use a2a_security::identity::Kid;
+use a2a_security::storage;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Serialize;
@@ -51,12 +54,31 @@ pub enum CredsError {
     /// A delegation file could not be encoded.
     #[error("delegation file encoding failed: {0}")]
     Encode(String),
+    /// Operator key or trust entry is missing or unusable (RFC-0007 [0007-006], RFC-0012 [0012-043]).
+    #[error("operator key: {0}")]
+    Operator(String),
 }
 
 /// Path of the NKey seed file of `identity` (0012-023): `<state>/creds/<identity>.nk`.
 #[must_use]
 pub fn seed_path(state_dir: &Path, id: &str) -> PathBuf {
     state_dir.join(CREDS_DIR).join(format!("{id}.nk"))
+}
+
+/// Creates the operator key `<state>/creds/operator-<K>.key` and its allowlist entry on first
+/// start, and changes nothing once both exist ([0007-006], [0012-043]). `roots` are the
+/// workspace roots the key must stay out of ([0007-014]).
+///
+/// # Errors
+/// Returns [`CredsError::Operator`] when the trust file is invalid, the key file is missing for an
+/// existing operator entry, or the key cannot be written with owner-only permissions.
+pub fn ensure_operator(
+    state_dir: &Path,
+    trust_file: &Path,
+    roots: &[PathBuf],
+) -> Result<Kid, CredsError> {
+    storage::ensure_operator_key(trust_file, &state_dir.join(CREDS_DIR), roots)
+        .map_err(|err| CredsError::Operator(err.to_string()))
 }
 
 /// Creates the state directory tree with owner-only directories (0012-006). Existing
@@ -254,6 +276,7 @@ pub fn remove_delegation(path: &Path) -> io::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use a2a_security::identity::Signer;
 
     #[test]
     fn stable_0012_023_seed_path_is_under_creds() {
@@ -325,5 +348,87 @@ mod tests {
         remove_delegation(&path).expect("remove");
         assert!(!path.exists());
         remove_delegation(&path).expect("idempotent");
+    }
+
+    fn operator_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        ensure_layout(&state).expect("layout");
+        let trust = dir.path().join("user").join("trust.toml");
+        (dir, state, trust)
+    }
+
+    #[test]
+    fn req_0007_006_first_start_creates_operator_key_and_trust_entry() {
+        let (dir, state, trust) = operator_fixture();
+        let kid = ensure_operator(&state, &trust, &[]).expect("bootstrap");
+        assert_eq!(kid.agent().as_str(), "operator");
+        let key = storage::operator_key_path(&state.join(CREDS_DIR), &kid).expect("key path");
+        assert!(key.is_file(), "operator key must be in creds/");
+        assert!(!dir.path().join("user").join("keys").exists());
+        let store = a2a_security::trust::TrustStore::load(&trust).expect("trust loads");
+        let agent = a2a_types::ids::AgentId::parse("operator").expect("agent");
+        let entry = store.active_for_agent(&agent).expect("operator entry");
+        assert_eq!(entry.kid().to_string(), kid.to_string());
+        let signer = storage::load_key_file(&key, &store, &agent, &[]).expect("key loads");
+        assert_eq!(signer.kid().to_string(), kid.to_string());
+    }
+
+    #[test]
+    fn req_0007_006_second_start_is_idempotent() {
+        let (_dir, state, trust) = operator_fixture();
+        let first = ensure_operator(&state, &trust, &[]).expect("first");
+        let key = storage::operator_key_path(&state.join(CREDS_DIR), &first).expect("key path");
+        let trust_before = fs::read(&trust).expect("read trust");
+        let key_before = fs::read(&key).expect("read key");
+        let second = ensure_operator(&state, &trust, &[]).expect("second");
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(fs::read(&trust).expect("read trust"), trust_before);
+        assert_eq!(fs::read(&key).expect("read key"), key_before);
+    }
+
+    #[test]
+    fn req_0007_010_operator_key_is_owner_only() {
+        let (_dir, state, trust) = operator_fixture();
+        let kid = ensure_operator(&state, &trust, &[]).expect("bootstrap");
+        let key = storage::operator_key_path(&state.join(CREDS_DIR), &kid).expect("key path");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o077, 0, "group and other bits must be clear");
+        }
+        let store = a2a_security::trust::TrustStore::load(&trust).expect("trust loads");
+        let agent = a2a_types::ids::AgentId::parse("operator").expect("agent");
+        storage::load_key_file(&key, &store, &agent, &[]).expect("permission check passes");
+    }
+
+    #[test]
+    fn req_0012_023_operator_bootstrap_keeps_bus_seeds() {
+        let (_dir, state, trust) = operator_fixture();
+        ensure_identity(&state, "cli").expect("seed");
+        let seed = fs::read(seed_path(&state, "cli")).expect("read seed");
+        ensure_operator(&state, &trust, &[]).expect("bootstrap");
+        assert_eq!(fs::read(seed_path(&state, "cli")).expect("read seed"), seed);
+    }
+
+    #[test]
+    fn req_0012_043_existing_entry_without_key_is_refused() {
+        let (_dir, state, trust) = operator_fixture();
+        let kid = ensure_operator(&state, &trust, &[]).expect("bootstrap");
+        let key = storage::operator_key_path(&state.join(CREDS_DIR), &kid).expect("key path");
+        fs::remove_file(&key).expect("remove key");
+        assert!(ensure_operator(&state, &trust, &[]).is_err());
+        assert!(
+            !key.exists(),
+            "a missing key must not be silently regenerated"
+        );
+    }
+
+    #[test]
+    fn req_0007_014_key_under_workspace_root_is_refused() {
+        let (_dir, state, trust) = operator_fixture();
+        let roots = vec![state.clone()];
+        assert!(ensure_operator(&state, &trust, &roots).is_err());
     }
 }

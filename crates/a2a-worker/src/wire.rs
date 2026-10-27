@@ -133,6 +133,14 @@ fn artifact_part(payload: Vec<u8>) -> pb::Part {
     }
 }
 
+/// Puts an open approval request on a task snapshot as its status message, in the shape of the
+/// approval event (0006-007), so that GetTask and ListTasks readers see what is awaited.
+pub fn attach_approval(task: &mut pb::Task, body: Struct) {
+    if let Some(status) = task.status.as_mut() {
+        status.message = Some(approval_message(&task.id, &task.context_id, body));
+    }
+}
+
 /// Builds the protobuf `Task` for a GetTask, ListTasks or CancelTask answer.
 #[must_use]
 pub fn task_proto(view: &TaskView) -> pb::Task {

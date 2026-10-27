@@ -17,7 +17,7 @@ Layer L2 (RFC-0001). Depends only on `a2a-types`. Implements RFC-0007 in full, p
 ## Provides
 - `Signer` and `Verifier` traits; `Ed25519Signer`; `Kid`.
 - `TrustStore`, `Role`, `KeyStatus`, `TrustEntry`.
-- `OPERATOR_RELAY_IDS`, `load_key_file`, `operator_key_path`.
+- `OPERATOR_RELAY_IDS`, `load_key_file`, `operator_key_path`, `ensure_operator_key`.
 - `Envelope`, `sign_envelope`, `verify_request`, `VerifyContext`, `VerifiedSender`, `MessageClass`.
 - `ApprovalBook`, `DecisionOrigin`, `VerifiedDecision`, `DecisionOutcome`, `verify_decision`, `request_digest`, `build_decision`, `decision_from_json`.
 - `verify_grant`, `VerifiedGrant`, `issue_root`, `issue_child`, `TokenCache`, `resolve_reference`, `UseLedger`, `GrantCredential`, `check_loopback_bind`.
@@ -44,7 +44,7 @@ Layer L2 (RFC-0001). Depends only on `a2a-types`. Implements RFC-0007 in full, p
 - `clock`: 0007-022, 0007-034.
 - `identity`: 0007-001, 0007-002, 0007-003.
 - `trust`: 0007-006, 0007-021, 0007-022, 0007-023, 0007-031, 0007-038, 0007-039.
-- `storage`: 0007-010, 0007-011, 0007-012, 0007-013, 0007-014.
+- `storage`: 0007-010, 0007-011, 0007-012, 0007-013, 0007-014, 0007-006.
 - `envelope`: 0007-030, 0007-031, 0007-032, 0007-033, 0007-034, 0007-035, 0007-036, 0007-038, 0007-039, 0007-040, 0007-041, 0007-046.
 - `replay`: 0007-041.
 - `decision`: 0006-009, 0006-013, 0006-014, 0006-015, 0006-051, 0007-095, 0007-096, 0007-098.

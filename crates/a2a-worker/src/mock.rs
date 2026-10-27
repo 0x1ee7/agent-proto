@@ -77,6 +77,8 @@ struct State {
     /// Permission requests awaiting an answer, with the turn that raised each.
     pending: Vec<(TurnRef, RequestId)>,
     log: Vec<Command>,
+    /// Lazy spawn: health is not live while the agent starts, but turns are still accepted.
+    starting: bool,
     alive: bool,
     restarts: u32,
     /// Why the mock is not live, reported through `Health::reason`.
@@ -254,6 +256,7 @@ impl MockBackend {
             alive: true,
             restarts: 0,
             down_reason: None,
+            starting: false,
             ignore_cancel: false,
         }));
         (
@@ -272,10 +275,11 @@ impl Backend for MockBackend {
 
     fn health(&self) -> Health {
         let state = lock(&self.state);
+        let starting = state.starting.then(|| "agent is starting".to_owned());
         Health {
-            live: state.alive,
+            live: state.alive && !state.starting,
             restarts: state.restarts,
-            reason: state.down_reason.clone(),
+            reason: state.down_reason.clone().or(starting),
         }
     }
 
@@ -396,6 +400,12 @@ impl MockControl {
         let mut state = lock(&self.state);
         state.alive = false;
         state.down_reason = Some(reason.to_owned());
+    }
+
+    /// Sets lazy-spawn start: health reports not live with "agent is starting", while turns are
+    /// still accepted (the driver keeps them, as ACP does during its lazy spawn).
+    pub fn set_starting(&self, starting: bool) {
+        lock(&self.state).starting = starting;
     }
 
     /// Simulates a driver restart: the backend is live again with an incremented restart count.

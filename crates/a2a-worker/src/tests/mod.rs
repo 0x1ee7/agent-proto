@@ -272,6 +272,20 @@ pub(crate) fn rig_with(approval: ApprovalMode, agent_deadline_ms: u64) -> Rig {
 
 /// A rig whose per-context waiting quota is `quota` (0005-028).
 pub(crate) fn rig_with_quota(approval: ApprovalMode, agent_deadline_ms: u64, quota: usize) -> Rig {
+    build_rig(approval, agent_deadline_ms, quota, false)
+}
+
+/// A rig whose backend is still starting when the Worker opens (lazy spawn; health not live).
+pub(crate) fn rig_starting() -> Rig {
+    build_rig(
+        ApprovalMode::AskAll,
+        3_600_000,
+        crate::config::DEFAULT_MAX_WAITING_PER_CONTEXT,
+        true,
+    )
+}
+
+fn build_rig(approval: ApprovalMode, agent_deadline_ms: u64, quota: usize, starting: bool) -> Rig {
     let bus = MemBus(Arc::new(
         BusMem::new(MemConfig {
             seed: 7,
@@ -297,6 +311,9 @@ pub(crate) fn rig_with_quota(approval: ApprovalMode, agent_deadline_ms: u64, quo
         approval_modes: vec!["default".to_owned()],
         streaming_text: true,
     });
+    if starting {
+        mock.set_starting(true);
+    }
     let store = SharedStore::default();
     let tasks = task::Config {
         owner: WORKER.to_owned(),

@@ -21,7 +21,7 @@ pub const DEFAULT_MAX_SKEW_MS: i64 = 300_000;
 /// Largest permitted `max_skew_ms` ([0007-021]).
 pub const MAX_SKEW_LIMIT_MS: i64 = 3_600_000;
 const DEFAULT_TENANT: &str = "local";
-const MAX_TRUST_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_TRUST_BYTES: u64 = 1024 * 1024;
 pub const OPERATOR_AGENT: &str = "operator";
 /// Bus identities that relay operator decisions ([0010-063]). An envelope from one of them is
 /// accepted only under an operator-role key, and the broker must publish it under the same name

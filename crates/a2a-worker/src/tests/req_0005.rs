@@ -305,3 +305,27 @@ fn req_0005_049_deadline_failure_carries_detail() {
         assert!(detail.contains("task deadline reached"), "{detail}");
     });
 }
+
+/// 0005-053: a backend still starting (lazy spawn, health not live) keeps the turn the driver
+/// accepted; the turn is not closed as lost, and it completes once the backend is live.
+#[test]
+fn req_0005_053_starting_backend_keeps_open_turn() {
+    let mut rig = rig_starting();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![
+            Step::Hold,
+            Step::Terminal(crate::backend::Outcome::Completed),
+        ]);
+        let task = submit(bus, "starting").await;
+        wait_for_state(bus, &task.id, pb::TaskState::Working).await;
+        advance(bus, 1);
+        assert_eq!(state(&get(bus, &task.id).await), WORKING);
+
+        mock.set_starting(false);
+        advance(bus, 1);
+        mock.release();
+        let done = wait_for_state(bus, &task.id, pb::TaskState::Completed).await;
+        assert_eq!(state(&done), pb::TaskState::Completed as i32);
+    });
+}

@@ -768,6 +768,67 @@ async fn drive<B: Bus, D: Backend, S: task::TaskStore>(
     }
 }
 
+/// One step of the readiness wait (RFC-0004 0004-015, RFC-0012 0012-009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveWait {
+    Live,
+    Stopped,
+    TimedOut,
+    Poll,
+}
+
+/// Decides the next readiness-wait step. Liveness wins over a stop request, so a live backend is
+/// reported ready and then drained normally.
+fn live_wait(live: bool, stop: bool, elapsed: Duration, timeout: Duration) -> LiveWait {
+    if live {
+        LiveWait::Live
+    } else if stop {
+        LiveWait::Stopped
+    } else if elapsed >= timeout {
+        LiveWait::TimedOut
+    } else {
+        LiveWait::Poll
+    }
+}
+
+/// Pumps the worker until its backend reports live, so the ready marker and presence only follow a
+/// live backend. Requests are not served meanwhile. Returns `Ok(false)` when the stop flag is set
+/// first and an error when the backend stays down past `timeout`.
+async fn await_backend_live<B: Bus, D: Backend, S: task::TaskStore>(
+    worker: &mut Worker<B, D, S>,
+    backend: &SharedBackend,
+    control: &HostControl,
+    timeout: Duration,
+) -> Result<bool, HostError> {
+    let started = Instant::now();
+    loop {
+        let health = backend.health();
+        match live_wait(
+            health.live,
+            control.stop_requested(),
+            started.elapsed(),
+            timeout,
+        ) {
+            LiveWait::Live => return Ok(true),
+            LiveWait::Stopped => return Ok(false),
+            LiveWait::TimedOut => {
+                let reason = health
+                    .reason
+                    .unwrap_or_else(|| "no reason reported".to_owned());
+                return Err(HostError::Backend(format!(
+                    "backend not live after {timeout:?}: {reason}"
+                )));
+            }
+            LiveWait::Poll => {}
+        }
+        worker
+            .pump()
+            .await
+            .map_err(|err| HostError::Bus(err.to_string()))?;
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Runs one configured worker until the host stops (RFC-0012 4.5).
 ///
 /// Connects under the agent's identity, opens the worker, reports readiness, serves until the stop
@@ -823,9 +884,22 @@ pub fn run_worker(
             .attach_delegation(delegation)
             .map_err(|err| HostError::Bus(err.to_string()))?;
     }
-    control.report_ready()?;
+    let served = match runtime.block_on(await_backend_live(
+        &mut worker,
+        &backend,
+        control,
+        spec.readiness.timeout,
+    )) {
+        Ok(true) => control
+            .report_ready()
+            .map_err(HostError::from)
+            .and_then(|()| {
+                runtime.block_on(drive(&mut worker, control, &pipeline, config.drain()))
+            }),
+        Ok(false) => Ok(()),
+        Err(err) => Err(err),
+    };
 
-    let served = runtime.block_on(drive(&mut worker, control, &pipeline, config.drain()));
     worker.shutdown_delegation();
     drop_in_runtime(&runtime, worker);
     let stopped = backend.shutdown(config.grace());
@@ -891,6 +965,20 @@ mod tests {
             ("ANTHROPIC_API_KEY".to_owned(), "sk-test".to_owned()),
             ("A2AB_TENANT".to_owned(), "evil".to_owned()),
         ]
+    }
+
+    #[test]
+    fn req_0012_009_ready_waits_for_live_backend() {
+        let timeout = Duration::from_secs(30);
+        let early = Duration::from_secs(1);
+        assert_eq!(live_wait(false, false, early, timeout), LiveWait::Poll);
+        assert_eq!(live_wait(true, false, early, timeout), LiveWait::Live);
+        assert_eq!(live_wait(true, true, early, timeout), LiveWait::Live);
+        assert_eq!(live_wait(false, true, early, timeout), LiveWait::Stopped);
+        assert_eq!(
+            live_wait(false, false, timeout, timeout),
+            LiveWait::TimedOut
+        );
     }
 
     // req_0012_062: provider keys stay out of the child environment unless allowed.
