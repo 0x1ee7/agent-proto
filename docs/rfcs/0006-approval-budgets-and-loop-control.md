@@ -33,7 +33,7 @@ Non-goals:
 - **Hop**: one dispatch of work to one Worker for one task. A delegation creates a child task and therefore one hop.
 - **Fingerprint**: the digest defined in section 4.5, computed over the text of a message.
 - **Lineage**: `Budget.chain`, the ordered list of hops from the root to the current hop.
-- **Unlimited sentinel**: `18446744073709551615` (2^64 - 1), valid at the root for tokens, cost and wall time, and kept on delegated tokens and cost only (0006-032).
+- **Unlimited sentinel**: `18446744073709551615` (2^64 - 1), valid at the root for tokens and cost, and kept on delegated tokens and cost only. Wall time is always finite (0006-032).
 
 ## 4. Specification
 
