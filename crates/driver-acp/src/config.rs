@@ -4,10 +4,16 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use a2a_core::approval::DEFAULT_EXPIRY_MS;
+
 /// Default turn idle timeout, measured from the last agent activity (0009-024).
 pub const DEFAULT_TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-/// Default time a permission or elicitation waits for an answer before it is cancelled (0009-033).
-pub const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
+/// Worker approval expiry. The worker applies it to every permission request and passes no
+/// per-request value (0006-017), so the driver backstop must outlast it.
+pub const WORKER_APPROVAL_EXPIRY: Duration = Duration::from_millis(DEFAULT_EXPIRY_MS);
+/// Default backstop for a permission or elicitation wait: the worker expiry plus a 30 s margin
+/// (0009-033). The worker's expiry is authoritative; this fires only if the worker did not.
+pub const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(330);
 /// Default time the agent has to finish a cancelled prompt before the process tree is killed (0009-036).
 pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(10);
 /// Default time the agent has to exit after its stdin is closed (0009-060).
@@ -101,6 +107,23 @@ pub enum ConfigError {
     /// The driver's worker thread could not be started.
     #[error("driver thread could not start: {0}")]
     ThreadStart(String),
+    /// The permission backstop does not outlast the worker's approval expiry (0006-017).
+    #[error(
+        "permission_timeout must be greater than the worker approval expiry of {}s",
+        WORKER_APPROVAL_EXPIRY.as_secs()
+    )]
+    PermissionTimeoutNotAboveApproval,
+}
+
+/// Checks a permission backstop against the worker's approval expiry. The worker's expiry is
+/// authoritative and the backstop must strictly outlast it (0006-017). a2ad calls this at config
+/// load, so an unsafe value is rejected before any agent is spawned.
+pub fn check_permission_timeout(timeout: Duration) -> Result<(), ConfigError> {
+    if timeout > WORKER_APPROVAL_EXPIRY {
+        Ok(())
+    } else {
+        Err(ConfigError::PermissionTimeoutNotAboveApproval)
+    }
 }
 
 /// Provider credential variables the driver refuses to set (0009-069). The driver never reads
@@ -332,6 +355,17 @@ mod tests {
                 .env
                 .iter()
                 .any(|(k, _)| k.to_string_lossy().starts_with("A2AB_"))
+        );
+    }
+
+    #[test]
+    fn permission_backstop_must_outlast_worker_expiry_0006_017() {
+        assert!(check_permission_timeout(WORKER_APPROVAL_EXPIRY).is_err());
+        assert!(check_permission_timeout(WORKER_APPROVAL_EXPIRY + Duration::from_secs(1)).is_ok());
+        assert!(check_permission_timeout(DEFAULT_PERMISSION_TIMEOUT).is_ok());
+        assert_eq!(
+            DEFAULT_PERMISSION_TIMEOUT - WORKER_APPROVAL_EXPIRY,
+            Duration::from_secs(30)
         );
     }
 }

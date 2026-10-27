@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 a2a-worker = { version = "0.1.0", path = "../a2a-worker" }
+a2a-core = { version = "0.1.0", path = "../a2a-core" }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 tracing = "0.1.44"

@@ -13,7 +13,7 @@ pub(crate) fn canonical(profile: Profile, name: &str) -> Option<(&'static str, b
         (Profile::Omp, "ask-exec") => Some(("always-ask-cached", false)),
         (Profile::Omp, "write") => Some(("write", true)),
         (Profile::Omp, "yolo") => Some(("yolo", true)),
-        (Profile::Claude, "default") => Some(("default", false)),
+        (Profile::Claude, "default" | "ask-all") => Some(("default", false)),
         (Profile::Claude, "plan") => Some(("plan", false)),
         (Profile::Claude, "bypass" | "bypassPermissions") => Some(("bypassPermissions", true)),
         (Profile::Claude, "acceptEdits") => Some(("acceptEdits", true)),

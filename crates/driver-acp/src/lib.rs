@@ -22,6 +22,7 @@ mod tests;
 
 pub use config::{
     AcpDriverConfig, ConfigError, DEFAULT_CANCEL_GRACE, DEFAULT_PERMISSION_TIMEOUT,
-    DEFAULT_SHUTDOWN_GRACE, DEFAULT_TURN_IDLE_TIMEOUT, LaunchSpec, Profile,
+    DEFAULT_SHUTDOWN_GRACE, DEFAULT_TURN_IDLE_TIMEOUT, LaunchSpec, Profile, WORKER_APPROVAL_EXPIRY,
+    check_permission_timeout,
 };
 pub use driver::AcpDriver;

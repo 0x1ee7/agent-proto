@@ -18,7 +18,7 @@ use a2a_worker::backend::{
 use serde_json::{Value, json};
 
 use crate::acp::{self, Elicitation, ServerCaps, Translated};
-use crate::config::AcpDriverConfig;
+use crate::config::{AcpDriverConfig, WORKER_APPROVAL_EXPIRY};
 use crate::frame;
 use crate::mode;
 use crate::process::{Spawner, Terminator};
@@ -184,6 +184,9 @@ pub(crate) struct Core {
     next_rpc: i64,
     perms: HashMap<String, Pending>,
     next_request: u64,
+    /// Distinguishes this driver's request ids from earlier processes: the task store persists
+    /// open approvals across restarts, so a bare `perm-N` counter collides with them.
+    request_epoch: u128,
 }
 
 impl Core {
@@ -224,6 +227,9 @@ impl Core {
             next_rpc: 1,
             perms: HashMap::new(),
             next_request: 1,
+            request_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
         }
     }
 
@@ -449,6 +455,33 @@ impl Core {
         });
         self.advance();
         Ok(())
+    }
+
+    /// Starts the agent while no turn is open, so backend health is known before work arrives
+    /// (0012-009, 0004-015). An idle exit respawns after the backoff (0009-061). Nothing starts
+    /// while `start` would refuse the approval mode (0009-064).
+    fn ensure_process(&mut self) {
+        if self.conn.is_some() || self.closed || self.failed || self.unhealthy {
+            return;
+        }
+        if self.respawn_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        if let Err(reason) = mode::check_start(
+            self.config.profile,
+            &self.config.approval_mode,
+            self.config.acknowledge_dangerous,
+        ) {
+            if self.down_reason.as_deref() != Some(reason) {
+                tracing::warn!(target: "driver_acp", reason, "agent not started: configuration refused");
+                self.down_reason = Some(reason.to_owned());
+            }
+            return;
+        }
+        if let Err(error) = self.spawn_process() {
+            self.down_reason = Some(format!("agent could not be spawned: {error}"));
+            self.note_exit();
+        }
     }
 
     /// Moves the current turn forward as far as the process state allows.
@@ -1004,7 +1037,7 @@ impl Core {
     }
 
     fn next_pending_id(&mut self) -> String {
-        let id = format!("perm-{}", self.next_request);
+        let id = format!("perm-{}-{}", self.request_epoch, self.next_request);
         self.next_request += 1;
         id
     }
@@ -1220,9 +1253,10 @@ impl Core {
             .map(|(id, _)| id.clone())
             .collect();
         for id in expired {
-            self.resolve_pending(&id, PermissionAnswer::Cancelled);
+            self.backstop_expired(&id);
         }
         let Some(turn) = self.turn.as_ref() else {
+            self.ensure_process();
             return;
         };
         let phase = turn.phase;
@@ -1260,10 +1294,40 @@ impl Core {
                 }
             }
         }
+        if self.turn.is_none() && self.conn.is_none() {
+            if let Some(at) = self.respawn_at {
+                consider(at);
+            }
+        }
         for pending in self.perms.values() {
             consider(pending.deadline);
         }
         best
+    }
+
+    /// The driver's own permission backstop fired (0009-033). The worker's approval expiry is
+    /// authoritative and normally fires first, so no answer arrived in time. The turn ends as a
+    /// timeout, reported by a Fault with detail, never as a silent crash.
+    fn backstop_expired(&mut self, request_id: &str) {
+        let Some(turn_gen) = self.perms.get(request_id).map(|p| p.turn_gen) else {
+            return;
+        };
+        let detail = format!(
+            "permission backstop expired after {:?}; worker approval expiry is {:?}",
+            self.config.permission_timeout, WORKER_APPROVAL_EXPIRY
+        );
+        self.emit(BackendEvent::Fault {
+            kind: FaultKind::Internal,
+            detail: detail.clone(),
+        });
+        if let Some(turn) = self.turn.as_mut().filter(|t| t.generation == turn_gen) {
+            turn.override_outcome = Some(Outcome::Failed {
+                reason: ReasonToken::BackendTimeout,
+                health_class: None,
+                detail,
+            });
+        }
+        self.resolve_pending(request_id, PermissionAnswer::Cancelled);
     }
 
     /// Turn idle past the limit: record BACKEND_TIMEOUT and cancel (0009-024).

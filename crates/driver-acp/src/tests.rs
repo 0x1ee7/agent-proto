@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use a2a_worker::backend::{
     Backend, BackendError, BackendEvent, ChannelSink, FaultKind, InputPart, Outcome, PeerTools,
@@ -609,7 +609,17 @@ fn permission_timeout_cancels_0009_033() {
     let mut f = open(harness(agent), cfg);
     f.driver.start(start("perm", "t1", None)).expect("start");
     let events = drain(&f.rx);
-    assert_eq!(outcome(&events), Outcome::Completed);
+    assert!(matches!(
+        outcome(&events),
+        Outcome::Failed {
+            reason: ReasonToken::BackendTimeout,
+            ..
+        }
+    ));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        BackendEvent::Fault { kind: FaultKind::Internal, detail } if detail.contains("backstop")
+    )));
     let answer = response_to(&f.rec, 50);
     assert_eq!(answer["result"]["outcome"]["outcome"], json!("cancelled"));
 }
@@ -854,7 +864,11 @@ fn peer_tools_with_operator_servers_refused_0015_084() {
             ..
         }
     ));
-    assert!(!lock(&f.rec).iter().any(|r| method(r) == "initialize"));
+    assert!(
+        !lock(&f.rec)
+            .iter()
+            .any(|r| matches!(method(r), "session/new" | "session/load" | "session/prompt"))
+    );
 }
 
 #[test]
@@ -1028,7 +1042,59 @@ fn approval_wait_is_bounded_by_permission_timeout_not_idle_0009_024_0009_033() {
     let mut f = open(harness(agent), cfg);
     f.driver.start(start("perm", "t1", None)).expect("start");
     let events = drain(&f.rx);
-    assert_eq!(outcome(&events), Outcome::Completed);
+    assert!(matches!(
+        outcome(&events),
+        Outcome::Failed {
+            reason: ReasonToken::BackendTimeout,
+            ..
+        }
+    ));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        BackendEvent::Fault { kind: FaultKind::Internal, detail } if detail.contains("backstop")
+    )));
     let answer = response_to(&f.rec, 50);
     assert_eq!(answer["result"]["outcome"]["outcome"], json!("cancelled"));
+}
+
+#[test]
+fn attach_starts_agent_before_any_turn_0012_009_0004_015() {
+    let f = open(harness(agent), config());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f.driver.health().live {
+        assert!(Instant::now() < deadline, "driver not live without a turn");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(f.driver.health().reason.is_none());
+    assert_eq!(f.counters.spawns.load(Ordering::SeqCst), 1);
+    assert!(
+        lock(&f.rec)
+            .iter()
+            .all(|frame| method(frame) == "initialize")
+    );
+}
+
+#[test]
+fn refused_mode_is_not_started_at_attach_0009_064() {
+    let mut cfg = config();
+    cfg.approval_mode = "bypass".to_owned();
+    let f = open(harness(agent), cfg);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(f.counters.spawns.load(Ordering::SeqCst), 0);
+    assert!(!f.driver.health().live);
+    assert!(
+        f.driver
+            .health()
+            .reason
+            .is_some_and(|r| r.contains("acknowledge"))
+    );
+}
+
+#[test]
+fn claude_ask_all_config_starts_the_agent() {
+    let mut cfg = config();
+    cfg.approval_mode = "ask-all".to_owned();
+    let f = open(harness(agent), cfg);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(f.counters.spawns.load(Ordering::SeqCst), 1);
 }
