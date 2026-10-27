@@ -633,6 +633,21 @@ pub fn chain_has_loop(parent_chain: &[Hop], receiving: &str, fingerprint: &str) 
         .any(|hop| hop.agent_id == receiving && hop.fingerprint == fingerprint)
 }
 
+/// Ancestors of the receiving agent: the chain without its final hop, which names the
+/// receiving agent itself (0006-043). `None` when the chain is empty or does not end with
+/// `own_agent`.
+#[must_use]
+pub fn chain_before_self<'a>(chain: &'a [Hop], own_agent: &str) -> Option<&'a [Hop]> {
+    let (last, ancestors) = chain.split_last()?;
+    (last.agent_id == own_agent).then_some(ancestors)
+}
+
+/// True when `own_agent` already appears among the ancestors of the receiving agent (0006-059).
+#[must_use]
+pub fn is_reentrant(ancestors: &[Hop], own_agent: &str) -> bool {
+    ancestors.iter().any(|hop| hop.agent_id == own_agent)
+}
+
 /// The child's chain: the parent's chain with one appended hop (0006-043). Never shortened.
 #[must_use]
 pub fn extend_chain(parent_chain: &[Hop], receiving: &str, fingerprint: &str) -> Vec<Hop> {
@@ -1146,6 +1161,28 @@ mod tests {
         assert!(!chain_has_loop(&chain, "claude", "f3"));
         chain = extend_chain(&chain, "claude", "f3");
         assert!(!chain_has_loop(&chain, "omp", "f4"));
+    }
+
+    #[test]
+    fn req_0006_043_chain_before_self_returns_ancestors_only() {
+        let chain = extend_chain(&root_chain("claude", "f1"), "omp", "f2");
+        assert_eq!(chain_before_self(&chain, "omp"), Some(&chain[..1]));
+        assert_eq!(
+            chain_before_self(&chain, "claude"),
+            None,
+            "a chain that does not end with the receiver has no ancestors view"
+        );
+        assert_eq!(chain_before_self(&[], "omp"), None);
+    }
+
+    #[test]
+    fn req_0006_059_reentrant_is_a_return_to_an_ancestor() {
+        let chain = extend_chain(&root_chain("claude", "f1"), "omp", "f2");
+        let at_b = chain_before_self(&chain, "omp").expect("ends with own hop");
+        assert!(!is_reentrant(at_b, "omp"), "A -> B is not a re-entry");
+        let back = extend_chain(&chain, "claude", "f3");
+        let at_a = chain_before_self(&back, "claude").expect("ends with own hop");
+        assert!(is_reentrant(at_a, "claude"), "A -> B -> A is a re-entry");
     }
 
     #[test]

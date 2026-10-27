@@ -21,7 +21,7 @@ use crate::approval::{
 };
 use crate::budget::{
     Allowance, BreakerStatus, Breakers, BudgetError, BudgetTrip, DelegationRefused, Ledger,
-    Metering, Usage, chain_has_loop,
+    Metering, Usage, chain_before_self, chain_has_loop, is_reentrant,
 };
 
 /// Retention after a terminal state: T_task = 24 h (0005-026, 0005-043).
@@ -40,6 +40,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 50;
 pub const MAX_PAGE_SIZE: usize = 100;
 
 const BREAKER_DETAIL: &str = r#"{"breaker":"open"}"#;
+const REENTRANT_DETAIL: &str = r#"{"reason":"reentrant"}"#;
 
 /// Error from the record store seam.
 #[derive(Debug, Error)]
@@ -341,6 +342,8 @@ pub struct TaskView {
     pub usage: BudgetUsage,
     /// Artifacts retained for the task, in creation order (0005-022).
     pub artifacts: Vec<TaskArtifact>,
+    /// Inbound delegation chain (0006-043); empty for a root task.
+    pub chain: Vec<Hop>,
 }
 
 /// ListTasks query (0005-044).
@@ -498,8 +501,8 @@ pub struct Submission {
 pub struct Incoming {
     /// The child task id returned by [`Tasks::delegate`].
     pub task_id: String,
-    /// The parent task id.
-    pub parent_task_id: String,
+    /// The parent task id, or `None` for a delegation received over the wire (0006-043).
+    pub parent_task_id: Option<String>,
     /// The grant reserved by the parent.
     pub grant: Allowance,
     /// The chain carried by the message (0006-043).
@@ -940,11 +943,22 @@ impl<S: TaskStore> Tasks<S> {
                 (grant, Ledger::root(grant, self.config.metering)?)
             }
             Some(incoming) => {
-                let parent = self
-                    .tasks
-                    .get(&incoming.parent_task_id)
-                    .ok_or(TaskError::NotFound)?;
-                let depth = parent.ledger.depth().saturating_add(1);
+                let (parent_depth, root_owner) = match &incoming.parent_task_id {
+                    Some(parent_id) => {
+                        let parent = self.tasks.get(parent_id).ok_or(TaskError::NotFound)?;
+                        let root = parent
+                            .chain
+                            .first()
+                            .map_or(owner.as_str(), |hop| hop.agent_id.as_str());
+                        (Some(parent.ledger.depth()), Some(root))
+                    }
+                    None => (None, None),
+                };
+                check_inbound_chain(&incoming.chain, &owner, root_owner)?;
+                let depth = parent_depth.map_or_else(
+                    || u32::try_from(incoming.chain.len().saturating_sub(1)).unwrap_or(u32::MAX),
+                    |depth| depth.saturating_add(1),
+                );
                 (
                     incoming.grant,
                     Ledger::child(incoming.grant, depth, self.config.metering)?,
@@ -952,10 +966,13 @@ impl<S: TaskStore> Tasks<S> {
             }
         };
 
-        let looped = s
+        let ancestors = s
             .incoming
             .as_ref()
-            .is_some_and(|incoming| chain_has_loop(&incoming.chain, &owner, &s.fingerprint));
+            .and_then(|incoming| chain_before_self(&incoming.chain, &owner))
+            .unwrap_or_default();
+        let reentrant = is_reentrant(ancestors, &owner);
+        let looped = chain_has_loop(ancestors, &owner, &s.fingerprint);
         let refusal: Option<(FailureCode, Option<String>)> = if let Some(code) = s.pressure {
             Some((code, None))
         } else if matches!(
@@ -963,6 +980,8 @@ impl<S: TaskStore> Tasks<S> {
             BreakerStatus::Open { .. }
         ) {
             Some((FailureCode::RateLimited, Some(BREAKER_DETAIL.to_owned())))
+        } else if reentrant {
+            Some((FailureCode::LoopDetected, Some(REENTRANT_DETAIL.to_owned())))
         } else if looped {
             Some((FailureCode::LoopDetected, None))
         } else {
@@ -1642,21 +1661,11 @@ impl<S: TaskStore> Tasks<S> {
         })
     }
 
-    fn proto_chain(rec: &TaskRecord) -> Vec<Hop> {
-        rec.chain
-            .iter()
-            .map(|h| Hop {
-                agent_id: h.agent_id.clone(),
-                fingerprint: h.fingerprint.clone(),
-            })
-            .collect()
-    }
-
     /// Inbound delegation chain of a task, owner-side like [`Tasks::task_owner`]
     /// (RFC-0007 [0007-129], RFC-0015 [0015-065]). `None` for an unknown task.
     #[must_use]
     pub fn chain(&self, task_id: &str) -> Option<Vec<Hop>> {
-        self.tasks.get(task_id).map(Self::proto_chain)
+        self.tasks.get(task_id).map(proto_chain)
     }
 
     /// Grant and consumption of a task for the RFC-0015 pre-check (0015-055). The
@@ -1668,7 +1677,7 @@ impl<S: TaskStore> Tasks<S> {
             let ledger = &rec.ledger;
             let used = ledger.usage();
             let reserved = ledger.reserved();
-            let budget = ledger.grant().to_proto(Self::proto_chain(rec));
+            let budget = ledger.grant().to_proto(proto_chain(rec));
             let usage = BudgetUsage {
                 tokens_used: used.tokens.saturating_add(reserved.tokens),
                 cost_units_used: used.cost_units.saturating_add(reserved.cost_units),
@@ -1882,6 +1891,38 @@ fn view(rec: &TaskRecord) -> TaskView {
         deadline_ms: rec.deadline_ms,
         usage: rec.ledger.usage_proto(),
         artifacts: rec.artifacts.clone(),
+        chain: proto_chain(rec),
+    }
+}
+
+fn proto_chain(rec: &TaskRecord) -> Vec<Hop> {
+    rec.chain
+        .iter()
+        .map(|h| Hop {
+            agent_id: h.agent_id.clone(),
+            fingerprint: h.fingerprint.clone(),
+        })
+        .collect()
+}
+
+/// Validates a chain received with a delegation (0006-043): it ends with the receiving
+/// agent's own hop and, when the root owner is known, starts with the root owner.
+fn check_inbound_chain(
+    chain: &[Hop],
+    owner: &str,
+    root_owner: Option<&str>,
+) -> Result<(), TaskError> {
+    if chain_before_self(chain, owner).is_none() {
+        return Err(TaskError::Invalid(
+            "chain must end with the receiving agent's hop",
+        ));
+    }
+    let root_ok =
+        root_owner.is_none_or(|root| chain.first().is_some_and(|hop| hop.agent_id == root));
+    if root_ok {
+        Ok(())
+    } else {
+        Err(TaskError::Invalid("chain must start with the root owner"))
     }
 }
 
@@ -2030,7 +2071,7 @@ mod tests {
         let mut s = sub(msg, now);
         s.incoming = Some(Incoming {
             task_id: child.clone(),
-            parent_task_id: parent.to_owned(),
+            parent_task_id: Some(parent.to_owned()),
             grant: budget(),
             chain: vec![Hop {
                 agent_id: "omp".to_owned(),
@@ -3067,6 +3108,117 @@ mod tests {
             }])
         );
         assert_eq!(tasks.chain("missing"), None);
+    }
+
+    fn inbound_chain(hops: &[(&str, &str)]) -> Vec<Hop> {
+        hops.iter()
+            .map(|(agent, fingerprint)| Hop {
+                agent_id: (*agent).to_owned(),
+                fingerprint: (*fingerprint).to_owned(),
+            })
+            .collect()
+    }
+
+    fn receive(
+        tasks: &mut Tasks<MemStore>,
+        msg: &str,
+        chain: Vec<Hop>,
+        now: u64,
+    ) -> Result<String, TaskError> {
+        let task_id = TaskId::generate().to_string();
+        let mut s = sub(msg, now);
+        s.incoming = Some(Incoming {
+            task_id: task_id.clone(),
+            parent_task_id: None,
+            grant: budget(),
+            chain,
+        });
+        tasks.submit(s, now)?;
+        Ok(task_id)
+    }
+
+    #[test]
+    fn req_0006_059_a_to_b_delegation_is_not_self_detected() {
+        let mut tasks = fresh();
+        let chain = inbound_chain(&[("claude", "f1"), ("omp", "f2")]);
+        let id = receive(&mut tasks, "c1", chain.clone(), T0).expect("admitted");
+        assert_eq!(failure_code(&tasks, &id), None);
+        assert_eq!(state(&tasks, &id), TaskState::Submitted);
+        assert_eq!(tasks.chain(&id), Some(chain.clone()));
+        assert_eq!(tasks.task(ORIGIN, &id).expect("visible").chain, chain);
+        tasks.start_backend(&id, T0).expect("backend starts");
+    }
+
+    #[test]
+    fn req_0006_059_return_to_an_ancestor_is_refused_as_reentrant() {
+        let mut tasks = fresh();
+        let chain = inbound_chain(&[
+            ("claude", "f1"),
+            ("omp", "f2"),
+            ("claude", "f3"),
+            ("omp", "f4"),
+        ]);
+        let id = receive(&mut tasks, "c1", chain, T0).expect("refused, not rejected");
+        assert_eq!(state(&tasks, &id), TaskState::Failed);
+        assert_eq!(failure_code(&tasks, &id), Some(FailureCode::LoopDetected));
+        let detail = tasks
+            .task(ORIGIN, &id)
+            .expect("visible")
+            .failure
+            .and_then(|f| f.detail);
+        assert_eq!(detail.as_deref(), Some(REENTRANT_DETAIL));
+        assert!(tasks.start_backend(&id, T0).is_err(), "no backend start");
+    }
+
+    #[test]
+    fn req_0006_045_repeated_identical_fingerprint_is_a_loop() {
+        let chain = inbound_chain(&[
+            ("claude", "f1"),
+            ("omp", "f2"),
+            ("claude", "f1"),
+            ("omp", "f2"),
+        ]);
+        let ancestors = chain_before_self(&chain, "omp").expect("ends with own hop");
+        assert!(chain_has_loop(ancestors, "omp", "f2"));
+        let mut tasks = fresh();
+        let id = receive(&mut tasks, "c1", chain, T0).expect("refused");
+        assert_eq!(failure_code(&tasks, &id), Some(FailureCode::LoopDetected));
+    }
+
+    #[test]
+    fn req_0006_043_malformed_chains_are_refused() {
+        let mut tasks = fresh();
+        assert!(matches!(
+            receive(&mut tasks, "c1", Vec::new(), T0),
+            Err(TaskError::Invalid(_))
+        ));
+        let not_own = inbound_chain(&[("claude", "f1"), ("gateway", "f2")]);
+        assert!(matches!(
+            receive(&mut tasks, "c2", not_own, T0),
+            Err(TaskError::Invalid(_))
+        ));
+        let root = start(&mut tasks, "p", T0);
+        let (child, _grant) = tasks.delegate(&root).expect("delegate");
+        let mut s = sub("c3", T0);
+        s.incoming = Some(Incoming {
+            task_id: child,
+            parent_task_id: Some(root),
+            grant: budget(),
+            chain: inbound_chain(&[("claude", "f1"), ("omp", "f2")]),
+        });
+        assert!(matches!(tasks.submit(s, T0), Err(TaskError::Invalid(_))));
+    }
+
+    #[test]
+    fn req_0006_043_inbound_chain_survives_record_serialization() {
+        let mut tasks = fresh();
+        let chain = inbound_chain(&[("claude", "f1"), ("omp", "f2")]);
+        let id = receive(&mut tasks, "c1", chain.clone(), T0).expect("admitted");
+        let record = tasks.tasks.get(&id).expect("record");
+        let json = serde_json::to_string(record).expect("serialize");
+        let restored: TaskRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(proto_chain(&restored), chain);
+        assert_eq!(serde_json::to_string(&restored).expect("reserialize"), json);
     }
 
     #[test]
