@@ -121,8 +121,10 @@ impl Allowance {
         }
     }
 
-    /// Checks sentinel placement (0006-032). The sentinel is valid only for tokens and cost on
-    /// the root hop; wall time is always finite, and the count dimensions never take it.
+    /// Checks sentinel placement (0006-032). `root` is the root placement: the sentinel is valid
+    /// only for tokens and cost. Delegated grants pass `true` too, because 0015-055 keeps the
+    /// unlimited sentinel for children. Wall time is always finite, and the count dimensions
+    /// never take it.
     pub fn validate(&self, root: bool) -> Result<(), BudgetError> {
         if self.max_wall_ms == UNLIMITED {
             return Err(BudgetError::Sentinel(Dimension::WallMs));
@@ -316,7 +318,8 @@ impl Ledger {
 
     /// Ledger of a child hop at `depth`.
     pub fn child(grant: Allowance, depth: u32, metering: Metering) -> Result<Ledger, BudgetError> {
-        grant.validate(false)?;
+        // Delegated grants keep the unlimited sentinel on tokens and cost (0015-055).
+        grant.validate(true)?;
         Ok(Self::new(grant, depth, metering))
     }
 
@@ -832,6 +835,34 @@ mod tests {
             .expect_err("zero tokens refuse the turn");
         assert_eq!(trip.dimension, Dimension::Tokens);
         assert_eq!(trip.limit, 0);
+    }
+
+    #[test]
+    fn req_0015_055_delegated_grant_keeps_unlimited_tokens_and_cost() {
+        let delegated = Allowance {
+            max_tokens: UNLIMITED,
+            max_cost_units: UNLIMITED,
+            ..grant()
+        };
+        let ledger =
+            Ledger::child(delegated, 1, metered()).expect("sentinel kept on a delegated grant");
+        assert_eq!(ledger.depth(), 1);
+        let hops = Allowance {
+            max_hops: u32::MAX,
+            ..grant()
+        };
+        assert!(
+            Ledger::child(hops, 1, metered()).is_err(),
+            "count dimensions never take the sentinel"
+        );
+        let wall = Allowance {
+            max_wall_ms: UNLIMITED,
+            ..grant()
+        };
+        assert!(
+            Ledger::child(wall, 1, metered()).is_err(),
+            "wall time is always finite"
+        );
     }
 
     #[test]

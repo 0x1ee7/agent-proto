@@ -33,7 +33,7 @@ Non-goals:
 - **Hop**: one dispatch of work to one Worker for one task. A delegation creates a child task and therefore one hop.
 - **Fingerprint**: the digest defined in section 4.5, computed over the text of a message.
 - **Lineage**: `Budget.chain`, the ordered list of hops from the root to the current hop.
-- **Unlimited sentinel**: `18446744073709551615` (2^64 - 1), valid only at the root for tokens, cost and wall time.
+- **Unlimited sentinel**: `18446744073709551615` (2^64 - 1), valid at the root for tokens, cost and wall time, and kept on delegated tokens and cost only (0006-032).
 
 ## 4. Specification
 
@@ -131,7 +131,7 @@ stateDiagram-v2
 
 - [0006-030] Each delegated message MUST carry `Budget` in `Message.metadata["urn:a2abus:ext:budget:1"]` (budget.proto). The receiving hop enforces the allowance it received and never uses a larger one, even if a later message carries a larger one (L9).
 - [0006-031] Root allowance: when a request arrives without a budget, the Worker MUST build the root allowance from the agent's configuration, capped by the card ceilings (RFC-0003). Defaults: `max_tokens` and `max_cost_units` from configuration (unlimited sentinel if the deployment chooses no cap); `max_wall_ms` 3600000 (matching RFC-0005 [0005-040]); `max_hops` 8; `max_depth` 3; `max_children` 8. When a request carries a budget, the root allowance is the component-wise minimum of the request's budget and these values.
-- [0006-032] Zero means none remaining. A hop with `max_tokens` 0 may not spend tokens, and so on for each dimension. The unlimited sentinel MUST NOT appear on any non-root hop and is not valid for `max_hops`, `max_depth` or `max_children`.
+- [0006-032] Zero means none remaining. A hop with `max_tokens` 0 may not spend tokens, and so on for each dimension. The unlimited sentinel is valid at the root; a delegated child allowance MAY keep the sentinel on `max_tokens` and `max_cost_units` (RFC-0015 [0015-055]), but it MUST NOT appear on `max_wall_ms`, `max_hops`, `max_depth` or `max_children`.
 - [0006-033] Delegation: before a hop creates a child, all of the following MUST hold, otherwise the create is refused and the hop continues without the child:
   - `max_depth` >= 1, `max_hops - hops_used` >= 1 and `children_used` < `max_children`;
   - the child allowance is computed as: `child.max_hops = (max_hops - hops_used) - 1`; `child.max_depth = max_depth - 1`; `child.max_children = max_children - 1`; for `max_tokens`, `max_cost_units` and `max_wall_ms`, the child receives the parent's available amount minus margin, where available = allowance - used - reserved (0006-034), margin is 0 for tokens and cost, and 1000 ms for wall time.
@@ -155,7 +155,7 @@ stateDiagram-v2
 
 - [0006-043] Lineage: the root hop's `Budget.chain` holds exactly one Hop, for the root owner (its `agent_id`), with the fingerprint of the message that started the root task. Each delegation appends a `Hop` whose `agent_id` is the receiving Worker of the child and whose `fingerprint` is the fingerprint of the message that starts the child. The child receives the appended chain. So every chain starts with the root owner and loop detection (0006-045) covers the root. `chain` is never shortened or rewritten (monotonic rule for lineage).
 - [0006-044] Fingerprint: the lowercase hex encoding of the first 16 bytes of SHA-256 over the UTF-8 bytes of `<target agent id> LF <normalized text>`, where normalized text is the concatenation of the message's text parts after Unicode NFC normalization and collapsing each run of whitespace to one space. Tool arguments, metadata and file content are not part of the fingerprint.
-- [0006-045] Loop rule: at admission of a delegated task, if the pair (receiving agent id, fingerprint) already appears in the parent's `chain` (before the new `Hop` is appended), the Worker MUST create the task directly in FAILED with `LOOP_DETECTED`, with no backend start and no child. This creates a new transition not in the RFC-0005 table: `(create) -> FAILED`, which RFC-0005 Table 4.2 now carries (section 10, request 1).
+- [0006-045] Loop rule: at admission of a delegated task, if the pair (receiving agent id, fingerprint) already appears in the parent's `chain` (before the new `Hop` is appended), the Worker MUST create the task directly in FAILED with `LOOP_DETECTED`, with no backend start and no child. This creates a new transition not in the RFC-0005 table: `(create) -> FAILED`, which RFC-0005 Table 4.2 now carries (section 10, request 1). The rule tests only the hops already in the parent's `chain`, which are the ancestors of the new task. A repeated receiving agent is also a re-entrancy, and [0006-059] refuses it at the same point with `LOOP_DETECTED`, whatever the fingerprint, so the two rules never disagree.
 - [0006-046] Ping-pong between two agents with different text is not a loop under [0006-045], but a return to an agent already in the chain is a re-entrancy and fails under [0006-059]. Chains therefore hold distinct agents, which `max_hops` and `max_depth` (R-B1) bound. Hermes' own cap on its side still applies (`hermes.md` 6.2).
 - [0006-047] Hermes' anti-loop cap refuses with REJECTED and no JSON-RPC error (`hermes.md` 6.2). The Worker treats a remote child that ends REJECTED as a child failure (0006-049). The Worker does not reimplement Hermes' counters.
 - [0006-048] Breaker: for each origin, if three tasks from that origin end FAILED with `BUDGET_EXHAUSTED` or `LOOP_DETECTED` within 10 minutes, the breaker opens for 10 minutes. While open, a new submission from that origin is refused with REJECTED and code `RATE_LIMITED` with detail `{ "breaker": "open" }` (RFC-0005 [0005-028]). A successful (non-failed) task from that origin closes the breaker early. Breaker state is stored durably (RFC-0005 [0005-031]).
@@ -449,7 +449,7 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-029 | Omp under always-ask-cached without elicitation.form: write denied and read not run; with elicitation advertised: write proceeds only after an operator allow-once, reject-once denies, and cancel ends the turn with the session usable. Residual items in issue 2 | MUST |
 | 0006-030 | Delegated message carries budget; receiver does not use a larger allowance than received | MUST |
 | 0006-031 | Root without budget gets configured defaults; with a budget gets the component-wise minimum | MUST |
-| 0006-032 | Zero means none (tool refused); sentinel rejected on non-root hop | MUST |
+| 0006-032 | Zero means none (tool refused); sentinel refused on wall time and counts, kept on delegated tokens and cost | MUST |
 | 0006-033 | Child allowance equals parent minus one hop and depth and minus 1000 ms wall; create refused at zero | MUST |
 | 0006-034 | Parent reserve reduced at creation; child usage charged and unused part returned | MUST |
 | 0006-035 | Child receives message with skewed issuer clock; wall budget unaffected | MUST |
