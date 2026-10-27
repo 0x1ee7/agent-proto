@@ -23,7 +23,7 @@ use bus_nats::config::{NatsConfig, Seed};
 use bus_nats::layout;
 
 const USAGE: &str = "usage: a2a-tui --seed-file <path> [--url <nats-url>] [--tenant <name>] \
-[--key <operator-key-path>] [--trust <trust-file>] [--root <dir>]...";
+[--creds <dir>] [--trust <trust-file>] [--root <dir>]...";
 const DEFAULT_URL: &str = "nats://127.0.0.1:4222";
 const DEFAULT_TENANT: &str = "local";
 const AUDIT_CONSUMER: &str = "tui-audit";
@@ -44,7 +44,7 @@ struct Args {
     url: String,
     seed_file: PathBuf,
     tenant: String,
-    key: Option<PathBuf>,
+    creds: Option<PathBuf>,
     trust: Option<PathBuf>,
     roots: Vec<PathBuf>,
 }
@@ -54,7 +54,7 @@ impl Args {
         let mut url = DEFAULT_URL.to_owned();
         let mut seed_file = None;
         let mut tenant = DEFAULT_TENANT.to_owned();
-        let mut key = None;
+        let mut creds = None;
         let mut trust = None;
         let mut roots = Vec::new();
         while let Some(flag) = iter.next() {
@@ -62,7 +62,7 @@ impl Args {
                 "--url" => url = value(&mut iter, &flag)?,
                 "--seed-file" => seed_file = Some(PathBuf::from(value(&mut iter, &flag)?)),
                 "--tenant" => tenant = value(&mut iter, &flag)?,
-                "--key" => key = Some(PathBuf::from(value(&mut iter, &flag)?)),
+                "--creds" => creds = Some(PathBuf::from(value(&mut iter, &flag)?)),
                 "--trust" => trust = Some(PathBuf::from(value(&mut iter, &flag)?)),
                 "--root" => roots.push(PathBuf::from(value(&mut iter, &flag)?)),
                 "-h" | "--help" => return Err(USAGE.to_owned()),
@@ -80,7 +80,7 @@ impl Args {
             url,
             seed_file,
             tenant,
-            key,
+            creds,
             trust,
             roots,
         })
@@ -136,7 +136,7 @@ fn run() -> Result<(), String> {
         ))
         .map_err(|e| format!("audit feed: {e}"))?;
 
-    let (signing, read_only) = match operator::load(args.key.as_deref(), &trust, &args.roots) {
+    let (signing, read_only) = match operator::load(args.creds.as_deref(), &trust, &args.roots) {
         Identity::Signed(signer) => (Some(envelope_hook(signer, Arc::new(SystemClock))), None),
         Identity::ReadOnly(reason) => (None, Some(reason)),
     };

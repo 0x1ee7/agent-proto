@@ -17,8 +17,8 @@ Layer L5 operator console (RFC-0001 crate table). Binary plus library.
   names, and builds the envelope signing hook.
 
 ## Uses
-- `a2a-client` for Directory sync, event streams, `PendingApproval`, `decide`, and the
-  envelope signing hook.
+- `a2a-client` for Directory sync, event streams, `PendingApproval`, `decide_signed` (operator
+  decisions, RFC-0007 0007-095), and the envelope signing hook.
 - `a2a-audit` (timestamp validity), `a2a-core` (clock), `a2a-security` (operator key and
   trust storage), `a2a-types`, `bus-api`. `bus-nats` in `main.rs` only.
 

@@ -286,6 +286,8 @@ pub(crate) mod fixtures {
             request_id: id.to_owned(),
             task_id: format!("task-{id}"),
             tool: "shell".to_owned(),
+            working_directory: "/work/app".to_owned(),
+            workspace_mode: "per-task".to_owned(),
             options: vec![
                 option(ALLOW_ONCE_ID, a2abus::ApprovalOptionKind::AllowOnce),
                 option(REJECT_ONCE_ID, a2abus::ApprovalOptionKind::RejectOnce),

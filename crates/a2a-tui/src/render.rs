@@ -388,8 +388,8 @@ fn card_lines(app: &App, request_id: &str, now: u64) -> Vec<String> {
         ),
         field("Tool", &redact::escape(&request.tool)),
         field("Argument summary", &redact::summary(&request.summary)),
-        field("Working directory", "missing"),
-        field("Workspace mode", "missing"),
+        field("Working directory", &or_missing(&request.working_directory)),
+        field("Workspace mode", &or_missing(&request.workspace_mode)),
         field("Risk tier", tier_label(request.tier)),
         field("Budget remaining", &budget),
         field("Requested scope", &scope),
@@ -482,6 +482,14 @@ fn tier_label(raw: i32) -> &'static str {
         Ok(ApprovalTier::Exec) => "exec",
         Ok(ApprovalTier::DeleteOrMove) => "delete-or-move",
         Ok(ApprovalTier::Unspecified) | Err(_) => "missing",
+    }
+}
+
+fn or_missing(value: &str) -> String {
+    if value.is_empty() {
+        "missing".to_owned()
+    } else {
+        redact::escape(value)
     }
 }
 
@@ -665,10 +673,27 @@ mod tests {
                 .clone()
         };
         assert!(field_line("Task chain").contains("missing"));
-        assert!(field_line("Working directory").contains("missing"));
-        assert!(field_line("Workspace mode").contains("missing"));
+        assert!(field_line("Working directory").contains("/work/app"));
+        assert!(field_line("Workspace mode").contains("per-task"));
         assert!(field_line("Budget remaining").contains("missing"));
         assert!(field_line("Signature").contains("not verified"));
+    }
+
+    #[test]
+    fn req_0006_006_empty_directory_and_mode_read_missing() {
+        let mut app = App::new(false);
+        let mut req = request("r1", EXPIRES_SECS);
+        req.working_directory.clear();
+        req.workspace_mode.clear();
+        app.board.approvals.observe("omp", pending_from(&req), 0);
+        let card = card_lines(&app, "r1", 0);
+        for label in ["Working directory", "Workspace mode"] {
+            let line = card
+                .iter()
+                .find(|line| line.starts_with(label))
+                .expect(label);
+            assert!(line.contains("missing"), "{line}");
+        }
     }
 
     #[test]

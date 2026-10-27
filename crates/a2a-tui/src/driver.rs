@@ -79,6 +79,7 @@ where
     F: AuditFeed + 'static,
 {
     let operator = console_agent();
+    let decide_hook = signing.clone();
     let config = Config {
         signing,
         ..Config::default()
@@ -90,7 +91,7 @@ where
     tokio::select! {
         () = sync_loop(client.clone(), ui.clone(), refresh.clone()) => {}
         () = audit_loop(audit, ui.clone()) => {}
-        () = command_loop(client, ui, refresh, commands) => {}
+        () = command_loop(client, ui, refresh, decide_hook, commands) => {}
     }
     Ok(())
 }
@@ -309,6 +310,7 @@ async fn command_loop<B: Bus + 'static>(
     client: Arc<Client<B>>,
     ui: Sender<Msg>,
     refresh: Arc<Notify>,
+    operator: Option<Arc<dyn SigningHook>>,
     mut commands: UnboundedReceiver<Command>,
 ) {
     while let Some(command) = commands.recv().await {
@@ -319,7 +321,8 @@ async fn command_loop<B: Bus + 'static>(
                 decision_id,
                 option_id,
             } => {
-                let outcome = decide(&client, &agent, &pending, &option_id).await;
+                let outcome =
+                    decide(&client, operator.as_deref(), &agent, &pending, &option_id).await;
                 let request_id = pending.request().request_id.clone();
                 ui.send(Msg::Decision {
                     request_id,
@@ -345,20 +348,31 @@ async fn command_loop<B: Bus + 'static>(
     }
 }
 
-/// Sends one approval decision. Local refusals are `Refused`; anything that reached the bus
-/// without a clear answer is `Unknown` and is never resent (RFC-0006).
+/// Sends one signed operator decision (RFC-0006, RFC-0007 0007-095). Without the operator key
+/// it is refused locally. Local refusals are `Refused`; anything that reached the bus without a
+/// clear answer is `Unknown` and is never resent.
 async fn decide<B: Bus>(
     client: &Client<B>,
+    operator: Option<&dyn SigningHook>,
     agent: &str,
     pending: &PendingApproval,
     option_id: &str,
 ) -> DecisionOutcome {
+    let Some(operator) = operator else {
+        return DecisionOutcome::Refused("read-only: operator key not loaded".to_owned());
+    };
     let agent = match AgentId::parse(agent) {
         Ok(agent) => agent,
         Err(e) => return DecisionOutcome::Refused(format!("agent id: {e}")),
     };
     match client
-        .decide(&agent, pending, option_id, &CallOptions::default())
+        .decide_signed(
+            &agent,
+            pending,
+            option_id,
+            operator,
+            &CallOptions::default(),
+        )
         .await
     {
         Ok(_) => DecisionOutcome::Accepted,
