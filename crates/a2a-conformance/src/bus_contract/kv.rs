@@ -20,6 +20,12 @@ fn revision(value: u64) -> Result<Revision, String> {
     Ok(Revision::new(value))
 }
 
+/// Rounds up to whole seconds, at least one: some bindings (NATS) reject sub-second TTLs.
+fn whole_seconds(nominal: Duration) -> Duration {
+    let secs = nominal.as_secs() + u64::from(nominal.subsec_nanos() > 0);
+    Duration::from_secs(secs.max(1))
+}
+
 /// [0011-016] put/get/create/update(CAS)/delete, and TTL expiry.
 pub(super) fn r0011_016<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     let fx = ctx.fx;
@@ -81,6 +87,8 @@ pub(super) fn r0011_016<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     })?;
 
     let ttl_key = key("t16")?;
+    // NATS TTLs are whole seconds, so the scaled TTL is rounded up to whole seconds.
+    let ttl = whole_seconds(fx.scaled(Duration::from_secs(2)));
     let old = settle(ctx.control, async {
         let rev = bx(
             "kv_put ttl",
@@ -89,7 +97,7 @@ pub(super) fn r0011_016<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
                 bucket,
                 &ttl_key,
                 Bytes::from_static(b"short"),
-                Some(fx.scaled(Duration::from_secs(2))),
+                Some(ttl),
             )
             .await,
         )?;
@@ -99,7 +107,9 @@ pub(super) fn r0011_016<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         }
         Ok::<Revision, String>(rev)
     })?;
-    ctx.control.advance(ctx.fx.scaled(Duration::from_secs(3)))?;
+    // The margin past expiry is scaled like any other nominal duration.
+    ctx.control
+        .advance(ttl + ctx.fx.scaled(Duration::from_secs(1)))?;
     settle(ctx.control, async {
         match bus.kv_get(&fx.client, bucket, &ttl_key).await {
             Err(BusError::Absent) => {}
@@ -348,4 +358,29 @@ pub(super) fn r0011_072<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
             )),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::whole_seconds;
+
+    // [0011-016] TTLs are whole seconds on bindings such as NATS: a scaled TTL rounds up.
+    #[test]
+    fn req_0011_016_ttl_rounds_up_to_whole_seconds() {
+        assert_eq!(
+            whole_seconds(Duration::from_millis(400)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            whole_seconds(Duration::from_millis(1500)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            whole_seconds(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(whole_seconds(Duration::ZERO), Duration::from_secs(1));
+    }
 }

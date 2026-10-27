@@ -694,8 +694,7 @@ pub(super) fn r0011_071<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     }
     let first = held.remove(0);
     bx("ack", first.ack())?;
-    match ready_now(next_of(&mut c)) {
-        Some(Ok(_)) => Ok(()),
-        other => Err(format!("no delivery after an ack freed a slot: {other:?}")),
-    }
+    // The freed slot's redelivery is a server push: poll under the time budget.
+    let _freed = settle(control, next_of(&mut c))?;
+    Ok(())
 }

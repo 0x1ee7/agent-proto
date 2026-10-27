@@ -44,6 +44,12 @@ pub trait BusFactory {
     /// clock return [`Clock::Virtual`]; bindings on wall time return
     /// [`Clock::Real`].
     fn clock(&self) -> Clock;
+    /// Which deliveries carry the publisher as principal. Defaults to
+    /// [`DeliveryPrincipal::Full`], the strictest reading; a binding that
+    /// attributes only owner-token subjects overrides it with `OwnerToken`.
+    fn delivery_principal(&self) -> DeliveryPrincipal {
+        DeliveryPrincipal::Full
+    }
 
     /// Starts a fresh binding.
     ///
@@ -55,6 +61,16 @@ pub trait BusFactory {
         seed: u64,
         withhold: Option<&'static str>,
     ) -> Result<(Self::Bus, Self::Control), BusError>;
+}
+
+/// How a binding attributes deliveries to their publisher ([0002-011]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryPrincipal {
+    /// Every delivery carries the authenticated publisher.
+    Full,
+    /// Only deliveries on subjects whose owner token names the publisher carry
+    /// it; other deliveries carry no principal.
+    OwnerToken,
 }
 
 /// Everything a check needs: the binding, its control, fixtures and seed.
@@ -416,6 +432,7 @@ pub fn run_suite<F: BusFactory>(factory: &F, seed: u64) -> Result<Report, String
     Ok(Report {
         profile: bus_api::capabilities::A2A_BUS_M1.name(),
         binding: factory.binding(),
+        delivery_principal: factory.delivery_principal(),
         capabilities,
         seed,
         results,

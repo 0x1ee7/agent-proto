@@ -104,7 +104,9 @@ impl<'a, C: BusControl + ?Sized> Timeline<'a, C> {
         }
     }
 
-    /// Moves time forward by `by`: advances the virtual clock, or sleeps.
+    /// Moves time forward by `by`: advances the virtual clock, or sleeps. On a real
+    /// clock `by` is wall time, slept as given; callers pass durations already scaled
+    /// by [`Clock::scaled`].
     ///
     /// # Errors
     /// `unsupported: advance` when a virtual binding has no clock to advance.

@@ -1,16 +1,11 @@
 //! Principal derivation (RFC-0010 0010-078). The NATS binding has no
 //! authenticated sender field. A request's principal is the identity in its inbox.
-//! A stream message's principal is the identity the binding stamped on it under
-//! [`PRINCIPAL_HEADER`] when it was published; a message without that header falls
-//! back to the subject, where the server permission model places the identity.
+//! A stream message's principal is the owner token of its subject, for event and audit
+//! subjects only. The server permission model (0010-060) lets an agent publish only on
+//! its own `ev.<self>.>` and `audit.<self>`, so that token names the publisher. No client
+//! header sets the principal.
 
 use bus_api::name::Principal;
-
-/// Reserved header carrying the publisher's identity on stream messages. The binding
-/// stamps it on every stream publish and append, replacing any caller value, and
-/// strips it before delivery. The server does not verify it: a raw NATS client can
-/// write it, so it is the binding's own claim about its publishes.
-pub(crate) const PRINCIPAL_HEADER: &str = "a2a-principal";
 
 /// Inbox prefix of an identity: `_INBOX.<identity>`.
 pub(crate) fn inbox_prefix(identity: &str) -> String {
@@ -28,9 +23,9 @@ pub(crate) fn principal_from_inbox(reply: &str) -> Option<Principal> {
     Principal::named(identity).ok()
 }
 
-/// Principal of a stream message, taken from subject token 4 of
-/// `a2a.v1.<tenant>.ev.<agent>.<task>` and `a2a.v1.<tenant>.audit.<identity>`.
-/// Returns `None` for any other subject shape.
+/// Principal of a stream message: subject token 4 of `a2a.v1.<tenant>.ev.<agent>.<task>`
+/// or `a2a.v1.<tenant>.audit.<identity>`, the publisher the server lets write that
+/// subject. Returns `None` for any other shape.
 pub(crate) fn principal_from_subject(subject: &str) -> Option<Principal> {
     let mut tokens = subject.split('.');
     if tokens.next()? != "a2a" || tokens.next()? != "v1" {
@@ -66,9 +61,8 @@ mod tests {
         assert!(principal_from_inbox("_INBOX.Bad Name.x").is_none());
     }
 
-    // 0010-078 covers request principals only. Stream deliveries carry the stamped
-    // `a2a-principal` header first (0011-040); subject token 4 is the fallback. This test
-    // guards the fallback reading (RFC feedback: principal source for stream deliveries).
+    // 0010-078 covers request principals and the stream owner token. This test guards
+    // the subject reading for stream deliveries (RFC feedback: principal source).
     #[test]
     fn req_0010_078_subject_principal_for_events_and_audit() {
         let ev =

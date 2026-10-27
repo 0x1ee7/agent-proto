@@ -7,34 +7,11 @@ use bus_api::headers::Headers;
 use bytes::Bytes;
 
 use crate::layout::{MAX_BODY_BYTES, MAX_WIRE_BYTES};
-use crate::principal::PRINCIPAL_HEADER;
 
 /// The NATS header status line, `NATS/1.0\r\n`.
 const STATUS_LINE_LEN: usize = 10;
 /// The blank line that ends a header block.
 const HEADER_END_LEN: usize = 2;
-
-/// Stamps `identity` as the reserved principal header, replacing any value the caller
-/// set, so the stream message carries its publisher (see `principal`). Applied before
-/// the budget check, so the stamped header counts toward the limit.
-pub(crate) fn stamp_principal(headers: &Headers, identity: &str) -> Result<Headers, BusError> {
-    let mut out = headers.clone();
-    out.insert(PRINCIPAL_HEADER, identity)
-        .map_err(|_| BusError::Internal)?;
-    Ok(out)
-}
-
-/// `headers` without the reserved principal header, which the caller never set.
-pub(crate) fn without_principal(headers: &Headers) -> Headers {
-    let mut out = Headers::new();
-    for (name, value) in headers.iter() {
-        if name != PRINCIPAL_HEADER {
-            // Names and values were validated when `headers` was built.
-            let _ = out.insert(name, value);
-        }
-    }
-    out
-}
 
 /// Checks the body limit and the headers-plus-body limit before sending.
 pub(crate) fn check_budget(headers: &Headers, payload: &Bytes) -> Result<(), BusError> {

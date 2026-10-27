@@ -20,7 +20,7 @@ use bus_api::bus::Consumer;
 use bus_api::error::BusError;
 use bus_api::headers::Headers;
 use bus_api::message::{Delivery, PublishAck, StartPosition};
-use bus_api::name::{ConsumerName, MsgId, Principal, StreamName, Subject, SubjectPattern};
+use bus_api::name::{ConsumerName, MsgId, StreamName, Subject, SubjectPattern};
 use bus_api::value::StreamSeq;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -29,11 +29,9 @@ use crate::connection::NatsBus;
 use crate::denial::{CORE_PUBLISH_REPORT_WINDOW, Denied, denied_within, guard};
 use crate::errors::{self, reason};
 use crate::layout::{MAX_ACK_PENDING, MAX_DELIVER};
-use crate::principal::{PRINCIPAL_HEADER, inbox_prefix, principal_from_subject};
+use crate::principal::{inbox_prefix, principal_from_subject};
 use crate::settle::JetStreamSettlement;
-use crate::wire::{
-    check_budget, inbound_headers, stamp_principal, to_header_map, without_principal,
-};
+use crate::wire::{check_budget, inbound_headers, to_header_map};
 
 /// Header carrying the JetStream dedupe key (`Nats-Msg-Id`).
 pub(crate) const NATS_MSG_ID: &str = "Nats-Msg-Id";
@@ -119,12 +117,11 @@ pub(crate) async fn publish(
     headers: &Headers,
     payload: Bytes,
 ) -> Result<PublishAck, BusError> {
-    let headers = stamp_principal(headers, bus.identity())?;
-    check_budget(&headers, &payload)?;
+    check_budget(headers, &payload)?;
     match publish_durable(
         bus,
         subject.as_str(),
-        to_header_map(&headers),
+        to_header_map(headers),
         payload.clone(),
     )
     .await?
@@ -134,7 +131,7 @@ pub(crate) async fn publish(
             seq: Some(StreamSeq::new(ack.sequence)),
         }),
         Err(err) if err.kind() == PublishErrorKind::StreamNotFound => {
-            core_publish(bus, subject, &headers, payload).await
+            core_publish(bus, subject, headers, payload).await
         }
         Err(err) => Err(errors::js_publish(&err)),
     }
@@ -185,8 +182,7 @@ pub(crate) async fn append(
     payload: Bytes,
     msg_id: &MsgId,
 ) -> Result<PublishAck, BusError> {
-    let headers = stamp_principal(headers, bus.identity())?;
-    check_budget(&headers, &payload)?;
+    check_budget(headers, &payload)?;
     let handle = open_stream(bus, stream).await?;
     let captured = handle
         .cached_info()
@@ -197,7 +193,7 @@ pub(crate) async fn append(
     if !captured {
         return Err(BusError::Absent);
     }
-    let mut map = to_header_map(&headers);
+    let mut map = to_header_map(headers);
     map.insert(NATS_MSG_ID, msg_id.as_str());
     let ack = publish_durable(bus, subject.as_str(), map, payload)
         .await?
@@ -244,11 +240,7 @@ impl Consumer for NatsConsumer {
         let (message, acker) = msg.split();
         let subject = Subject::parse(message.subject.as_str()).map_err(|_| BusError::Internal)?;
         let headers = inbound_headers(message.headers.as_ref()).ok_or(BusError::Internal)?;
-        let principal = headers
-            .get(PRINCIPAL_HEADER)
-            .and_then(|who| Principal::named(who).ok())
-            .or_else(|| principal_from_subject(subject.as_str()));
-        let headers = without_principal(&headers);
+        let principal = principal_from_subject(subject.as_str());
         Ok(Delivery::new(
             subject,
             principal,

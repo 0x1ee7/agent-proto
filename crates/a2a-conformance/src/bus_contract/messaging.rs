@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use super::support::{expect_delivery, headers, next_of, open, put, seq_of};
 use super::{BusFactory, Ctx, bx, expect_variant, pat, settle, subj};
-use crate::driver::{drive, join, ready_now};
+use crate::driver::{Clock, UNSUPPORTED, drive, join, ready_now};
 use crate::fixtures::CONSUMER;
 
 /// Result for a driver that ran out of virtual time.
@@ -356,13 +356,14 @@ pub(super) fn r0011_015<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     })?;
     let d1 = settle(control, next_of(&mut c))?;
     expect_delivery(&d1, "suite.st.a", b"one", Some(seq_a))?;
+    // Captured before the nak, which starts the delay timer.
+    let before = control.now()?;
     bx("nak", d1.nak(fx.scaled(Duration::from_secs(2))))?;
     match ready_now(next_of(&mut c)) {
         None => {}
         Some(Ok(_)) => return Err("nak'd delivery redelivered before its delay".to_owned()),
         Some(Err(reason)) => return Err(reason),
     }
-    let before = control.now()?;
     let d2 = settle(control, next_of(&mut c))?;
     let waited = control.now()?.saturating_sub(before);
     if waited < fx.scaled(Duration::from_secs(2)) {
@@ -388,6 +389,8 @@ pub(super) fn r0011_015<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     bx("ack", d3.ack())?;
 
     // unacked past ack_wait: redelivered with attempt >= 2.
+    // Captured before the delivery below, which starts the ack_wait timer.
+    let before = control.now()?;
     let seq_c = settle(control, async {
         seq_of(&put(bus, &fx.client, "suite.st.c", b"three").await?)
     })?;
@@ -399,7 +402,6 @@ pub(super) fn r0011_015<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
         Some(Ok(_)) => return Err("unacked delivery redelivered before ack_wait".to_owned()),
         Some(Err(reason)) => return Err(reason),
     }
-    let before = control.now()?;
     let d5 = settle(control, next_of(&mut c))?;
     let waited = control.now()?.saturating_sub(before);
     if waited < fx.ack_wait {
@@ -527,6 +529,9 @@ pub(super) fn r0011_022<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
 
 /// [0011-023] dedupe covers the window; past it a second copy may be stored.
 pub(super) fn r0011_023<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
+    if matches!(ctx.control.clock(), Clock::Real { .. }) {
+        return Err(format!("{UNSUPPORTED}advance by the dedupe window"));
+    }
     let fx = ctx.fx;
     let bus = ctx.bus;
     let subject = subj("suite.dd.23")?;

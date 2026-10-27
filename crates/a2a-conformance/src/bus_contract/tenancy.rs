@@ -12,7 +12,7 @@ use bus_api::value::Digest;
 use bytes::Bytes;
 
 use super::support::{expect_delivery, headers, next_of, open, put, seq_of};
-use super::{BusFactory, Ctx, bx, expect_denied, pat, settle, subj};
+use super::{BusFactory, Ctx, DeliveryPrincipal, bx, expect_denied, pat, settle, subj};
 use crate::driver::join;
 
 fn key(text: &str) -> Result<Key, String> {
@@ -95,8 +95,9 @@ pub(super) fn r0011_040<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
     principal_not_spoofable(ctx)
 }
 
-/// [0002-011] a received request or delivery carries the principal the binding
-/// authenticated; a forged `A2AB-Sender` header or payload cannot change it.
+/// [0002-011] a received request carries the principal the binding authenticated.
+/// A delivery carries the real publisher, or none on a binding whose tier is
+/// `OwnerToken`; a forged `A2AB-Sender` header or payload never changes it.
 /// RFC-0011 has no row for receiver-side sender checks, so the assertion is
 /// recorded under [0011-040].
 fn principal_not_spoofable<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String> {
@@ -166,11 +167,21 @@ fn principal_not_spoofable<F: BusFactory>(ctx: &Ctx<'_, F>) -> Result<(), String
     })?;
     let delivery = settle(ctx.control, next_of(&mut c))?;
     expect_delivery(&delivery, "suite.spoof040", body.as_ref(), Some(seq))?;
-    if delivery.principal() != Some(&fx.client) {
-        return Err(format!(
-            "delivery principal {:?}, expected client",
-            delivery.principal()
-        ));
+    // A binding that authenticates every publisher (Full) must report the real one.
+    // A binding that attributes only owner-token subjects (OwnerToken) may report
+    // None. No binding may report the forged name.
+    let tier = ctx.factory.delivery_principal();
+    match delivery.principal() {
+        Some(p) if p == &fx.outsider => {
+            return Err(format!("delivery principal is the forged {p:?}"));
+        }
+        Some(p) if p == &fx.client => {}
+        None if tier == DeliveryPrincipal::OwnerToken => {}
+        other => {
+            return Err(format!(
+                "delivery principal {other:?} on a {tier:?} binding, expected client"
+            ));
+        }
     }
     Ok(())
 }

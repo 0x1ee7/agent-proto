@@ -16,7 +16,13 @@ Provides:
   `BusControl::advance` and needs no sleeping. `Clock::Real { scale }` waits on the
   wall clock; nominal durations are multiplied by `scale` in (0, 1]. `Timeline` is the
   only path to time and fault controls; each control call returns `Result<_, String>`.
+  On a real clock `advance` sleeps the given duration unscaled, so callers pass scaled
+  durations. A check whose wait cannot be scaled (0011-023 dedupe window) reports
+  `unsupported:` on a real clock. A TTL is rounded up to whole seconds (0011-016).
   A future that cannot finish within the budget is a stall, reported as a failure.
+- `bus_contract::DeliveryPrincipal` (`Full` default, `OwnerToken`): the delivery-principal
+  tier a binding declares via `BusFactory::delivery_principal`. 0011-040 accepts a `None`
+  delivery principal only for `OwnerToken`; `report::Report` prints the tier.
 - `report::{Report, CheckResult, Outcome, Conformance, BindingInfo}`: `Report`
   implements `Display`; `Report::conformance()` applies the claim rule.
   `Conformance::Partial { unexercised }` means no row failed but some could not run.

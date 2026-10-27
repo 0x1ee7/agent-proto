@@ -11,6 +11,8 @@ use std::fmt::{self, Display, Formatter};
 
 use bus_api::capabilities::Capabilities;
 
+use crate::bus_contract::DeliveryPrincipal;
+
 /// Result of one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -96,6 +98,8 @@ pub struct Report {
     pub profile: &'static str,
     /// Binding identity.
     pub binding: BindingInfo,
+    /// How the binding attributes deliveries to their publisher.
+    pub delivery_principal: DeliveryPrincipal,
     /// Declared capability values.
     pub capabilities: Capabilities,
     /// Seed the run used.
@@ -136,6 +140,7 @@ impl Display for Report {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         writeln!(f, "profile: {}", self.profile)?;
         writeln!(f, "binding: {} {}", self.binding.name, self.binding.version)?;
+        writeln!(f, "delivery principal: {:?}", self.delivery_principal)?;
         writeln!(f, "seed: {}", self.seed)?;
         writeln!(f, "capabilities: {:?}", self.capabilities)?;
         for result in &self.results {
