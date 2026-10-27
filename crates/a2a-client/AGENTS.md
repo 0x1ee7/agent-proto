@@ -10,7 +10,8 @@ Provides:
   `get_task`, `list_tasks`, `cancel_task`, `extended_card`, `push_*`, `decide` (config signing hook),
   `decide_signed` (explicit operator `SigningHook`, RFC-0007 [0007-038]).
 - `Outbound`, `text`: request message builder (`message_id`, task and context ids, parts,
-  budget, return-immediately).
+  budget, return-immediately). `transport_id` names the bus message id; `to_message` and
+  `from_message` convert to and from the wire message so a journaled send can be repeated.
 - `CallOptions`, `Config`, `SigningHook`, `VerifyHook`.
 - `signing::envelope_hook(signer, clock)`: signs outgoing requests (RFC-0007 0007-032..040). No verify constructor: `VerifyHook` lacks the subject and replay/trust state that `verify_request` needs.
 - `EventStream`, `Event`, `StreamStart`, `Outcome`, `SendReply`, `Unary`: task event delivery.

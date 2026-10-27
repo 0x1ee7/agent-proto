@@ -71,8 +71,44 @@ impl Outbound {
         self
     }
 
+    /// Transport identifier sent as `A2AB-Msg-Id` (RFC-0002 0002-031). A resend of this message
+    /// must reuse it so the worker dedupes it (RFC-0015 0015-062).
+    #[must_use]
+    pub fn transport_id(&self) -> &MessageId {
+        &self.transport_id
+    }
+
+    /// Rebuilds a message from the protobuf form returned by [`Outbound::to_message`], the
+    /// transport identifier it was first sent under, and its `return_immediately` flag
+    /// (RFC-0015 0015-062). The flag lives in the request configuration rather than the message,
+    /// so the caller journals it with the message. Returns `None` when an identifier is
+    /// malformed. The budget stays in `message.metadata`, so `budget` is `None`.
+    #[must_use]
+    pub fn from_message(
+        message: pb::Message,
+        transport_id: MessageId,
+        return_immediately: bool,
+    ) -> Option<Self> {
+        Some(Self {
+            message_id: MessageId::parse(&message.message_id).ok()?,
+            transport_id,
+            task_id: match message.task_id.as_str() {
+                "" => None,
+                id => Some(TaskId::parse(id).ok()?),
+            },
+            context_id: match message.context_id.as_str() {
+                "" => None,
+                id => Some(ContextId::parse(id).ok()?),
+            },
+            parts: message.parts,
+            metadata: message.metadata,
+            budget: None,
+            return_immediately,
+        })
+    }
+
     /// Builds the protobuf message, attaching the budget to its metadata.
-    pub(crate) fn to_message(&self) -> Result<pb::Message, ClientError> {
+    pub fn to_message(&self) -> Result<pb::Message, ClientError> {
         let mut metadata = self.metadata.clone();
         if let Some(budget) = &self.budget {
             budget::attach(&mut metadata, budget)?;

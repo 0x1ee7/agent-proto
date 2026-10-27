@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
-use a2a_client::{CallOptions, Client, Config as ClientConfig};
+use a2a_client::{CallOptions, Client, Config as ClientConfig, Outbound};
 use a2a_core::budget::Usage;
 use a2a_core::envelope::{Clock, SystemClock};
 use a2a_core::task::{ChildEnd, Effect, TaskError, TaskStore};
@@ -24,7 +24,7 @@ use a2a_mcp::ipc::{
     Secret, TaskResult, constant_time_eq, reason,
 };
 use a2a_mcp::ipc_server::{GrantTable, ServerHandle, ServerRequest};
-use a2a_types::ids::{AgentId, TaskId};
+use a2a_types::ids::{AgentId, MessageId, TaskId};
 use a2a_types::proto::a2a::{self as pb, TaskState};
 use a2a_types::proto::a2abus::Hop;
 use a2a_types::vocab::ext;
@@ -283,6 +283,65 @@ pub(crate) struct Delegation<B: Bus> {
     children: BTreeMap<String, Child>,
     /// Idempotency ledger: (parent task, idempotency key) to the child's local id (0015-048).
     ledger: Ledger,
+    /// Journaled sends not yet confirmed as `sent`; resent by the next pass (0015-062).
+    pending: Vec<Pending>,
+    /// Test crash injection: park after the remote accepts a child, before `sent` (0015-062).
+    #[cfg(test)]
+    pub(crate) park_after_accept: bool,
+}
+
+/// A child journaled as `prepared` whose send is not yet journaled as `sent` (0015-062). The
+/// recorded message and transport identifier let the send be repeated unchanged.
+pub(crate) struct Pending {
+    child: String,
+    parent: String,
+    key: String,
+    target: AgentId,
+    context: String,
+    chain_length: u32,
+    deadline: u64,
+    message: Outbound,
+}
+
+impl Pending {
+    /// Reads a `prepared` record. Every field is required; a record without its message or
+    /// transport identifier is corrupt.
+    fn from_record(record: &serde_json::Value) -> Result<Self, WorkerError> {
+        let wire = record.get("message").cloned().ok_or_else(corrupt_journal)?;
+        let wire: pb::Message = serde_json::from_value(wire).map_err(|_| corrupt_journal())?;
+        let immediate = record
+            .get("return_immediately")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(corrupt_journal)?;
+        let transport =
+            MessageId::parse(journal_str(record, "transport")?).map_err(|_| corrupt_journal())?;
+        Ok(Self {
+            child: journal_str(record, "child")?.to_owned(),
+            parent: journal_str(record, "parent")?.to_owned(),
+            key: journal_str(record, "key")?.to_owned(),
+            target: AgentId::parse(journal_str(record, "target")?)
+                .map_err(|_| corrupt_journal())?,
+            context: journal_str(record, "context")?.to_owned(),
+            chain_length: record
+                .get("hop")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|hop| u32::try_from(hop).ok())
+                .ok_or_else(corrupt_journal)?,
+            deadline: record
+                .get("deadline")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(corrupt_journal)?,
+            message: Outbound::from_message(wire, transport, immediate)
+                .ok_or_else(corrupt_journal)?,
+        })
+    }
+}
+
+/// Journal state rebuilt by `replay_journal`.
+struct Replayed {
+    ledger: Ledger,
+    children: BTreeMap<String, Child>,
+    pending: Vec<Pending>,
 }
 
 /// Peer-call state kept on the worker (RFC-0015).
@@ -362,7 +421,11 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             self.config.agent.clone(),
         )
         .map_err(|_| WorkerError::Config("delegation client unavailable"))?;
-        let (ledger, children) = self.replay_journal()?;
+        let Replayed {
+            ledger,
+            children,
+            pending,
+        } = self.replay_journal()?;
         // Cancels queued by recovery (0015-063) survive the attach and flush on the next pump.
         let cancels = std::mem::take(&mut self.peers.cancels);
         self.peers = peers;
@@ -375,15 +438,28 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             client,
             ledger,
             children,
+            pending,
+            #[cfg(test)]
+            park_after_accept: false,
         });
         Ok(())
     }
 
-    /// Rebuilds the idempotency ledger and the child table from the delegation journal
-    /// (0015-062, 0015-063). Only children whose send was journaled as `sent` are restored;
-    /// a `prepared` record without `sent` never reached the peer, so it has no child to
-    /// resume. Restored children are polled and canceled through the normal delegation path.
-    fn replay_journal(&self) -> Result<(Ledger, BTreeMap<String, Child>), WorkerError> {
+    /// Test crash injection (0015-062): the next child this worker sends is parked after the
+    /// remote accepts it and before `sent` is journaled, as if the process stopped there.
+    #[cfg(test)]
+    pub(crate) fn park_after_accept(&mut self) {
+        if let Some(d) = self.delegation.as_mut() {
+            d.park_after_accept = true;
+        }
+    }
+
+    /// Rebuilds the idempotency ledger, the child table and the sends still to make from the
+    /// delegation journal (0015-062, 0015-063). A child is restored once its send is journaled as
+    /// `sent`. A `prepared` record closed by neither `sent` nor `abandoned` is returned as pending
+    /// so its message can be resent with the recorded transport identifier. Restored children are
+    /// polled and canceled through the normal delegation path.
+    fn replay_journal(&self) -> Result<Replayed, WorkerError> {
         let now = self.clock.now_ms().ok_or(WorkerError::Clock)?;
         let records: Vec<serde_json::Value> = self
             .tasks
@@ -391,54 +467,48 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             .into_iter()
             .cloned()
             .collect();
-        let mut prepared: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let mut prepared: BTreeMap<String, Pending> = BTreeMap::new();
         let mut ledger = Ledger::new();
         let mut children = BTreeMap::new();
         for record in records {
             let child = journal_str(&record, "child")?.to_owned();
             match journal_str(&record, "phase")? {
                 "prepared" => {
-                    prepared.insert(child, record);
+                    prepared.insert(child, Pending::from_record(&record)?);
+                }
+                "abandoned" => {
+                    prepared.remove(&child).ok_or_else(corrupt_journal)?;
                 }
                 "sent" => {
-                    let entry = prepared.get(&child).ok_or_else(corrupt_journal)?;
+                    let entry = prepared.remove(&child).ok_or_else(corrupt_journal)?;
                     let remote = TaskId::parse(journal_str(&record, "remote")?)
                         .map_err(|_| corrupt_journal())?;
-                    let parent = journal_str(entry, "parent")?.to_owned();
-                    let key = journal_str(entry, "key")?.to_owned();
-                    let target = AgentId::parse(journal_str(entry, "target")?)
-                        .map_err(|_| corrupt_journal())?;
-                    let chain_length = entry
-                        .get("hop")
-                        .and_then(serde_json::Value::as_u64)
-                        .and_then(|hop| u32::try_from(hop).ok())
-                        .ok_or_else(corrupt_journal)?;
-                    let deadline = entry
-                        .get("deadline")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(corrupt_journal)?;
-                    ledger.insert((parent.clone(), key), child.clone());
+                    ledger.insert((entry.parent.clone(), entry.key), child.clone());
                     children.insert(
                         child,
                         Child {
-                            parent,
-                            target,
+                            parent: entry.parent,
+                            target: entry.target,
                             remote,
-                            context_id: journal_str(entry, "context")?.to_owned(),
-                            chain_length,
+                            context_id: entry.context,
+                            chain_length: entry.chain_length,
                             state: TaskState::Submitted,
                             cancel_requested: false,
                             settled: None,
                             waiters: Vec::new(),
                             next_poll: now.saturating_add(CHILD_POLL_MS),
-                            deadline,
+                            deadline: entry.deadline,
                         },
                     );
                 }
                 _ => return Err(corrupt_journal()),
             }
         }
-        Ok((ledger, children))
+        Ok(Replayed {
+            ledger,
+            children,
+            pending: prepared.into_values().collect(),
+        })
     }
 
     /// Stops delegation (RFC-0015 0015-074): revokes every grant, answers pending
@@ -534,6 +604,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         while let Ok(request) = d.requests.try_recv() {
             self.dispatch(d, request, now, &mut effects).await?;
         }
+        self.resume_sends(d, now, &mut effects).await?;
         self.flush_cancels(d).await?;
         self.poll_children(d, now, &mut effects).await?;
         expire_waiters(d, now);

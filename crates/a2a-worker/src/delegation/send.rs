@@ -24,7 +24,8 @@ use super::policy::{
 };
 use super::result::{frame, state_name};
 use super::{
-    CHILD_POLL_MS, Child, Delegation, Waiter, current, respond_err, respond_outcome, respond_value,
+    CHILD_POLL_MS, Child, Delegation, Pending, Waiter, current, respond_err, respond_outcome,
+    respond_value,
 };
 use crate::backend::Backend;
 use crate::error::WorkerError;
@@ -85,10 +86,6 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 return Ok(());
             }
         };
-        d.ledger.insert(
-            (task.to_owned(), params.idempotency_key.clone()),
-            child_id.clone(),
-        );
         self.observe(d, &child_id, &remote, now, effects)?;
         replay(d, request, &child_id, blocking);
         Ok(())
@@ -107,6 +104,16 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         let prepared = match self.prepare(d, task, params, now, effects) {
             Ok(prepared) => prepared,
             Err(err) => return Ok(Err(err)),
+        };
+        // The wire message and its transport identifier are journaled with the child, so a
+        // resend after a crash repeats the same request (0015-062).
+        let Some(wire) = prepared
+            .message
+            .to_message()
+            .ok()
+            .and_then(|message| serde_json::to_value(message).ok())
+        else {
+            return Ok(Err(unavailable()));
         };
         let (child_id, allowance) = match self.tasks.delegate(task) {
             Ok(created) => created,
@@ -129,6 +136,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             "context": prepared.context,
             "hop": prepared.hop,
             "deadline": prepared.deadline,
+            "message": wire,
+            "transport": prepared.message.transport_id().as_str(),
+            "return_immediately": prepared.message.return_immediately,
         });
         if self
             .tasks
@@ -138,52 +148,133 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             self.settle_unsent(task, &child_id, now, effects)?;
             return Ok(Err(unavailable()));
         }
+        let pending = Pending {
+            child: child_id.clone(),
+            parent: task.to_owned(),
+            key: params.idempotency_key.clone(),
+            target: prepared.target,
+            context: prepared.context,
+            chain_length: prepared.hop,
+            deadline: prepared.deadline,
+            message: prepared.message,
+        };
+        let Some(remote) = self.send_pending(d, &pending, now, effects).await? else {
+            return Ok(Err(unavailable()));
+        };
+        self.audit(
+            Some(task),
+            format!(
+                "DELEGATION_CHILD_CREATED child={child_id} target={} chain_length={}",
+                pending.target.as_str(),
+                pending.chain_length
+            ),
+        );
+        Ok(Ok((child_id, remote)))
+    }
+
+    /// Sends a journaled child message and records the outcome (0015-062). On success the send
+    /// is journaled as `sent`, the child is tracked and the ledger is updated; returns the remote
+    /// task's first view. A failed send abandons the child and returns `None`.
+    async fn send_pending(
+        &mut self,
+        d: &mut Delegation<B>,
+        pending: &Pending,
+        now: u64,
+        effects: &mut Vec<Effect>,
+    ) -> Result<Option<pb::Task>, WorkerError> {
         let sent = self
             .await_peer(
                 d.client
-                    .send(&prepared.target, &prepared.message, &CallOptions::default()),
+                    .send(&pending.target, &pending.message, &CallOptions::default()),
             )
             .await?;
         let remote = match sent.map(|unary| unary.value) {
             Ok(SendReply::Task(remote)) => remote,
             _ => {
-                self.settle_unsent(task, &child_id, now, effects)?;
-                return Ok(Err(unavailable()));
+                self.abandon(pending, now, effects)?;
+                return Ok(None);
             }
         };
         let Ok(remote_id) = TaskId::parse(&remote.id) else {
-            self.settle_unsent(task, &child_id, now, effects)?;
-            return Ok(Err(unavailable()));
+            self.abandon(pending, now, effects)?;
+            return Ok(None);
         };
+        #[cfg(test)]
+        {
+            // Crash point (0015-062): the remote accepted the child, but `sent` is never written.
+            if std::mem::take(&mut d.park_after_accept) {
+                std::future::pending::<()>().await;
+            }
+        }
         self.tasks.append_extension(
             super::JOURNAL_OWNER,
-            serde_json::json!({"phase": "sent", "child": child_id, "remote": remote_id.as_str()}),
+            json!({"phase": "sent", "child": pending.child, "remote": remote_id.as_str()}),
         )?;
+        d.ledger.insert(
+            (pending.parent.clone(), pending.key.clone()),
+            pending.child.clone(),
+        );
         d.children.insert(
-            child_id.clone(),
+            pending.child.clone(),
             Child {
-                parent: task.to_owned(),
-                target: prepared.target.clone(),
+                parent: pending.parent.clone(),
+                target: pending.target.clone(),
                 remote: remote_id,
-                context_id: prepared.context,
-                chain_length: prepared.hop,
+                context_id: pending.context.clone(),
+                chain_length: pending.chain_length,
                 state: TaskState::Submitted,
                 cancel_requested: false,
                 settled: None,
                 waiters: Vec::new(),
                 next_poll: now.saturating_add(CHILD_POLL_MS),
-                deadline: prepared.deadline,
+                deadline: pending.deadline,
             },
         );
-        self.audit(
-            Some(task),
-            format!(
-                "DELEGATION_CHILD_CREATED child={child_id} target={} chain_length={}",
-                prepared.target.as_str(),
-                prepared.hop
-            ),
-        );
-        Ok(Ok((child_id, remote)))
+        Ok(Some(remote))
+    }
+
+    /// Closes a child whose send failed: `abandoned` stops a restart from resending it, then its
+    /// allowance is released (0015-062).
+    fn abandon(
+        &mut self,
+        pending: &Pending,
+        now: u64,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), WorkerError> {
+        self.tasks.append_extension(
+            super::JOURNAL_OWNER,
+            json!({"phase": "abandoned", "child": pending.child}),
+        )?;
+        self.settle_unsent(&pending.parent, &pending.child, now, effects)
+    }
+
+    /// Resends the messages journaled as `prepared` before a restart (0015-062). Each resend
+    /// carries the recorded message and transport identifier, so the child worker answers with
+    /// the child it already holds or creates it once. Runs before cancels flush, so a resumed
+    /// child of a parent that failed at restart is canceled.
+    pub(crate) async fn resume_sends(
+        &mut self,
+        d: &mut Delegation<B>,
+        now: u64,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), WorkerError> {
+        for pending in std::mem::take(&mut d.pending) {
+            if self
+                .send_pending(d, &pending, now, effects)
+                .await?
+                .is_some()
+            {
+                self.audit(
+                    Some(pending.parent.as_str()),
+                    format!(
+                        "DELEGATION_CHILD_RESUMED child={} target={}",
+                        pending.child,
+                        pending.target.as_str()
+                    ),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Refusals (a) to (f) of 0015-054 and the outbound message for a child.

@@ -66,6 +66,12 @@ impl Mesh {
             child: self.child_mock.clone(),
         }
     }
+
+    /// Crash injection (0015-062): the parent parks after its child accepts a message and
+    /// before `sent` is journaled. Restart it with [`restart_parent`].
+    pub(crate) fn park_parent_after_accept(&mut self) {
+        self.parent.park_after_accept();
+    }
 }
 
 pub(crate) fn mesh(spec: Spec) -> Mesh {

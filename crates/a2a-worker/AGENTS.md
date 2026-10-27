@@ -58,7 +58,7 @@ Layer L3 worker (RFC-0001 section 4.2). Serves one agent's RPC subjects, runs ta
 - 0012-067: a session workspace is keyed by its context id. An opaque (non-UUID) context id maps to a derived version-8 UUID, so its workspace is leased; a canonical UUID keeps its short id. Guarded in `workspace` tests.
 - 0015-043: five authentication failures in 60 s lock out the endpoint, including the correct credential. Guarded in `delegation` and `tests::req_0015` tests.
 - 0015-054, 0015-058: refused and return-to-chain calls create no child. Guarded in `tests::req_0015`.
-- 0015-062: gap, not met. A crash between the remote accept and the `sent` record orphans the remote child: recovery drops the `prepared` record and does not resend. The outbound message is not yet journaled.
+- 0015-062: a crash between the remote accept and the `sent` record does not orphan the child. The `prepared` record carries the wire message, its transport id and its `return_immediately` flag; recovery resends it with the same ids and flag, so the remote returns the child it already holds, and `sent` is written once. A send that fails is closed by `abandoned`. Guarded in `tests::req_0015`.
 - 0015-067: parent stays non-terminal until its children are terminal; a deferred parent cancelled by the operator commits CANCELED at once (cancel path). Guarded in `tests::req_0015`.
 - 0015-070: a failed child fails the delegating task with CHILD_FAILED. Guarded in `tests::req_0015`.
 - 0015-075: each delegation outcome writes one audit note. Guarded in `tests::req_0015`.

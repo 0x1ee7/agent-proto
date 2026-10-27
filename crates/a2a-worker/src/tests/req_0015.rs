@@ -816,3 +816,75 @@ fn req_0015_063_restart_cancels_open_child_once() {
         .count();
     assert_eq!(cancels, 1, "the open child is canceled exactly once");
 }
+
+/// Counts the delegation journal records written with `phase` (0015-062).
+fn journal_count(store: &SharedStore, phase: &str) -> usize {
+    let needle = format!(r#""phase":"{phase}""#);
+    store
+        .records()
+        .unwrap()
+        .iter()
+        .map(|raw| String::from_utf8_lossy(raw).into_owned())
+        .filter(|text| text.contains(crate::delegation::JOURNAL_OWNER) && text.contains(&needle))
+        .count()
+}
+
+/// 0015-062: a crash after the remote accepts a child and before `sent` is journaled leaves
+/// exactly one child. The restarted parent resends the recorded message with its transport
+/// identifier, the child answers with the child it already holds, and that child is canceled.
+#[test]
+fn req_0015_062_crash_between_accept_and_sent_leaves_exactly_one_child() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.child_mock.enqueue(vec![Step::Hold]);
+    m.parent_mock.enqueue(vec![Step::Hold]);
+    m.park_parent_after_accept();
+    let parent_id = drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "crash").await;
+        let tools = peer_tools(&h.parent).await;
+        let _call = ipc_call(&tools, send_frame(CHILD, "long", "k1", Wait::Blocking));
+        peer_tools(&h.child).await;
+        // Give the accept reply time to reach the parent, which then parks (0015-062).
+        for _ in 0..200 {
+            yield_now().await;
+        }
+        parent.id
+    });
+    assert_eq!(
+        journal_count(&m.parent_store, "prepared"),
+        1,
+        "the child is journaled before the send"
+    );
+    assert_eq!(
+        journal_count(&m.parent_store, "sent"),
+        0,
+        "the crash lands before `sent` is written"
+    );
+    let mut m = restart_parent(m);
+    let h = m.handles();
+    drive_mesh(&mut m, async move {
+        until_state(&h.bus, PARENT, &parent_id, pb::TaskState::Failed).await;
+        while !cancel_seen(&h.child) {
+            yield_now().await;
+        }
+    });
+    let starts = m
+        .child_mock
+        .commands()
+        .iter()
+        .filter(|c| matches!(c, crate::mock::Command::Start(_)))
+        .count();
+    assert_eq!(starts, 1, "the resend reaches the one child that exists");
+    let cancels = m
+        .child_mock
+        .commands()
+        .iter()
+        .filter(|c| matches!(c, crate::mock::Command::Cancel(_)))
+        .count();
+    assert_eq!(cancels, 1, "the one child is canceled exactly once");
+    assert_eq!(
+        journal_count(&m.parent_store, "sent"),
+        1,
+        "the resumed child is recorded as sent once"
+    );
+}
