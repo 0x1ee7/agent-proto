@@ -1093,6 +1093,19 @@ impl<S: TaskStore> Tasks<S> {
         reason: StopReason,
         now: u64,
     ) -> Result<Vec<Effect>, TaskError> {
+        self.backend_stopped_with_detail(task_id, reason, None, now)
+    }
+
+    /// As [`Tasks::backend_stopped`], carrying the backend's failure detail (for example the
+    /// exit reason and a bounded stderr tail) into the failure record (0005-053). The value is
+    /// stored as compact JSON text. Only failures caused by the backend carry it.
+    pub fn backend_stopped_with_detail(
+        &mut self,
+        task_id: &str,
+        reason: StopReason,
+        detail: Option<serde_json::Value>,
+        now: u64,
+    ) -> Result<Vec<Effect>, TaskError> {
         let accepted = match reason {
             StopReason::Backend(code) => matches!(
                 code,
@@ -1137,12 +1150,16 @@ impl<S: TaskStore> Tasks<S> {
                 StopReason::Backend(code) => Ending::Failed(code),
             }
         };
+        let detail = detail.map(|v| v.to_string());
         match ending {
             Ending::Completed => {
                 plan.move_to(Some(state), TaskState::Completed, None, None, now)?
             }
             Ending::Canceled => plan.move_to(Some(state), TaskState::Canceled, None, None, now)?,
-            Ending::Failed(code) => plan.fail(Some(state), code, None, now)?,
+            Ending::Failed(code) => {
+                let detail = detail.filter(|_| code != FailureCode::ApprovalDenied);
+                plan.fail(Some(state), code, detail, now)?
+            }
         }
         self.commit(plan)
     }
@@ -3830,5 +3847,48 @@ mod tests {
         assert_eq!(omp[1]["key"], "k2");
         assert_eq!(reopened.extensions("other")[0]["seq"], 9);
         assert!(reopened.extensions("nobody").is_empty());
+    }
+
+    #[test]
+    fn req_0005_053_backend_stop_detail_reaches_failure_record() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks
+            .backend_stopped_with_detail(
+                &id,
+                StopReason::Backend(FailureCode::BackendUnavailable),
+                Some(serde_json::json!({"reason": "agent stdout closed", "stderr": "boom"})),
+                T0 + 1,
+            )
+            .expect("stop");
+        assert_eq!(
+            failure_code(&tasks, &id),
+            Some(FailureCode::BackendUnavailable)
+        );
+        let failure = tasks
+            .task(ORIGIN, &id)
+            .expect("visible")
+            .failure
+            .expect("failure");
+        let detail = failure.detail.expect("detail");
+        let parsed: serde_json::Value = serde_json::from_str(&detail).expect("json");
+        assert_eq!(parsed["reason"], "agent stdout closed");
+        assert_eq!(parsed["stderr"], "boom");
+    }
+
+    #[test]
+    fn req_0005_053_plain_backend_stop_has_no_detail() {
+        let mut tasks = fresh();
+        let id = start(&mut tasks, "m1", T0);
+        tasks
+            .backend_stopped(&id, StopReason::Crashed, T0 + 1)
+            .expect("stop");
+        assert_eq!(failure_code(&tasks, &id), Some(FailureCode::BackendCrashed));
+        let failure = tasks
+            .task(ORIGIN, &id)
+            .expect("visible")
+            .failure
+            .expect("failure");
+        assert_eq!(failure.detail, None);
     }
 }
