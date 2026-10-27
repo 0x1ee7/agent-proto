@@ -11,6 +11,8 @@
 
 A2A-Bus carries the open A2A v1.0 protocol over a message bus. This RFC fixes the layering, the module (crate) boundaries and dependency rules, the process topology for Milestone 1, and the shared vocabulary every other RFC uses. Anything defined here MUST NOT be redefined elsewhere.
 
+Non-normative diagrams of this layering, the dependency grid, the runtime and the audit path are in [docs/architecture/README.md](../architecture/README.md).
+
 ## 2. Motivation and scope
 
 Goals: a modular system where the bus, the agent integration and the HTTP gateway are independently replaceable; a protocol core that is bus-agnostic (D1) and A2A-faithful (D5, D8).
