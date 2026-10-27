@@ -27,6 +27,7 @@ Protocol that carries the open A2A v1.0 protocol over a message bus (reference b
 - Third-party facts come from `docs/interop/`. Keep its `[UNVERIFIED]` markers; do not upgrade a claim without a source.
 - Work only inside the files you were assigned. Another agent's RFC changes go through a note to the integrator, not an edit.
 - Write ASCII punctuation. No emoji. Wrap nothing by hand; one sentence per line is fine in docs.
+- Exception: `tools/diagram_kit.py` may use non-ASCII glyphs (bullets, arrows, dashes) because it draws the PDFs in `docs/architecture/`. Every other file stays ASCII.
 - Windows and Linux are both first-class. Never assume POSIX paths, signals or permissions.
 - Never put secrets, tokens or provider keys in any file, example or log.
 - Do not quote attack strings verbatim in docs or agent files; describe the attack.
