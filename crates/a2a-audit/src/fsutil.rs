@@ -20,7 +20,7 @@ pub(crate) fn owner_only_icacls_args(path: &Path, user: &str) -> Vec<OsString> {
 }
 
 /// Restricts `path` to its owner.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) fn restrict_to_owner(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
