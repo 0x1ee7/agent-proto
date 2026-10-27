@@ -97,6 +97,7 @@ fn run_turns(extra: Value, turns: &[&str]) {
                 )],
                 deadline_ms: 0,
                 session: None,
+                peer_tools: None,
             })
             .expect("start accepted");
         let events = collect(&rx, turn);

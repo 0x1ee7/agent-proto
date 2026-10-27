@@ -236,6 +236,7 @@ fn start_turn_from(origin: &str, turn: &str, text: &str) -> StartTurn {
         input: vec![InputPart::Text(text.to_owned())],
         deadline_ms: 0,
         session: None,
+        peer_tools: None,
     }
 }
 
