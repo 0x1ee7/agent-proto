@@ -52,6 +52,7 @@ Prompt directives understood by the stub (in a user message containing `STUB:`):
 `STUB:WRITE:<name>` (Write tool), `STUB:READ:<name>` (Read), `STUB:BASH:<cmd>` (Bash),
 `STUB:LONG` (200 text chunks at 50 ms), `STUB:REMEMBER:<word>` (replies OK), `STUB:RECALL` (echoes the remembered word),
 `STUB:PLAIN` (plain "OK"). After a tool result the stub replies `DONE`. Requests without tools get `OK`.
+`STUB:A2A:<agent>:<text>` emits one `a2a_send` tool call (matched by suffix to the a2abus MCP tool). It only reaches a peer when the session is offered the a2abus MCP tools; see `docs/spikes/e2e-m1.md` S3.
 
 Outputs: `.spikes/claude-acp/out/<scenario>.jsonl` (frame log, redacted), `*.stderr.log`, and `stub-<name>.jsonl` (stub request log).
 Work dirs: `.spikes/claude-acp/work/`. Config dirs for stub runs: `.spikes/claude-acp/cfg/`.

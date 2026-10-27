@@ -34,4 +34,5 @@ url = "2.5.8"
 bus-mem = { version = "0.1.0", path = "../bus-mem" }
 http-body-util = "0.1.5"
 tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }

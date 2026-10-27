@@ -12,7 +12,7 @@
 ## Uses
 - `a2a-client` for worker calls (send, stream, subscribe, task and push operations).
 - `a2a-core` for envelope, subject, and header handling; `a2a-types` for ids and protobuf types; `bus-api` for the generic bus trait.
-- Dev only: `bus-mem`.
+- Dev only: `bus-mem`; `tokio` with `test-util` for paused time.
 
 ## Static rules
 - Generic over `bus_api::bus::Bus`. Name no concrete bus in `src/`. Depend on no `driver-*` crate.
@@ -25,7 +25,7 @@
 - Listeners bind to loopback by default. Non-loopback listeners require TLS, peers, and trusted peers.
 
 ## Tests
-- `tests/requirements.rs` names each guarded requirement as `req_0008_0NN_*` with a `// [0008-0NN]` comment. Covered IDs: 001 through 006, 009 through 032, 035, 038, 043 through 046, 049 through 052, 059, 060.
+- `tests/requirements.rs` names each guarded requirement as `req_0008_0NN_*` with a `// [0008-0NN]` comment. Covered IDs: 001 through 006, 009 through 032, 035, 038, 043 through 046, 049 through 052, 059, 060. 0008-052 has a paused-time test for a wait above 10 s. It guards the gateway's own bound; the bus-nats per-call timeout cap is guarded in bus-nats.
 - `src/limits.rs` unit tests guard 0008-023 at the limiter level.
 - `src/tls.rs` unit tests guard 0008-066 (key file owner-only: Unix mode bits; Windows access list via `icacls`, where only the Windows cases run on Windows).
 - `tests/common/mod.rs` holds the virtual clock, fixture, and HTTP call helpers. It adds no requirements of its own.

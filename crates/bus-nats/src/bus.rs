@@ -55,10 +55,13 @@ impl Bus for NatsBus {
     ) -> Result<Reply, BusError> {
         self.check_who(who)?;
         check_budget(headers, &payload)?;
-        let map = to_header_map(headers);
+        let request = async_nats::Request::new()
+            .headers(to_header_map(headers))
+            .payload(payload)
+            .timeout(Some(timeout));
         let pending = self
             .client()
-            .request_with_headers(subject.as_str().to_owned(), map, payload);
+            .send_request(subject.as_str().to_owned(), request);
         let timed = tokio::time::timeout(timeout, pending);
         let message = guard(self.denials(), |s: &str| s == subject.as_str(), timed)
             .await?

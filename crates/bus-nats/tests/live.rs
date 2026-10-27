@@ -13,7 +13,7 @@ use a2a_conformance::bus_contract::{BusFactory, run_suite};
 use a2a_conformance::driver::Clock;
 use a2a_conformance::fixtures::Fixtures;
 use a2a_conformance::report::Outcome;
-use bus_api::bus::{Bus, Consumer, Watch};
+use bus_api::bus::{Bus, Consumer, RequestStream, Watch};
 use bus_api::error::BusError;
 use bus_api::headers::Headers;
 use bus_api::message::{StartPosition, WatchEvent};
@@ -86,6 +86,51 @@ fn req_0010_078_unlisted_nkey_refused() {
     };
     let result = rt.block_on(connect(config));
     assert!(result.is_err(), "unlisted NKey connected");
+}
+
+/// [0011-011] `request` waits up to its own `timeout`. The connection default (1 s here) must
+/// not cap it: the reply arrives after 2 s and the call allows 5 s.
+#[test]
+#[ignore = "live: needs nats-server"]
+fn req_0011_011_request_honors_call_timeout_over_connection_default() {
+    let rt = runtime();
+    let (server, fx) = start(&rt);
+    let short = Duration::from_secs(1);
+    let connect_short = |identity: &str| NatsConfig {
+        url: server.url().to_owned(),
+        identity: identity.to_owned(),
+        seed: Seed::new(server.seed(identity).expect("identity seed")),
+        tenant: fx.local.clone(),
+        request_timeout: short,
+        ack_wait: fx.ack_wait,
+    };
+    let responder_name = fx.server.name().expect("server name").to_owned();
+    let requester_name = fx.client.name().expect("client name").to_owned();
+    let responder_cfg = connect_short(&responder_name);
+    let requester_cfg = connect_short(&requester_name);
+    rt.block_on(async {
+        let responder = connect(responder_cfg).await.expect("responder connects");
+        let requester = connect(requester_cfg).await.expect("requester connects");
+        let pattern = SubjectPattern::parse("rpc.echo").expect("pattern");
+        let subject = Subject::parse("rpc.echo").expect("subject");
+        let mut requests = responder.serve(&fx.server, &pattern).await.expect("serve");
+        let slow = async {
+            let req = requests.next().await.expect("request");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            req.reply.reply(Headers::new(), req.payload).expect("reply");
+        };
+        let headers = Headers::new();
+        let call = requester.request(
+            &fx.client,
+            &subject,
+            &headers,
+            Bytes::from_static(b"ping"),
+            Duration::from_secs(5),
+        );
+        let (_, outcome) = tokio::join!(slow, call);
+        let reply = outcome.expect("reply within the call timeout, not the connection default");
+        assert_eq!(reply.payload.as_ref(), b"ping");
+    });
 }
 
 /// Connects `identity` to the test server with its NKey.

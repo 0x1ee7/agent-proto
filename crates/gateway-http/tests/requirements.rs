@@ -800,6 +800,30 @@ fn req_0008_052_default_blocking_wait_is_under_client_timeout() {
     assert!(GatewayConfig::default().blocking_wait < Duration::from_secs(120));
 }
 
+// [0008-052] A blocking wait above 10 s returns the task the worker reports at 30 s: the
+// configured wait is the bound, not a shorter request deadline.
+#[tokio::test(start_paused = true)]
+async fn req_0008_052_blocking_wait_above_ten_seconds_returns_the_working_task() {
+    let fx = Fixture::new();
+    fx.seed_worker().await;
+    let config = GatewayConfig {
+        blocking_wait: Duration::from_secs(100),
+        ..fx.config()
+    };
+    let (_gw, app) = fx.app(config).await;
+    let mut requests = fx.serve(Op::Send).await;
+    let body = rpc("SendMessage", json!({"message": message("hi")}));
+    let worker = async {
+        let inbound = fx.next_inbound(&mut requests).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        fx.reply(inbound, &send_reply(task("t-3", pb::TaskState::Working)));
+    };
+    let (reply, ()) = tokio::join!(send(&app, Call::post(RPC, &body)), worker);
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.json().get("error").is_none(), "no error at 30 s");
+    assert_eq!(reply.json()["result"]["task"]["id"], "t-3");
+}
+
 // [0008-059] Push credentials are refused with -32602 PUSH_CREDENTIALS_NOT_SUPPORTED.
 #[tokio::test]
 async fn req_0008_059_push_credentials_are_refused() {

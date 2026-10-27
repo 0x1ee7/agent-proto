@@ -30,9 +30,9 @@ Uses: `bus-api` (the seam, names, values, capabilities), `a2a-types` (`TenantId`
 - 0010-015: payload budget (`wire`, `settle`).
 - 0010-024, 0010-025, 0010-027, 0010-030, 0010-031, 0010-035, 0010-054, 0010-055: stream, bucket and archiver configuration (`provision`).
 - 0010-078: principal from inbox prefix and subject (`principal`).
-- 0011-011, 0011-015: request outcomes and dispatch (`request`, `settle`).
+- 0011-011, 0011-015: request outcomes and dispatch (`request`, `settle`). `request` passes its own `timeout` to the async-nats request; the connection-wide `request_timeout` is a default only and never caps a call.
 - 0010-031: KV live/marker classification and TTL header (`kv`).
-- 0010-031 live: `req_0010_031_ttl_expiry_then_create_recreates`; 0010-034 live: `req_0010_034_watch_snapshot_then_live_without_gap`; 0010-078 live: `req_0010_078_unlisted_nkey_refused`; 0010-024 live: `req_0010_024_provision_is_idempotent`.
+- 0010-031 live: `req_0010_031_ttl_expiry_then_create_recreates`; 0010-034 live: `req_0010_034_watch_snapshot_then_live_without_gap`; 0010-078 live: `req_0010_078_unlisted_nkey_refused`; 0010-024 live: `req_0010_024_provision_is_idempotent`; 0011-011 live: `req_0011_011_request_honors_call_timeout_over_connection_default`.
 
 ## Live tests
 

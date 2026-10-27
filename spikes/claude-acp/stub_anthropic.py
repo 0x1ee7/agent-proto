@@ -6,6 +6,7 @@ It is NOT a model. It answers POST /v1/messages (streaming SSE or JSON), POST
 directive in the latest user prompt (see README.md). Usage numbers are fixed so
 they can be checked against adapter output. Runs as a daemon thread inside the
 client process; no separate process is started.
+STUB:A2A:<agent>:<text> emits one a2a_send tool call (the a2abus MCP tool, matched by suffix).
 """
 import json
 import pathlib
@@ -87,6 +88,9 @@ class Stub:
         m = re.search(r"STUB:BASH:([^\n]+)", prompt)
         if m:
             return "tool", ("Bash", {"command": m.group(1).strip()})
+        m = re.search(r"STUB:A2A:([a-z0-9][a-z0-9-]{0,47}):([^\n]+)", prompt)
+        if m:
+            return "tool", ("a2a_send", {"agent": m.group(1), "text": m.group(2).strip()})
         if "STUB:LONG" in prompt:
             return "long", None
         if "STUB:RECALL" in prompt:
