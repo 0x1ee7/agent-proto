@@ -1,0 +1,37 @@
+# Local development stack. See DEV.md.
+#
+#   docker compose run --rm dev cargo test --workspace --all-features
+#   docker compose --profile stack up a2ad     # bus-only runtime smoke
+#
+# Build output lives in named volumes, never in the bind-mounted checkout, so Windows target/
+# directories are not shared with Linux builds.
+name: a2a-bus
+
+services:
+  dev:
+    build:
+      context: .
+      target: dev
+    image: a2a-bus-dev:local
+    working_dir: /work
+    volumes:
+      - .:/work
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-cache:/cache
+    stdin_open: true
+    tty: true
+
+  a2ad:
+    profiles: ["stack"]
+    build:
+      context: .
+      target: runtime
+    image: a2a-bus-runtime:local
+    volumes:
+      - a2ad-state:/state
+    restart: "no"
+
+volumes:
+  cargo-registry:
+  cargo-cache:
+  a2ad-state:

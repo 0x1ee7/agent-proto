@@ -1,0 +1,6 @@
+.git
+.spikes
+target
+target-*
+docs/architecture
+**/__pycache__

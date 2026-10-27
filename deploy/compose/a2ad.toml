@@ -1,0 +1,21 @@
+# Container runtime config (bus only, no agents). Used by the `a2ad` service in compose.yaml.
+# Add [[agent]] tables in a mounted copy to run workers; omp and Claude need credentials that
+# are not baked into the image.
+#
+# sha256 is the digest of /usr/local/bin/nats-server in the runtime image (nats:2.15.2 linux
+# amd64). Recompute with: docker compose run --rm --entrypoint sha256sum a2ad /usr/local/bin/nats-server
+
+config_version = 1
+
+[paths]
+state_dir = "/state"
+
+[supervisor]
+drain_ms = 5000
+grace_ms = 3000
+operator_id = "cli"
+
+[bus]
+port = 4222
+binary = "/usr/local/bin/nats-server"
+sha256 = "33f3fe3fed80b2b229bd9fe4b735257ad8583cd2349452a0c74f3d768b593e66"
