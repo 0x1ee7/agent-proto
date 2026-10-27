@@ -82,13 +82,10 @@ pub fn child(
     let child = Allowance {
         max_tokens: share(grant.max_tokens, used.tokens),
         max_cost_units: share(grant.max_cost_units, used.cost_units),
-        max_wall_ms: share(grant.max_wall_ms, used.wall_ms).saturating_sub(
-            if grant.max_wall_ms == UNLIMITED {
-                0
-            } else {
-                WALL_MARGIN_MS
-            },
-        ),
+        max_wall_ms: grant
+            .max_wall_ms
+            .saturating_sub(used.wall_ms)
+            .saturating_sub(WALL_MARGIN_MS),
         max_hops: grant.max_hops - used.hops - 1,
         max_depth: grant.max_depth - 1,
         max_children: grant.max_children - 1,
