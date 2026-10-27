@@ -321,7 +321,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                         budget_of(data).ok_or(RpcError::extension_invalid("BUDGET_INVALID"))?;
                     let allowance = Allowance::from_proto(&proto);
                     allowance
-                        .validate(true)
+                        .validate()
                         .map_err(|_| RpcError::extension_invalid("BUDGET_INVALID"))?;
                     applied.push(BUDGET.to_owned());
                     (Some(allowance), Some(proto))

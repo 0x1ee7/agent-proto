@@ -13,7 +13,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
-/// Unlimited sentinel. Valid only for `max_tokens`, `max_cost_units` on the root hop (0006-032).
+/// Unlimited sentinel. Valid for `max_tokens` and `max_cost_units` at the root and on delegated
+/// grants (0006-032, 0015-055); never for wall time or the count dimensions.
 pub const UNLIMITED: u64 = u64::MAX;
 /// Margin subtracted from the parent's available wall time for each child (0006-033).
 pub const WALL_MARGIN_MS: u64 = 1_000;
@@ -121,21 +122,12 @@ impl Allowance {
         }
     }
 
-    /// Checks sentinel placement (0006-032). `root` is the root placement: the sentinel is valid
-    /// only for tokens and cost. Delegated grants pass `true` too, because 0015-055 keeps the
-    /// unlimited sentinel for children. Wall time is always finite, and the count dimensions
-    /// never take it.
-    pub fn validate(&self, root: bool) -> Result<(), BudgetError> {
+    /// Checks sentinel placement (0006-032, 0015-055). The sentinel is valid for tokens and cost
+    /// on the root hop and on delegated grants alike. Wall time is always finite, and the count
+    /// dimensions never take it.
+    pub fn validate(&self) -> Result<(), BudgetError> {
         if self.max_wall_ms == UNLIMITED {
             return Err(BudgetError::Sentinel(Dimension::WallMs));
-        }
-        if !root {
-            if self.max_tokens == UNLIMITED {
-                return Err(BudgetError::Sentinel(Dimension::Tokens));
-            }
-            if self.max_cost_units == UNLIMITED {
-                return Err(BudgetError::Sentinel(Dimension::CostUnits));
-            }
         }
         for (dim, value) in [
             (Dimension::Hops, self.max_hops),
@@ -312,14 +304,14 @@ pub struct Ledger {
 impl Ledger {
     /// Ledger of the root hop (depth 0).
     pub fn root(grant: Allowance, metering: Metering) -> Result<Ledger, BudgetError> {
-        grant.validate(true)?;
+        grant.validate()?;
         Ok(Self::new(grant, 0, metering))
     }
 
     /// Ledger of a child hop at `depth`.
     pub fn child(grant: Allowance, depth: u32, metering: Metering) -> Result<Ledger, BudgetError> {
         // Delegated grants keep the unlimited sentinel on tokens and cost (0015-055).
-        grant.validate(true)?;
+        grant.validate()?;
         Ok(Self::new(grant, depth, metering))
     }
 
@@ -386,7 +378,7 @@ impl Ledger {
                 self.used.cost_units,
                 self.reserved.cost_units,
             ),
-            Dimension::WallMs => finite_remaining(
+            Dimension::WallMs => wall_remaining(
                 self.grant.max_wall_ms,
                 self.used.wall_ms,
                 self.reserved.wall_ms,
@@ -518,15 +510,15 @@ impl Ledger {
         self.used.wall_ms = self.used.wall_ms.saturating_add(child_usage.wall_ms);
     }
 
-    /// Child share of a token or cost dimension: the available amount, or the sentinel distance
-    /// for an unlimited parent (the child is then finite but effectively unbounded).
+    /// Child share of a token or cost dimension (0015-055): the available amount, or the
+    /// sentinel itself when the parent is unlimited, so the child keeps the sentinel.
     fn child_share(&self, dim: Dimension) -> u64 {
         let unlimited = match dim {
             Dimension::Tokens => self.grant.max_tokens == UNLIMITED,
             _ => self.grant.max_cost_units == UNLIMITED,
         };
         if unlimited {
-            UNLIMITED - 1
+            UNLIMITED
         } else {
             self.remaining(dim)
         }
@@ -573,6 +565,15 @@ fn finite_remaining(grant: u64, used: u64, reserved: u64) -> u64 {
         return UNLIMITED.saturating_sub(used);
     }
     grant.saturating_sub(used).saturating_sub(reserved)
+}
+
+/// Remaining wall time (0006-032). Wall time is always finite: a sentinel grant can only come
+/// from state that skipped validation, and it fails closed (no time) rather than unlimited.
+fn wall_remaining(grant: u64, used: u64, reserved: u64) -> u64 {
+    if grant == UNLIMITED {
+        return 0;
+    }
+    finite_remaining(grant, used, reserved)
 }
 
 /// Lowercase hex of `bytes`.
@@ -777,48 +778,35 @@ mod tests {
         assert_eq!((d.max_tokens, d.max_cost_units), (UNLIMITED, UNLIMITED));
     }
 
+    /// req_0006_032: the sentinel is valid for tokens and cost only, on the root and on
+    /// delegated grants alike; wall time and the count dimensions never take it.
     #[test]
-    fn req_0006_032_sentinel_only_on_root_tokens_and_cost() {
-        let root = Allowance {
+    fn req_0006_032_sentinel_on_tokens_and_cost_only() {
+        let open = Allowance {
             max_tokens: UNLIMITED,
             max_cost_units: UNLIMITED,
             ..grant()
         };
-        assert!(root.validate(true).is_ok());
-        assert_eq!(
-            root.validate(false),
-            Err(BudgetError::Sentinel(Dimension::Tokens))
-        );
-        let child_cost = Allowance {
-            max_cost_units: UNLIMITED,
-            ..grant()
-        };
-        assert_eq!(
-            child_cost.validate(false),
-            Err(BudgetError::Sentinel(Dimension::CostUnits))
-        );
+        assert!(open.validate().is_ok());
         let wall = Allowance {
             max_wall_ms: UNLIMITED,
             ..grant()
         };
         assert_eq!(
-            wall.validate(true),
+            wall.validate(),
             Err(BudgetError::Sentinel(Dimension::WallMs))
         );
         let hops = Allowance {
             max_hops: u32::MAX,
             ..grant()
         };
-        assert_eq!(
-            hops.validate(true),
-            Err(BudgetError::Sentinel(Dimension::Hops))
-        );
+        assert_eq!(hops.validate(), Err(BudgetError::Sentinel(Dimension::Hops)));
         let children = Allowance {
             max_children: u32::MAX,
             ..grant()
         };
         assert_eq!(
-            children.validate(true),
+            children.validate(),
             Err(BudgetError::Sentinel(Dimension::Children))
         );
     }
@@ -863,6 +851,30 @@ mod tests {
             Ledger::child(wall, 1, metered()).is_err(),
             "wall time is always finite"
         );
+    }
+
+    #[test]
+    fn req_0015_055_unlimited_parent_hands_child_the_sentinel() {
+        let parent = Allowance {
+            max_tokens: UNLIMITED,
+            max_cost_units: UNLIMITED,
+            ..grant()
+        };
+        let mut ledger = Ledger::root(parent, metered()).expect("valid");
+        let child = ledger.delegate().expect("delegation allowed");
+        assert_eq!(child.max_tokens, UNLIMITED);
+        assert_eq!(child.max_cost_units, UNLIMITED);
+    }
+
+    #[test]
+    fn req_0006_032_wall_sentinel_grants_no_time() {
+        let ledger = Ledger::root(grant(), metered()).expect("valid");
+        let mut value = serde_json::to_value(&ledger).expect("serialize");
+        value["grant"]["max_wall_ms"] = serde_json::json!(UNLIMITED);
+        let mut ledger: Ledger = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(ledger.remaining(Dimension::WallMs), 0);
+        let trip = ledger.start_turn().expect_err("no wall time to run a turn");
+        assert_eq!(trip.dimension, Dimension::WallMs);
     }
 
     #[test]

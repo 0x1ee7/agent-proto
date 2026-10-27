@@ -88,21 +88,24 @@ pub(crate) fn budget_exhausted(dimension: &str) -> IpcError {
     IpcError::new(reason::BUDGET_EXHAUSTED).with_meta("dimension", dimension)
 }
 
-/// The first budget dimension whose child share is zero (0015-055): the parent has nothing
-/// left to hand a child, so the send is refused before any delegation or network traffic.
+/// The first budget dimension whose child share is unusable (0015-055): zero leaves the parent
+/// nothing to hand a child, and a sentinel wall share grants no time (0006-032). The send is
+/// refused before any delegation or network traffic. Unlimited tokens and cost are valid shares.
 pub(crate) fn exhausted_dimension(
     tokens: u64,
     cost_units: u64,
     wall_ms: u64,
 ) -> Option<&'static str> {
-    [
-        ("tokens", tokens),
-        ("cost", cost_units),
-        ("wall_ms", wall_ms),
-    ]
-    .into_iter()
-    .find(|(_, share)| *share == 0)
-    .map(|(dimension, _)| dimension)
+    if tokens == 0 {
+        return Some("tokens");
+    }
+    if cost_units == 0 {
+        return Some("cost");
+    }
+    if wall_ms == 0 || wall_ms == UNLIMITED {
+        return Some("wall_ms");
+    }
+    None
 }
 
 /// The budget dimension a delegation refusal names.
@@ -136,15 +139,10 @@ pub(crate) fn context_id(raw: &str) -> Result<ContextId, IpcError> {
 }
 
 /// Blocking deadline for a call (0015-022, 0015-066): the requested timeout, bounded by
-/// the child's wall budget. Only the unlimited sentinel falls back to the maximum request
-/// deadline; a zero wall budget is exhausted and bounds the call to zero (0015-055).
+/// the child's wall budget. A zero wall budget is exhausted and bounds the call to zero
+/// (0015-055).
 pub(crate) fn call_deadline(now: u64, timeout_ms: Option<u64>, wall_ms: u64) -> u64 {
-    let wall = if wall_ms == UNLIMITED {
-        MAX_DEADLINE_MS
-    } else {
-        wall_ms
-    };
-    now.saturating_add(timeout_ms.unwrap_or(MAX_DEADLINE_MS).min(wall))
+    now.saturating_add(timeout_ms.unwrap_or(MAX_DEADLINE_MS).min(wall_ms))
 }
 
 #[cfg(test)]
@@ -195,15 +193,23 @@ mod tests {
         assert!(child_context("ctx-1", Some("other")).is_err());
     }
 
-    /// req_0015_022: an unlimited wall budget bounds the call by the request deadline.
+    /// req_0015_022: the requested timeout, or the maximum request deadline when none is given,
+    /// is bounded by a finite wall budget.
     #[test]
     fn req_0015_022_deadline_bounded_by_wall_budget() {
         assert_eq!(call_deadline(1_000, Some(500), 200), 1_200);
-        assert_eq!(
-            call_deadline(1_000, None, UNLIMITED),
-            1_000 + MAX_DEADLINE_MS
-        );
+        assert_eq!(call_deadline(1_000, None, 200), 1_200);
         assert_eq!(call_deadline(u64::MAX, Some(5), 10), u64::MAX);
+    }
+
+    /// req_0006_032, req_0015_055: a zero share, or a sentinel wall share (which grants no
+    /// time), refuses the send before any traffic. A sentinel token or cost share is valid.
+    #[test]
+    fn req_0006_032_wall_share_is_finite_and_positive() {
+        assert_eq!(exhausted_dimension(1, 1, UNLIMITED), Some("wall_ms"));
+        assert_eq!(exhausted_dimension(1, 1, 0), Some("wall_ms"));
+        assert_eq!(exhausted_dimension(0, 1, 1), Some("tokens"));
+        assert_eq!(exhausted_dimension(UNLIMITED, UNLIMITED, 1), None);
     }
 
     /// req_0015_055: an exhausted wall allowance (zero) bounds the call to zero.
