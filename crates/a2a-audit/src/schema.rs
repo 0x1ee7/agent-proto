@@ -24,6 +24,15 @@ pub enum SchemaError {
     /// A value is not a string, boolean, list of strings or objects, or object (0013-008).
     #[error("details key {0} has a value type that RFC-0013 0013-008 does not admit")]
     BadDetailValue(String),
+    /// A `reason` detail is not a lowercase token of `[a-z0-9_]{1,64}` (RFC-0013 table 4.2).
+    #[error("details key {0} is not a lowercase reason token")]
+    ReasonToken(String),
+    /// `excluded_count` is admitted only for a copy workspace (RFC-0012 0012-074).
+    #[error("details key {0} is only admitted for a copy workspace")]
+    CopyModeOnly(&'static str),
+    /// `excluded_count` is a decimal string, not free text (0013-008).
+    #[error("details key {0} is not a decimal string")]
+    NotDecimal(&'static str),
 }
 
 /// One `details` key of table 4.2.
@@ -182,7 +191,12 @@ pub static SPECS: &[EventSpec] = &[
     EventSpec {
         ty: AuditEventType::WorkspaceCreated,
         kinds: WRK,
-        keys: &[opt("mode"), opt("kind"), opt("base_commit")],
+        keys: &[
+            opt("mode"),
+            opt("kind"),
+            opt("base_commit"),
+            opt("excluded_count"),
+        ],
     },
     EventSpec {
         ty: AuditEventType::WorkspaceRetained,
@@ -236,7 +250,7 @@ pub static SPECS: &[EventSpec] = &[
     },
     EventSpec {
         ty: AuditEventType::SubmissionDropped,
-        kinds: WRK_GW,
+        kinds: WRK,
         keys: &[req("message_id"), opt("reason")],
     },
     EventSpec {
@@ -281,8 +295,9 @@ pub fn spec(ty: AuditEventType) -> Option<&'static EventSpec> {
     SPECS.iter().find(|row| row.ty == ty)
 }
 
-/// Checks `details` against the row for its type: only listed keys, every `*` key present, and
-/// value types per 0013-008.
+/// Checks `details` against the row for its type: only listed keys, every `*` key present, value
+/// types per 0013-008, `reason` values as lowercase tokens (table 4.2), and the copy-only rule of
+/// `excluded_count` (0012-074).
 pub fn check_details(spec: &EventSpec, details: &Map<String, Value>) -> Result<(), SchemaError> {
     let event = spec.ty.as_str_name();
     for (key, value) in details {
@@ -295,6 +310,9 @@ pub fn check_details(spec: &EventSpec, details: &Map<String, Value>) -> Result<(
         if !admitted_value(value) {
             return Err(SchemaError::BadDetailValue(key.clone()));
         }
+        if is_reason_key(key) && !is_reason_value(value) {
+            return Err(SchemaError::ReasonToken(key.clone()));
+        }
     }
     for key in spec.keys.iter().filter(|k| k.required) {
         if !details.contains_key(key.name) {
@@ -304,7 +322,36 @@ pub fn check_details(spec: &EventSpec, details: &Map<String, Value>) -> Result<(
             });
         }
     }
-    Ok(())
+    check_excluded_count(details)
+}
+
+/// Keys that carry a machine-readable reason: `reason` and `*_reason`.
+fn is_reason_key(key: &str) -> bool {
+    key == "reason" || key.ends_with("_reason")
+}
+
+/// A reason value is a string of lowercase letters, digits and underscores, 1 to 64 bytes.
+fn is_reason_value(value: &Value) -> bool {
+    matches!(value, Value::String(text) if crate::correlation::is_short_token(text, false))
+}
+
+/// `excluded_count` (WORKSPACE_CREATED) counts the entries a copy left out (0012-074). It is
+/// admitted only when `kind` is `copy`, and then only as a decimal string.
+fn check_excluded_count(details: &Map<String, Value>) -> Result<(), SchemaError> {
+    let Some(value) = details.get("excluded_count") else {
+        return Ok(());
+    };
+    if details.get("kind") != Some(&Value::String("copy".to_owned())) {
+        return Err(SchemaError::CopyModeOnly("excluded_count"));
+    }
+    match value {
+        Value::String(text) if is_decimal(text) => Ok(()),
+        _ => Err(SchemaError::NotDecimal("excluded_count")),
+    }
+}
+
+fn is_decimal(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// 0013-008: strings, booleans, lists of strings or objects, and objects whose values follow the
@@ -449,5 +496,93 @@ mod tests {
     #[test]
     fn req_0013_007_unknown_type_has_no_row() {
         assert!(AuditEventType::try_from(999).is_err());
+    }
+
+    fn worker_event(ty: AuditEventType, kind: EmitterKind) -> AuditEvent {
+        AuditEvent {
+            event_id: "e1".to_owned(),
+            time: "2026-05-01T12:00:00.000Z".to_owned(),
+            seq: 1,
+            tenant: "tenant-a".to_owned(),
+            emitter: "worker-a".to_owned(),
+            emitter_kind: kind as i32,
+            r#type: ty as i32,
+            ..Default::default()
+        }
+    }
+
+    /// 0013-050: SUBMISSION_DROPPED is worker-only; the gateway may not emit it.
+    #[test]
+    fn req_0013_050_submission_dropped_is_worker_only() {
+        let mut event = worker_event(AuditEventType::SubmissionDropped, EmitterKind::Gateway);
+        assert_eq!(
+            validate_event(&event),
+            Err(SchemaError::Field("emitter_kind"))
+        );
+        event.emitter_kind = EmitterKind::Worker as i32;
+        assert_eq!(
+            validate_event(&event),
+            Ok(AuditEventType::SubmissionDropped)
+        );
+    }
+
+    /// 0013-008 and table 4.2: `reason` details are lowercase tokens of `[a-z0-9_]{1,64}`.
+    #[test]
+    fn req_0013_008_reason_details_are_lowercase_tokens() {
+        let row = spec(AuditEventType::SubmissionDropped).unwrap();
+        let ok = json!({"message_id": "m1", "reason": "stale_receipt"});
+        assert!(check_details(row, ok.as_object().unwrap()).is_ok());
+        let edge = json!({"message_id": "m1", "reason": "a".repeat(64)});
+        assert!(check_details(row, edge.as_object().unwrap()).is_ok());
+
+        let refused: Vec<Value> = vec![
+            json!("Stale"),
+            json!("bad-signature"),
+            json!(""),
+            Value::String("a".repeat(65)),
+            json!(["stale"]),
+            json!(true),
+        ];
+        for reason in refused {
+            let body = json!({"message_id": "m1", "reason": reason});
+            assert_eq!(
+                check_details(row, body.as_object().unwrap()),
+                Err(SchemaError::ReasonToken("reason".into()))
+            );
+        }
+    }
+
+    /// 0012-074 and 0013-008: `excluded_count` is a decimal string, admitted only for copy.
+    #[test]
+    fn req_0013_008_excluded_count_is_copy_only_decimal() {
+        let row = spec(AuditEventType::WorkspaceCreated).unwrap();
+        let check = |body: Value| check_details(row, body.as_object().unwrap());
+
+        assert!(check(json!({"kind": "copy", "excluded_count": "4"})).is_ok());
+        assert!(check(json!({"kind": "copy", "excluded_count": "0"})).is_ok());
+        assert_eq!(
+            check(json!({"kind": "worktree", "excluded_count": "4"})),
+            Err(SchemaError::CopyModeOnly("excluded_count"))
+        );
+        assert_eq!(
+            check(json!({"excluded_count": "4"})),
+            Err(SchemaError::CopyModeOnly("excluded_count"))
+        );
+        assert_eq!(
+            check(json!({"kind": "copy", "excluded_count": "four"})),
+            Err(SchemaError::NotDecimal("excluded_count"))
+        );
+        assert_eq!(
+            check(json!({"kind": "copy", "excluded_count": ""})),
+            Err(SchemaError::NotDecimal("excluded_count"))
+        );
+        assert_eq!(
+            check(json!({"kind": "copy", "excluded_count": "-1"})),
+            Err(SchemaError::NotDecimal("excluded_count"))
+        );
+        assert_eq!(
+            check(json!({"kind": "copy", "excluded_count": 4})),
+            Err(SchemaError::BadDetailValue("excluded_count".into()))
+        );
     }
 }

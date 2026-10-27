@@ -13,6 +13,7 @@ pub mod correlation;
 pub mod emitter;
 pub mod error;
 pub mod event;
+pub mod gaplog;
 pub mod health;
 pub mod metrics;
 pub mod pipeline;

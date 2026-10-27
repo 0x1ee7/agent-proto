@@ -102,7 +102,7 @@ mod tests {
     fn req_0013_047_hundred_rejections_in_window_yield_one_summary() {
         let mut coalescer = PeerCoalescer::new();
         for i in 0..100 {
-            coalescer.record("peer-x", "bad-signature", at(i / 20));
+            coalescer.record("peer-x", "bad_signature", at(i / 20));
         }
         assert!(coalescer.take_expired(at(9)).is_empty());
         let closed = coalescer.take_expired(at(10));
@@ -110,7 +110,7 @@ mod tests {
             closed,
             vec![Summary {
                 peer: "peer-x".to_owned(),
-                reason: "bad-signature".to_owned(),
+                reason: "bad_signature".to_owned(),
                 count: 100,
             }]
         );
@@ -120,10 +120,10 @@ mod tests {
     #[test]
     fn req_0013_047_windows_are_keyed_by_peer_and_reason() {
         let mut coalescer = PeerCoalescer::new();
-        coalescer.record("peer-a", "bad-signature", at(0));
+        coalescer.record("peer-a", "bad_signature", at(0));
         coalescer.record("peer-a", "expired", at(0));
-        coalescer.record("peer-b", "bad-signature", at(0));
-        coalescer.record("peer-a", "bad-signature", at(1));
+        coalescer.record("peer-b", "bad_signature", at(0));
+        coalescer.record("peer-a", "bad_signature", at(1));
         let mut closed = coalescer.take_all();
         closed.sort_by(|a, b| (&a.peer, &a.reason).cmp(&(&b.peer, &b.reason)));
         let counts: Vec<(String, String, u64)> = closed
@@ -133,9 +133,9 @@ mod tests {
         assert_eq!(
             counts,
             vec![
-                ("peer-a".to_owned(), "bad-signature".to_owned(), 2),
+                ("peer-a".to_owned(), "bad_signature".to_owned(), 2),
                 ("peer-a".to_owned(), "expired".to_owned(), 1),
-                ("peer-b".to_owned(), "bad-signature".to_owned(), 1),
+                ("peer-b".to_owned(), "bad_signature".to_owned(), 1),
             ]
         );
     }

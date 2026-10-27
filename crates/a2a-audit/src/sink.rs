@@ -17,6 +17,7 @@ use serde::Deserialize;
 use crate::canon::{CanonError, canonical_string};
 use crate::clock::{Clock, date_stamp};
 use crate::fsutil;
+use crate::gaplog::GapLog;
 
 /// Rotation size (0013-018).
 pub const SINK_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -208,6 +209,26 @@ impl JsonlSink {
     /// Returns and clears the sequence gaps observed since the last call.
     pub fn take_gaps(&mut self) -> Vec<SeqGap> {
         std::mem::take(&mut self.gaps)
+    }
+
+    /// Writes a `warn` record to `log` for every gap observed since the last call (0013-051).
+    /// Consumers call this after each batch. The gaps not yet written, including the one that
+    /// failed, are kept for the next call, so a failed write loses nothing. Returns the number of
+    /// records written.
+    pub fn report_gaps(&mut self, log: &mut GapLog) -> io::Result<usize> {
+        let mut gaps = self.take_gaps();
+        let now = self.clock.now();
+        let mut written = 0;
+        while written < gaps.len() {
+            if let Err(err) = log.warn_gap(&gaps[written], now) {
+                let mut retained = gaps.split_off(written);
+                retained.append(&mut self.gaps);
+                self.gaps = retained;
+                return Err(err);
+            }
+            written += 1;
+        }
+        Ok(written)
     }
 
     fn remember(&mut self, event_id: &str) {
@@ -488,6 +509,44 @@ mod tests {
         );
         assert_eq!(sink.take_gaps(), vec![expected]);
         assert!(sink.take_gaps().is_empty());
+    }
+
+    /// 0013-051: a consumer-observed gap becomes one `warn` record under the logs dir. The sink
+    /// writes no `AUDIT_GAP` line and the gap is not left pending.
+    #[test]
+    fn req_0013_051_consumer_gap_is_a_warn_record_not_an_audit_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let clock = ManualClock::new(at(1, 12, 0, 0));
+        let mut sink = open(dir.path(), &clock);
+        sink.write_event(&event("agent-a", 1)).unwrap();
+        sink.write_event(&event("agent-a", 4)).unwrap();
+        let before = lines(sink.current_path()).len();
+        let mut log = GapLog::open(&state.path().join("logs")).unwrap();
+        assert_eq!(sink.report_gaps(&mut log).unwrap(), 1);
+        assert!(sink.take_gaps().is_empty());
+        assert_eq!(lines(sink.current_path()).len(), before);
+        let text = fs::read_to_string(log.path()).unwrap();
+        assert!(!text.contains("AUDIT_GAP"));
+        let record: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["emitter"], "agent-a");
+        assert_eq!(record["first"], "2");
+        assert_eq!(record["last"], "3");
+    }
+
+    /// 0013-051: with no gap observed, `report_gaps` writes nothing to the log.
+    #[test]
+    fn req_0013_051_no_gap_writes_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let clock = ManualClock::new(at(1, 12, 0, 0));
+        let mut sink = open(dir.path(), &clock);
+        sink.write_event(&event("agent-a", 1)).unwrap();
+        sink.write_event(&event("agent-a", 2)).unwrap();
+        let mut log = GapLog::open(&state.path().join("logs")).unwrap();
+        assert_eq!(sink.report_gaps(&mut log).unwrap(), 0);
+        assert_eq!(fs::read_to_string(log.path()).unwrap(), "");
     }
 
     #[test]

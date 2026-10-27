@@ -169,7 +169,7 @@ fn lower_hex(value: &str, len: usize) -> bool {
 }
 
 /// `[A-Za-z0-9_-]{1,64}` for workspace ids (`allow_upper`), `[a-z0-9_]{1,64}` for reason codes.
-fn is_short_token(value: &str, allow_upper: bool) -> bool {
+pub(crate) fn is_short_token(value: &str, allow_upper: bool) -> bool {
     (1..=64).contains(&value.len())
         && value.bytes().all(|b| {
             b.is_ascii_lowercase()
