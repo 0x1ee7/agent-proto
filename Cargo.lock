@@ -176,6 +176,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -193,11 +194,18 @@ dependencies = [
 name = "a2ad"
 version = "0.1.0"
 dependencies = [
+ "a2a-audit",
+ "a2a-client",
+ "a2a-core",
  "a2a-security",
  "a2a-types",
  "a2a-worker",
  "a2a-workspace",
+ "base64 0.22.1",
+ "bus-api",
+ "bus-mem",
  "bus-nats",
+ "bytes",
  "clap",
  "ctrlc",
  "driver-a2a-http",
