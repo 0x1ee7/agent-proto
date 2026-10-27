@@ -170,7 +170,7 @@ The consequence is deliberate: agents use their own file and shell tools. The ap
 
 - [0009-022] A JSON-RPC error response to `session/prompt` MUST map to `Failed` `BACKEND_ERROR`. The detail is the error message after redaction (Section 4.10).
 - [0009-023] Process exit or stdout end-of-file while a turn is open MUST map to `Failed` `BACKEND_CRASHED`. The terminal event MUST be emitted at detection, and no later than 5 seconds after the exit is observed.
-- [0009-024] A turn with no agent activity for `turn_idle_timeout` (default 600 seconds, configurable by the operator) MUST map to `Failed` `BACKEND_TIMEOUT`. The driver then runs the cancel path in Section 4.5.6.
+- [0009-024] A turn with no agent activity for `turn_idle_timeout` (default 600 seconds, configurable by the operator) MUST map to `Failed` `BACKEND_TIMEOUT`. The driver then runs the cancel path in Section 4.5.6. While a permission request (0009-033) or a form elicitation (0009-082) is pending, the idle timer is paused and the permission deadline governs that wait; an answer, or the expiry that closes the request, restarts the idle timer from zero.
 
 #### 4.5.4 Message mapping
 
@@ -271,7 +271,7 @@ The agent then returns `{"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelle
 
 - [0009-037] The driver MUST spawn agent executables by absolute path without a shell. Shell strings, `cmd /c`, and shell interpolation MUST NOT be used.
 - [0009-038] On Windows, claude-agent-acp MUST be launched as `node <absolute path to the package entry>` rather than through `cmd /c npx`. This launch form was observed with the stub (`docs/spikes/claude-acp.md`). The bin name is `claude-agent-acp` (verified against the published package, v0.97.0). The package entry is `dist/index.js` in the notes' example; the Windows install path is `[UNVERIFIED]` (Section 9).
-- [0009-039] omp MUST be launched as `omp --mode acp --cwd <workspace root> --approval-mode ask-exec` (or `omp acp` with `--config` when an overlay file is needed). The driver MUST NOT pass `--session-dir` (0009-087). The driver MUST pass `--approval-mode` explicitly on every launch and MUST NOT rely on the schema default. Under ACP, read and write approvals arrive as form elicitation under `always-ask-cached` (0009-082), and exec (bash) approvals arrive as `session/request_permission` (0009-088).
+- [0009-039] omp MUST be launched as `omp --mode acp --cwd <workspace root> --approval-mode always-ask-cached` (the omp name of the canonical mode that operator config names `ask-exec`; 0009-063 and the table after 0009-083), or `omp acp` with `--config` when an overlay file is needed. The driver MUST NOT pass `--session-dir` (0009-087). The driver MUST pass `--approval-mode` explicitly on every launch and MUST NOT rely on the schema default. Under ACP, read and write approvals arrive as form elicitation under `always-ask-cached` (0009-082), and exec (bash) approvals arrive as `session/request_permission` (0009-088).
 
 - [0009-087] omp session persistence. The driver MUST NOT pass `--session-dir` to omp. The supervisor MUST keep one `PI_CODING_AGENT_DIR` per agent, unchanged across restarts (RFC-0012 [0012-063]), and the driver MUST send the same workspace `cwd` on every restart. Observed with the stub (`docs/spikes/omp-acp.md` Q7): with the default session directory, the same `PI_CODING_AGENT_DIR` and the same `cwd`, `session/load` and `session/resume` restored the session and the next prompt ended `end_turn`. With `--session-dir`, the same restart got `ACP session not found`. A different `cwd` got `ACP session load was cancelled` (cause `[UNOBSERVED]`); a different `PI_CODING_AGENT_DIR` got `ACP session not found`.
 
@@ -371,10 +371,20 @@ stateDiagram-v2
 - [0009-067] If the agent switches into a dangerous mode during a session (ACP `switch_mode` tool kind, or any mode notification into the dangerous set), the driver MUST refuse the switch, cancel the turn (Section 4.5.6), and emit `Fault` of kind `config-refused`.
 - [0009-083] The driver MUST start omp only in `always-ask-cached` (configured as `ask-exec`) and MUST NOT declare the omp `ask-all` mode. Omp `ask-all` stays undeclared until every tool kind omp runs (including grep, glob and find, `[UNOBSERVED]`) is observed to surface an approval prompt (RFC-0006 0006-004, D21). The omp allow path is verified by stub (RFC-0006 0006-029); the residual items are in RFC-0006 issue 2. The omp card carries `approvalMode` `ask-exec`, the card value that maps to `always-ask-cached` (RFC-0006 0006-003).
 
+Mode names for omp, by layer:
+
+| Layer | Value | Basis |
+|---|---|---|
+| Operator config `approval_mode` and card `approvalMode` | `ask-exec` | 0009-066, 0009-083 |
+| Canonical mode | `always-ask-cached` | 0009-063 |
+| omp command line `--approval-mode` | `always-ask-cached` | 0009-039 |
+| omp session `tools.approvalMode` | `always-ask-cached` | 0006-025 |
+| Refused for omp (not declared) | `ask-all`, `always-ask`, `write`, `yolo` | 0009-063, 0009-064 |
+
 Worked example (card extension entry, shape proposed):
 
 ```json
-{"urn:a2abus:ext:approval:1":{"approvalMode":"always-ask-cached"}}
+{"urn:a2abus:ext:approval:1":{"approvalMode":"ask-exec"}}
 ```
 
 ### 4.10 Environment and credentials
@@ -418,7 +428,7 @@ What each peer sees from this design.
 | Stock A2A v1.0 client | Nothing of the drivers. It talks to the gateway (RFC-0008) and sees standard A2A states and artifacts. | Tool-call detail is status metadata only. | Drivers never emit A2A-invalid shapes. Extension data lives only under extension URIs (RFC-0001). |
 | Hermes (as A2A peer) | `driver-a2a-http` is a standard A2A HTTP client: `SendMessage`, `A2A-Version: 1.0`, `ROLE_USER` text parts, a contextId namespaced per bus origin (0009-076), and `GetTask` or `SubscribeToTask` only for tasks it created (0009-077). | No `A2A-Extensions` header, no bus metadata, no budget or provenance sent. Peer sees a derived contextId, not the bus context id. | Matches the body and headers recorded in `docs/interop/hermes.md` section 8.3. Peer-side budgets are enforced locally (L9). Anti-loop cap is respected by reusing `messageId` on resend (0009-045). Peer error shapes are tolerated (0009-079). |
 | Hermes (as A2A server, reached through gateway) | Not applicable. The driver is the client. | Not applicable. | See RFC-0008 for the server-side profile. |
-| omp (ACP agent) | An ACP client on protocol version 1 that declares `elicitation.form` and no fs, terminal, or auth terminal capability; `cwd` set to the workspace; `mcpServers` from RFC-0007 only, after a probe call (0009-017). | omp's own file and shell tools run without client mediation. Read and write approvals arrive as form elicitation under `always-ask-cached`; bash approvals use `session/request_permission` (0009-088). | Explicit `--approval-mode ask-exec` (0009-039) and no `--session-dir` (0009-087). Start only in `always-ask-cached` (0009-083). Refuse-start for dangerous modes (0009-064). Cancel path ends every turn (0009-035). |
+| omp (ACP agent) | An ACP client on protocol version 1 that declares `elicitation.form` and no fs, terminal, or auth terminal capability; `cwd` set to the workspace; `mcpServers` from RFC-0007 only, after a probe call (0009-017). | omp's own file and shell tools run without client mediation. Read and write approvals arrive as form elicitation under `always-ask-cached`; bash approvals use `session/request_permission` (0009-088). | Explicit `--approval-mode always-ask-cached` (0009-039) and no `--session-dir` (0009-087). Start only in `always-ask-cached` (0009-083). Refuse-start for dangerous modes (0009-064). Cancel path ends every turn (0009-035). |
 | claude-agent-acp (ACP agent) | The same ACP client profile as omp, with `session/request_permission` for approvals. Default mode is set in the supervisor-owned settings file (0009-084). | Same as omp for file and shell tools. Background subagents keep running after `session/cancel` in the notes (`docs/interop/acp-omp-claude.md`); the driver cannot stop them through ACP. | The worker's turn deadline and the supervisor's process-tree kill (0009-036, 0009-060) bound them. Open issue in Section 9. |
 
 Notes on what each ACP agent may do with an unknown client method: it may fail its own operation (0009-019). That is the expected result of declaring no fs or terminal capability and is recorded in the trade-offs. `elicitation/create` in form mode is answered under 0009-082, not refused.
@@ -490,7 +500,7 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-021 | Each `stopReason` in the table maps to the listed outcome; an unknown string maps to `BACKEND_ERROR`. | contract |
 | 0009-022 | JSON-RPC error on prompt maps to `BACKEND_ERROR`; detail is redacted. | contract |
 | 0009-023 | Kill stub agent mid-turn; terminal emitted within 5 seconds. | contract |
-| 0009-024 | Stub agent silent past `turn_idle_timeout`; `BACKEND_TIMEOUT` and cancel path run. | contract |
+| 0009-024 | Stub agent silent past `turn_idle_timeout`; `BACKEND_TIMEOUT` and cancel path run. With a permission or elicitation pending the idle timer does not fire; an answer restarts it. | contract |
 | 0009-025 | Stub sends text chunks and a non-text block; only text becomes deltas, `last` set on final. | contract |
 | 0009-026 | Thought chunks produce no artifact text by default; enabling the option produces progress only. | contract |
 | 0009-027 | Tool-call update produces progress metadata with no raw output body. | contract |
@@ -505,7 +515,7 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-036 | Agent ignores cancel; driver kills tree after `cancel_grace` and emits `Canceled`. | contract |
 | 0009-037 | Launch spec with a shell string is rejected at config load. | contract |
 | 0009-038 | Windows launch uses `node` with an absolute entry path; no `cmd /c`. | driver |
-| 0009-039 | Launch argv for omp includes `--mode acp`, `--cwd`, and `--approval-mode ask-exec`, and does not include `--session-dir`. | contract |
+| 0009-039 | Launch argv for omp includes `--mode acp`, `--cwd`, and `--approval-mode always-ask-cached`, and does not include `--session-dir`. | contract |
 | 0009-040 | Hermes request carries `A2A-Version: 1.0`; no `A2A-Extensions` or `urn:a2abus:` metadata appears on the wire. | contract |
 | 0009-041 | Card fetch with 404 on the primary path falls back to `agent.json`; card failure does not abort the turn. | contract |
 | 0009-042 | Configured tenant is sent in `params.tenant`; a mismatched echo is not treated as isolation (0009-080). | contract |
@@ -563,7 +573,7 @@ Each issue has a default. The default applies until a lab run or a revision chan
 
 1. **omp approvals.** Verified by stub (`docs/spikes/omp-acp.md` Q4 and gating table): read and write approvals arrive as form elicitation under `always-ask-cached`; bash approvals arrive as `session/request_permission` in every mode except `yolo`; allow-once through elicitation works with the enum label; decline, reject, and cancel answers behave as 0009-082 and 0009-035. Still `[UNOBSERVED]`: a real model run; cache keying beyond tool name; other tool kinds (grep, glob, find); omp's timeout for an unanswered elicitation (none within 40 s). Default: the driver advertises `elicitation.form` (0009-018), maps form elicitation to `PermissionRequest` (0009-082), relays both channels (0009-088), and starts omp in `always-ask-cached` (0009-083). The residual items are RFC-0006 issue 2.
 2. **Session restore on claude and omp.** Stub tier: claude `session/load` and `session/resume` both restore after restart, and an unknown id returns `-32002` (`docs/spikes/claude-acp.md` Q7). omp `session/load` and `session/resume` restore after restart only with the default session directory, the same `PI_CODING_AGENT_DIR`, and the same `cwd` (0009-087); with `--session-dir` they return `ACP session not found`. Why a different `cwd` gives `ACP session load was cancelled` is `[UNOBSERVED]` (`docs/spikes/omp-acp.md` Q7, blocker B3). Live resume with a real model is `[UNOBSERVED]`. Default: `session/load`, then `session/resume`, then a new session with a notice; `not found` and `load was cancelled` both mean a new session (0009-013).
-3. **omp `--no-ui` in ACP.** The behavior under ACP is `[UNVERIFIED]`. Default: the driver does not pass `--no-ui`; the gate relies on `--approval-mode ask-exec` and form elicitation (0009-039, 0009-082).
+3. **omp `--no-ui` in ACP.** The behavior under ACP is `[UNVERIFIED]`. Default: the driver does not pass `--no-ui`; the gate relies on `--approval-mode always-ask-cached` and form elicitation (0009-039, 0009-082).
 4. **ACP error code for an unadvertised method.** omp's own error code is `[UNVERIFIED]`; the -32601 seen in the omp spike was the probe's answer, not omp's. Default: -32601 (0009-019). A lab run decides whether any agent needs another code.
 5. **claude-agent-acp bin name and Windows install.** The bin name `claude-agent-acp` is verified against the published package v0.97.0. Launch as `node <absolute entry>` on Windows is observed with the stub (`docs/spikes/claude-acp.md`). The Windows install path is `[UNVERIFIED]`. Default: resolve `dist/index.js` from the installed package root, and run `node` on that absolute path (0009-038).
 6. **claude usage sub-fields.** Stub tier (`docs/spikes/claude-acp.md` Q5): the prompt result `usage` has `inputTokens`, `outputTokens`, and `totalTokens`; `usage_update` has `used`, `size`, and `cost` (later updates only). Real values are `[UNOBSERVED]`. Default: map these fields as 0009-056 and 0009-086, and nothing else.

@@ -87,7 +87,7 @@ backend = "acp-omp"         # profile owned by RFC-0009; launches `omp --mode ac
 depends_on = ["bus"]
 repo = 'C:\Users\op\dev\agent-proto'
 workspace = { mode = "per-session", base_ref = "HEAD", non_git = "refuse" }
-approval_mode = "ask-all"  # RFC-0006 mode; driver sets omp always-ask (0006-025); dangerous modes refused (4.10)
+approval_mode = "ask-exec"  # RFC-0006 mode; driver passes `--approval-mode always-ask-cached` to omp (0009-039, 0006-025); dangerous modes refused (4.10)
 env_require = ["OMP_API_KEY"] # presence check by name only (4.7)
 env_allow = []             # provider key names this agent may receive (0012-062); empty by default
 readiness = { kind = "bus-presence", timeout_ms = 30000 }
@@ -138,6 +138,7 @@ restart = "on-failure"
 
 - [0012-005] MUST hold an exclusive lock on `<state_dir>/run/supervisor.lock` for the supervisor lifetime (`LockFileEx` on Windows; `flock` on Linux). A second supervisor on the same state directory MUST exit with code 6 and a message naming the lock holder pid.
 - [0012-006] MUST create the state directory layout `creds/`, `ws/`, `artifacts/`, `audit/` (RFC-0013 sink), `run/`. On Linux directories are mode `0700`; on Windows the DACL grants only the current user. Supervisor MUST refuse to start if an existing directory is broader.
+- [0012-075] MUST read the host trust file from `<state_dir>/trust.toml` by default. The optional `[security] trust_file` key in the supervisor config overrides that path. The supervisor MUST pass the resolved path to every child process in the environment variable `A2AB_TRUST_FILE`. The per-user configuration directory (RFC-0007 4.2) MUST NOT be the default location, so that parallel runs and tests do not share trust state.
 
 Linux defaults: state `$XDG_STATE_HOME/a2abus` (fallback `~/.local/state/a2abus`); config as in 4.1. Windows defaults: state `%LOCALAPPDATA%\a2abus`; the workspace root is `<state_dir>\ws` to keep paths short (4.8).
 
@@ -443,6 +444,7 @@ How the design avoids breaking them: no new headers or subjects are introduced h
 | 0012-072 | Unparseable lease lock blocks acquire with `state_invalid`; file bytes unchanged | Unit |
 | 0012-073 | Copy of a tree with an ignored `.env` and an untracked non-ignored file: `.env` absent from the workspace and baseline commit; the untracked file present | Integration |
 | 0012-074 | Copy of a non-git tree with `.env`, `id_rsa`, `.aws/config` and a file matched by `copy_exclude`: none present in the workspace or baseline commit; `WORKSPACE_CREATED` carries `excluded_count` `"4"` | Integration |
+| 0012-075 | No trust file under the per-user config dir: the supervisor reads `<state_dir>/trust.toml`; with `[security] trust_file` set, that path is read and passed to children as `A2AB_TRUST_FILE` | Integration |
 
 ## 9. Open issues
 

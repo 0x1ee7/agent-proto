@@ -75,7 +75,7 @@ Terms below are not defined in RFC-0001.
 
 ### 4.3 Trust allowlist
 
-- [0007-020] Each host has one trust file `trust.toml` in the per-user configuration directory (4.2). It is TOML 1.0, begins with `schema = "a2abus.trust/1"`, and is edited by the operator only.
+- [0007-020] Each host has one trust file `trust.toml`, at the path set by RFC-0012 [0012-075]: `<state_dir>/trust.toml` by default, or the `[security] trust_file` path. It is TOML 1.0, begins with `schema = "a2abus.trust/1"`, and is edited by the operator only.
 - [0007-021] Each `[[key]]` entry has the fields: `kid` (string, required), `agent` (required agent id), `role` (`agent`, `gateway` or `operator`, required), `tenants` (array, default `["local"]`), `public_key` (required, 4.1), `status` (`active`, `retired` or `revoked`, default `active`), `not_before` and `not_after` (optional RFC 3339 UTC), `max_skew_ms` (integer, default 300000, maximum 3600000), `require_signature` (boolean, default false), `mcp_direct` (boolean, default false). Unknown fields are a load error.
 - [0007-022] Load validation MUST check: kid equals the value derived under 4.1 from `agent` and `public_key`; kids are unique; `role = "operator"` only with `agent = "operator"`; `role = "gateway"` only with `agent = "gateway"`; `mcp_direct = true` only with role `agent`. Any violation is a load error.
 - [0007-023] At supervisor start an invalid trust file is fatal and the supervisor MUST NOT start. On a runtime reload, an invalid file MUST be rejected; the last valid state stays in force and an audit event is emitted (RFC-0013).

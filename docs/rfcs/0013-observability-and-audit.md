@@ -193,7 +193,7 @@ Workers expose no HTTP listener in M1; their health is their presence key (RFC-0
 ### 4.9 Log levels and output
 
 - [0013-038] MUST use these levels: `error` (an operation failed and needs action); `warn` (degraded or retried); `info` (lifecycle, decisions, refusals; default); `debug` (diagnostic detail without payload); `trace` (wire-level, development only, still redacted). The level is set with the `A2AB_LOG` environment variable, for example `info` or `warn,a2ad=debug`.
-- [0013-039] MUST write logs to stderr and to `<state_dir>/logs/<component>.log`, rotated at 10 MiB with 5 files kept. Behavior is identical on Windows and Linux; no ANSI sequences in files.
+- [0013-039] MUST write each component's log only to `<state_dir>/logs/<component>.log`, rotated at 10 MiB with 5 files kept. A host MUST NOT duplicate log lines to stderr; the supervisor MUST redirect each child process's stdout and stderr to that same file. Behavior is identical on Windows and Linux; no ANSI sequences in files.
 - [0013-040] MUST NOT log seeds, tokens, provider key values, decision signatures (log `key_id` only), payload bodies, or absolute paths outside the state directory. The redaction rules of sec 4.4 apply to log fields too.
 
 ### 4.10 Required emission points
@@ -292,7 +292,7 @@ No change is visible to existing clients. The audit subject and stream are new a
 | 0013-036 | `/readyz` returns 503 when bus disconnected, sink not writable, or spool above 80% | Integration |
 | 0013-037 | Health bodies match the shape and contain no paths or config names | Unit |
 | 0013-038 | `A2AB_LOG` levels filter as stated; default is info | Unit |
-| 0013-039 | Log rotation at 10 MiB keeps 5 files; no ANSI in files on Windows and Linux | Integration (Windows and Linux) |
+| 0013-039 | Log rotation at 10 MiB keeps 5 files; no duplicate stderr copy; child stdout and stderr land in the component log; no ANSI in files on Windows and Linux | Integration (Windows and Linux) |
 | 0013-040 | Secret fixtures never appear in logs (grep over captured stderr and files) | Integration |
 | 0013-041 | Expired approval produces `APPROVAL_DECIDED` with `expired`; bad signature produces `SIGNATURE_FAILED` and no decision applied | Integration |
 | 0013-042 | Dangerous-mode start emits `DANGEROUS_MODE_ACTIVE` each time | Integration |

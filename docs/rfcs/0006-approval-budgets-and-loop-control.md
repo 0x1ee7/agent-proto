@@ -128,6 +128,7 @@ stateDiagram-v2
 - [0006-057] The Worker MUST NOT offer a cache or always option in `ask-all`, and MUST NOT offer one for the `exec` or `delete_or_move` tier, for any agent. Cache and always options are `allow_always` (any id) and omp labels such as `Approve File`, `Always Approve File`, `Approve Directory`, and `Approve write for this session`. In those cases only once options are offered (`allow-once`, `reject-once`).
 - [0006-060] For an omp form elicitation under 0006-052, the card MUST show tool `write` and tier `write` (the name on the first line; 0006-002) and MUST build its summary from that name alone. The `Path:` line and the rest of `message` MAY be shown as untrusted text, redacted under 0006-008 and labelled untrusted. A card MAY show a peer-call hint when the displayed path begins `xd://mcp__`, labelled as derived from untrusted text. The hint MUST NOT change the tool, tier, summary, options, coalescing key or any decision under 0006-061.
 - [0006-061] The Worker MUST NOT answer a gated call with `allow-once` without an operator decision unless all of the following hold: `delegation.auto_allow_peer_tools` is true for the owner agent (RFC-0015 [0015-087]); the call is attributed to a peer-call shim tool (RFC-0015 [0015-116]) from a source that the agent's own output cannot set; and the tier is `write`. The Worker writes one audit event `APPROVAL_AUTO_ALLOWED` (RFC-0013) with `task_id`, `tool`, `tier` and `mode`. The answer uses the once option only (0006-053, 0006-057) and never `allow_always`. Until such a source is observed, the Worker MUST NOT auto-allow whatever the configuration says (section 9, issue 14).
+- [0006-062] While a task is `INPUT_REQUIRED` with an open approval request, every Task snapshot the bus serves for it (`GetTask`, `ListTasks`, `SubscribeToTask`, and the snapshot returned by `SendMessage`) MUST carry the request in `status.message.metadata["urn:a2abus:ext:approval:1"]`, in the shape of 0006-007. The key MUST be absent once no request is open for the task.
 
 ### 4.6 Budget allowance and accounting
 
@@ -481,6 +482,7 @@ On expiry or cancel, the driver answers `{"outcome":{"outcome":"cancelled"}}` (0
 | 0006-058 | The gateway derives no budget from HTTP headers; a Hermes-originated request takes the root allowance (0006-031), not a caller budget | MUST |
 | 0006-060 | Omp elicitation: card shows tool write and tier write; summary from the name only; path shown only as untrusted text; a peer-call hint changes no decision | MUST |
 | 0006-061 | Peer-call route auto-allowed only with delegation.auto_allow_peer_tools true, a trusted attribution source, tier write, audit APPROVAL_AUTO_ALLOWED, and allow-once only; without a trusted source no auto-allow occurs | MUST |
+| 0006-062 | Snapshot of an INPUT_REQUIRED task with an open request carries the approval entry from GetTask, ListTasks, SubscribeToTask and SendMessage; the entry is absent after the decision | MUST |
 
 ## 9. Open issues
 
