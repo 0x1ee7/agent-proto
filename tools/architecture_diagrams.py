@@ -30,12 +30,12 @@ M = kit.MARGIN
 kit.register(
     kit.Improvement(
         "E-01", "high", "driver-acp (approval expiry)",
-        "Live S4c fails: the task ends BACKEND_CRASHED with null detail, not APPROVAL_TIMEOUT "
-        "(docs/spikes/e2e-m1.md, verdict table). Cause not confirmed. The older case table in "
-        "the same file still shows S1 FAIL and S4a to S8 NOT RUN, which contradicts the verdicts.",
-        "Read the logs of that run to confirm the cause; fix the ordering of worker expiry and "
-        "driver backstop; rerun S4c live and record the verdict.",
-        "S4c live fails"),
+        "Live S4c passes (APPROVAL_TIMEOUT with detail), but after the expiry the omp backend stays closed: "
+        "the next task fails BACKEND_CRASHED (BACKEND_START_FAILED: backend is closed) until the supervisor "
+        "restarts (docs/spikes/e2e-m1.md, re-run 2026-10-27).",
+        "Find where the backend is closed on approval expiry and why it is not respawned; fix it with a "
+        "regression test; rerun S4c and the next task live and record it.",
+        "backend not respawned after expiry"),
     kit.Improvement(
         "G-01", "high", "gateway-http (tls.rs)",
         "The TLS key must be owner-only on Unix, but Windows ACLs are not inspected "
@@ -434,8 +434,8 @@ def page_approvals(p):
             "Driver turn idle: DEFAULT_TURN_IDLE_TIMEOUT = 600 s (driver-acp config.rs).",
         ]),
         ("Rule", "#34d399", [
-            "Worker approval expiry is authoritative (commit 9a4172a). S4c shows the live "
-            "failure of that ordering (E-01).",
+            "Worker approval expiry is authoritative (commit 9a4172a). Live S4c confirms APPROVAL_TIMEOUT; "
+            "the backend respawn after expiry is open (E-01).",
         ]),
     ], bottom=p.bottom)
 
@@ -488,7 +488,7 @@ def page_register(p):
     ]
     order = ["E-01", "G-01", "D-01", "P-01", "A-01", "R-01"]
     notes = [
-        "E-01 first: S4c is the only FAIL in the verdict table of docs/spikes/e2e-m1.md.",
+        "E-01 first: after an approval expiry the omp backend stays closed (live, 2026-10-27).",
         "G-01 next: RFC-0008 [0008-066] requires the owner-only key check on every platform.",
     ]
     kit.improvement_register(p, areas, order, notes)

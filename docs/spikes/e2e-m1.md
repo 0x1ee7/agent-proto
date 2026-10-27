@@ -26,7 +26,7 @@ Defects found and fixed or observed in this pass:
 | `a2a send` without `--wait` blocks until the task is terminal, so a cancel must come from a separate process | Timing in S8 below | Observation (CLI) |
 | `README.md` task fixture: `.spikes/e2e/repo` has `README.txt` only | Not changed | Open |
 | `a2a watch` returns `wire: UnsupportedOperation` | Not investigated | Open (CLI) |
-| `approvals list` fails when any configured agent is unavailable | `crates/a2a-cli/src/approvals.rs` ~103–128. Not re-checked | Open (CLI) |
+| `approvals list` fails when any configured agent is unavailable | `crates/a2a-cli/src/approvals.rs` ~103-128. Not re-checked | Open (CLI) |
 
 Case results:
 
@@ -35,10 +35,23 @@ Case results:
 | Main task `A2A_SEND:claude:review README.md` (0014-010, child hops == 1) | PASS | `a2a send omp "A2A_SEND:claude:review README.md" --wait` returned `TASK_STATE_INPUT_REQUIRED` for the write-to-xd-route approval `perm-1793073600661953500-1`. `a2a approvals approve <id> --scope once --yes` moved the task to WORKING. Parent task `01a17b84-3f61-72aa-aaf2-5e8478e3d0eb` reached state 3 (COMPLETED). Child claude task `01a17b84-5025-7622-a5c6-992131e4b7f8` reached state 3. omp `tasks.log` ledger: `hops 1, children 1` |
 | S4a (0014-013) write approve | PASS | `a2a send omp "WRITE_FILE" --wait` returned INPUT_REQUIRED. Approval `perm-1793073600661953500-2` approved with allow_once. Task `01a17b85-01f6-7502-b07a-7a4a5f6f70b4` reached COMPLETED. `ws/local/omp/01a17b8501f6/written.txt` exists |
 | S4b (0014-014) write deny | PASS | Approval `perm-1793073600661953500-3` denied with reject_once. Task `01a17b85-6582-70d6-9f4a-d6231447fe80` reached COMPLETED with no failure. `ws/local/omp/01a17b856582/` has no `written.txt`. Matches RFC 0014 "COMPLETED without the write if the turn succeeds" |
-| S4c (0014-015) no decision | FAIL | Approval `perm-1793073600661953500-4` (expires 04:07:29.274). Task `01a17b86-1a76-758e-b236-897360332a52` ended state 4 at 04:07:29.281 with `failure.code = BACKEND_CRASHED`, detail null. Expected `APPROVAL_TIMEOUT` and `cancelled` to the backend. No `written.txt`. Cause not yet confirmed [INFERENCE]: the driver's own 300 s `permission_timeout` and the worker's approval expiry fire at the same instant, and the driver path wins with a null-detail crash. `commit_expired` only maps to `APPROVAL_TIMEOUT` when the worker's expiry runs first |
-| S8 (0014-019) cancel LONG_STREAM | PASS (CANCELED within 15 s) | Task `01a17b8d-b91c-7496-a2cc-6347f592feec`. `a2a cancel` at 04:10:53.52 returned WORKING. CANCELED (state 5) committed at `at_ms 1793074253688`, about 0.2 s after the request. "No child process remains" is NOT VERIFIED: omp is a persistent host, and no tree check was done |
+| S4c (0014-015) no decision | SUPERSEDED 2026-10-27 by the re-run below (was FAIL: BACKEND_CRASHED, detail null, 04:07:29) | Approval `perm-1793073600661953500-4` (expires 04:07:29.274). Task `01a17b86-1a76-758e-b236-897360332a52` ended state 4 at 04:07:29.281 with `failure.code = BACKEND_CRASHED`, detail null. Expected `APPROVAL_TIMEOUT` and `cancelled` to the backend. No `written.txt`. Cause not yet confirmed [INFERENCE]: the driver's own 300 s `permission_timeout` and the worker's approval expiry fire at the same instant, and the driver path wins with a null-detail crash. `commit_expired` only maps to `APPROVAL_TIMEOUT` when the worker's expiry runs first |
+| S8 (0014-019) cancel LONG_STREAM | SUPERSEDED 2026-10-27 by the re-run below (earlier PASS had no process check) | Task `01a17b8d-b91c-7496-a2cc-6347f592feec`. `a2a cancel` at 04:10:53.52 returned WORKING. CANCELED (state 5) committed at `at_ms 1793074253688`, about 0.2 s after the request. "No child process remains" is NOT VERIFIED: omp is a persistent host, and no tree check was done |
 
 Earlier S8 attempts were invalid. The first ran while S4c's approval still held omp's turn, so it failed with `BACKEND_START_FAILED: a turn is already open`. A later attempt cancelled after the stream had already completed (`TaskNotCancelable`).
+
+## Re-run 2026-10-27: S4c and S8 (isolated stack `.spikes/e2e/s1debug.toml`)
+
+Stack: bus 4252, health 9485, omp stub 18786, claude stub 18777. Supervisor PID 44628 (first run), 47864 (second run, used for S8). Started by this run: stubs, supervisor, nats-server, a2ad hosts, omp.exe and node.exe children. No config change; the approval expiry is the fixed worker value (300 s), so the full wait was used. Stop: `a2ad.exe stop --config .spikes/e2e/s1debug.toml` reported `supervisor 47864 stopped`.
+
+| Case | Verdict | Evidence |
+|---|---|---|
+| S4c (0014-015) no decision | PASS | Task `01a17e1f-492c-7342-8985-e17eb60401c1` sent `A2A_SEND:claude:review README.md` (`send --wait` returned INPUT_REQUIRED at 17:09:03 local). Approval `perm-1793117316775074300-1` (tool `write`, tier EXEC, scope once) was never decided. `approvals list` showed `expires at 2026-10-27T16:14:03.136+00:00`. In `agents/omp/tasks.log` the approval is `state: Expired`, `expires_ms 1793117643136`. Task went to state 4 (FAILED) with `failure: {"code":"APPROVAL_TIMEOUT","detail":"APPROVAL_TIMEOUT: approval window expired"}` and `terminal_ms 1793117643145` (9 ms after expiry). Time to terminal: task created 1793117341996, terminal 1793117643145, = 301.1 s. Detail is non-null. The supervisor log has no BACKEND_CRASHED for this task |
+| S8 (0014-019) cancel LONG_STREAM | PASS | Task `01a17e27-3a39-77e2-835b-f5edf48cc700`, sent `LONG_STREAM` to omp. `a2a cancel <id> --agent omp` issued 16:17:46.50 local, returned `TASK_STATE_WORKING` at 16:17:46.64 (exit 0). CANCELED (state 5) committed at `at_ms 1793117866747`, about 0.25 s after the request. The send exited with `TASK_STATE_CANCELED` at 16:17:46.96. Process check: omp.exe PID 4604 (child of this run's a2ad host 49864) and node.exe PID 768 (child of claude host 60756) were alive before stop and gone after `a2ad stop` (`Get-Process -Id`). The omp host keeps a persistent omp.exe between tasks, so the check is made at stop |
+
+Anomaly (not a verdict change): after the S4c timeout, the omp backend stayed closed. The next task `01a17e24-ccae-748e-b090-2f71d292dbd1` (LONG_STREAM, sent 16:15:02 local, before the restart) failed in 1.7 s with `failure: {"code":"BACKEND_CRASHED","detail":"BACKEND_START_FAILED: backend is closed"}`. At that point the omp a2ad host (PID 40584) was alive but its omp.exe child (PID 34080) was gone, and no `agent process exited` line was logged. Cause [INFERENCE]: the approval-expiry path stops the ACP session and the omp host does not respawn the child. S8 ran only after a supervisor restart. Evidence: `.spikes/e2e/state-s1/logs/omp.log` has the `spawned program=omp.exe pid=34080` line at 16:08:36 and no later spawn or exit line; `tasks.log` holds the failure record above.
+
+Invalid attempts in this re-run (not verdicts): (1) the first S8 cancel used an id with a trailing newline and was rejected with a usage error; (2) a later S8 attempt cancelled after the stream had completed (about 20 s), returning `TASK_STATE_COMPLETED`.
 
 Test status: `cargo build -p a2ad -p a2a-cli -p a2a-mcp` passes. `cargo test -p driver-acp`: 67 passed, 0 failed, 2 ignored on the last run (AcpDriverAgent also fixed the `peer_tools_with_operator_servers_refused_0015_084` race and the silent refusal). Checks for Main: `cargo test -p a2ad -p a2a-worker -p a2a-cli`.
 
@@ -64,11 +77,11 @@ Test status: `cargo build -p a2ad -p a2a-cli -p a2a-mcp` passes. `cargo test -p 
 | 0014-012 (S3) | claude to Hermes via driver-a2a-http, `A2A-Version: 1.0` | NOT RUN | Depends on S2 gateway. Not started |
 | 0014-013 (S4a) | approve: INPUT_REQUIRED, WORKING, COMPLETED, audit `decided_by` | NOT RUN | Not reached in this pass; approval flow requires WRITE_FILE turn under `ask-exec` plus `a2a approvals` |
 | 0014-014 (S4b) | deny | NOT RUN | Same as S4a |
-| 0014-015 (S4c) | no decision: `cancelled`, FAILED APPROVAL_TIMEOUT | NOT RUN | Same as S4a |
+| 0014-015 (S4c) | no decision: `cancelled`, FAILED APPROVAL_TIMEOUT | PASS (re-run 2026-10-27) | Task `01a17e1f-492c-7342-8985-e17eb60401c1`: FAILED, `APPROVAL_TIMEOUT`, detail non-null, 301.1 s to terminal. See "Re-run 2026-10-27" |
 | 0014-016 (S5) | loop: LOOP_DETECTED | NOT RUN | Not exercised |
 | 0014-017 (S6) | kill bus mid-task | NOT RUN | Not exercised |
 | 0014-018 (S7) | duplicate delivery | NOT RUN | Not exercised |
-| 0014-019 (S8) | cancel within 15 s | NOT RUN | Not exercised |
+| 0014-019 (S8) | cancel within 15 s | PASS (re-run 2026-10-27) | CANCELED about 0.25 s after cancel; omp.exe and node.exe children gone after `a2ad stop`. See "Re-run 2026-10-27" |
 | 0014-020 (S9) | a2a-sdk Python client via gateway | NOT RUN | Depends on gateway |
 | 0014-021 (N1) | nats | NOT RUN | Not exercised |
 | 0014-022 (N2) | two workers one checkout | NOT RUN | Not exercised |
