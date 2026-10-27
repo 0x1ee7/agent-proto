@@ -321,7 +321,7 @@ impl<B: Bus> Client<B> {
             outbound,
             opts,
             outbound.return_immediately,
-            self.config.signing.as_deref(),
+            self.default_wire(),
         )
         .await
     }
@@ -452,13 +452,7 @@ impl<B: Bus> Client<B> {
         call_opts.timeout = Some(bound + Duration::from_millis(a2a_core::budget::WALL_MARGIN_MS));
         call_opts.ttl_ms.get_or_insert(ttl_ms);
         let reply = self
-            .send_with(
-                agent,
-                outbound,
-                &call_opts,
-                false,
-                self.config.signing.as_deref(),
-            )
+            .send_with(agent, outbound, &call_opts, false, self.default_wire())
             .await?;
         match reply.value {
             SendReply::Message(message) => Ok(Outcome::Message(message)),
@@ -498,7 +492,7 @@ impl<B: Bus> Client<B> {
         outbound: &Outbound,
         opts: &CallOptions,
         return_immediately: bool,
-        signing: Option<&dyn SigningHook>,
+        wire: Wire<'_>,
     ) -> Result<Unary<SendReply>, ClientError> {
         let body = self.send_body(outbound, return_immediately)?;
         let reply: Unary<pb::SendMessageResponse> = self
@@ -508,7 +502,7 @@ impl<B: Bus> Client<B> {
                 body,
                 opts,
                 outbound.transport_id.clone(),
-                signing,
+                wire,
             )
             .await?;
         let value = match reply.value.payload {
@@ -551,6 +545,14 @@ impl<B: Bus> Client<B> {
         })
     }
 
+    /// Wire settings from the configuration: the configured signing hook and extensions.
+    fn default_wire(&self) -> Wire<'_> {
+        Wire {
+            signing: self.config.signing.as_deref(),
+            extensions: self.config.extensions.clone(),
+        }
+    }
+
     /// Runs one request/reply exchange for `body` under the message identifier `msg_id`.
     async fn call<M: WireMessage>(
         &self,
@@ -560,15 +562,8 @@ impl<B: Bus> Client<B> {
         opts: &CallOptions,
         msg_id: MessageId,
     ) -> Result<Unary<M>, ClientError> {
-        self.call_signed(
-            agent,
-            op,
-            body,
-            opts,
-            msg_id,
-            self.config.signing.as_deref(),
-        )
-        .await
+        self.call_signed(agent, op, body, opts, msg_id, self.default_wire())
+            .await
     }
 
     /// Runs one exchange like [`Self::call`], signing with `signing` instead of the configured hook.
@@ -579,8 +574,12 @@ impl<B: Bus> Client<B> {
         body: RequestBody,
         opts: &CallOptions,
         msg_id: MessageId,
-        signing: Option<&dyn SigningHook>,
+        wire: Wire<'_>,
     ) -> Result<Unary<M>, ClientError> {
+        let Wire {
+            signing,
+            extensions,
+        } = wire;
         if let Some(traceparent) = &opts.traceparent {
             headers::validate_traceparent(traceparent).map_err(ClientError::Header)?;
         }
@@ -606,7 +605,7 @@ impl<B: Bus> Client<B> {
             ttl_ms,
             traceparent: opts.traceparent.clone(),
             tracestate: opts.tracestate.clone(),
-            extensions: self.config.extensions.clone(),
+            extensions,
             service_params: opts.service_params.clone(),
             json: self.config.json,
             op,
@@ -677,4 +676,9 @@ fn state_of(task: &pb::Task) -> Result<TaskState, ClientError> {
 
 fn task_id_of(task: &pb::Task) -> Result<TaskId, ClientError> {
     TaskId::parse(&task.id).map_err(|_| ClientError::InvalidReply("invalid task id"))
+}
+/// Per-call wire settings: the signing hook and the extension URIs to activate.
+pub(crate) struct Wire<'a> {
+    pub(crate) signing: Option<&'a dyn SigningHook>,
+    pub(crate) extensions: Vec<String>,
 }

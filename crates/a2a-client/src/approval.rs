@@ -16,7 +16,7 @@ use bus_api::bus::Bus;
 use pbjson_types::{Struct, Timestamp};
 use serde_json::{Value, json};
 
-use crate::client::{Client, SendReply, Unary};
+use crate::client::{Client, SendReply, Unary, Wire};
 use crate::config::{CallOptions, SigningHook};
 use crate::error::{ApprovalError, ClientError};
 use crate::outbound::Outbound;
@@ -190,8 +190,23 @@ impl<B: Bus> Client<B> {
         let now = self.clock.now_ms().ok_or(ClientError::Clock)?;
         pending.check(option_id, now)?;
         let outbound = decision_outbound(pending, option_id, now)?;
-        self.send_with(agent, &outbound, opts, outbound.return_immediately, signing)
-            .await
+        // A decision is a follow-up on a task, so the worker needs the approval extension
+        // activated on the request ([0006-012]).
+        let mut extensions = self.config.extensions.clone();
+        if !extensions.iter().any(|uri| uri == APPROVAL) {
+            extensions.push(APPROVAL.to_owned());
+        }
+        self.send_with(
+            agent,
+            &outbound,
+            opts,
+            outbound.return_immediately,
+            Wire {
+                signing,
+                extensions,
+            },
+        )
+        .await
     }
 }
 

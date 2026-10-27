@@ -592,6 +592,13 @@ async fn decide_signed_against(
     let mut requests = fx.serve(Op::Send).await;
     let worker = async {
         let (inbound, envelope, payload) = fx.next_signed(&mut requests).await;
+        assert!(
+            envelope
+                .extensions
+                .split(',')
+                .any(|uri| uri.trim() == APPROVAL),
+            "a decision must activate the approval extension"
+        );
         let verdict = worker_verifies(
             trust,
             book,
