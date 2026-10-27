@@ -100,3 +100,18 @@ Test status: `cargo build -p a2ad -p a2a-cli -p a2a-mcp` passes. `cargo test -p 
 - Run run7 `TASK_STATE_FAILED` (`01a17b12`) cause: not re-verified.
 - Re-test the audit fix on a clean stack.
 - Hermes-dependent cases S2, S3, S9 and N3 need the gateway started with its secrets from `.spikes/hermes/secrets/`.
+
+## Re-run 2026-10-27b: backend respawn after expiry
+
+Stack: `.spikes/e2e/s1debug.toml`, bus 4252, health 9485, omp stub 18786 (PID 42220), claude stub 18777 (PID 59516), supervisor PID 61032 (single run, no restart between steps). Started by this run: both stubs, supervisor, nats-server and the a2ad hosts. Stopped with `a2ad.exe stop` (`supervisor 61032 stopped`), then stubs killed by PID.
+
+| Step | Verdict | Evidence |
+|---|---|---|
+| S4c approval expiry | PASS | Task `01a17e31-31f4-72b2-bacc-c0e9d2bc3d04` (`A2A_SEND:claude:review README.md`) reached INPUT_REQUIRED at 16:28:36 UTC; approval never decided. `tasks.log`: state 4 FAILED, `failure: {"code":"APPROVAL_TIMEOUT","detail":"APPROVAL_TIMEOUT: approval window expired"}`, `at_ms 1793118816534` (16:33:36.534 UTC). Detail non-null. |
+| Respawn after expiry | PASS | `omp.log`: at 16:33:36.839 health `live=false ... reason=agent process killed by the worker`. At 16:33:57.921 `agent process spawned program=omp.exe pid=9132`, and at 16:33:58.199 health `live=true init=Ready`. |
+| Plain turn on same supervisor | PASS | `a2a send omp "hello" --wait` at 16:33:59 UTC, no restart. Task `01a17e36-1a91-7572-a730-6f70d356bf6e`: `TASK_STATE_COMPLETED`, artifact `reply` = `OK`, no failure field (none present). Not BACKEND_CRASHED / BACKEND_START_FAILED. |
+
+Process check (omp.exe PIDs not owned by this run, left untouched): 32988, 43184, 14360, 16684, present before and after; not killed.
+This run's omp child 18152 (spawned 16:28:04) was absent before the second task. This run's respawned child 9132 (spawned 16:33:57) was alive after the second task (`tasklist`) and absent after `a2ad stop` (`tasklist /FI "PID eq 9132"`: no tasks). No `agent process exited` line was logged for either child.
+
+Cleanup: no listeners on 4252, 9485, 18777, 18786 after stop and stub kill. Nothing committed; no source changed.
