@@ -129,6 +129,18 @@ impl Backend for AcpDriver {
         answer.recv().unwrap_or(dead)
     }
 
+    fn can_start(&self) -> bool {
+        let (reply, answer) = mpsc::channel();
+        if self
+            .tx
+            .send(Msg::Command(Command::CanStart(reply)))
+            .is_err()
+        {
+            return false;
+        }
+        answer.recv().unwrap_or(false)
+    }
+
     fn attach(&mut self, sink: Box<dyn BackendSink>) {
         let _ = self.tx.send(Msg::Command(Command::Attach(sink)));
     }

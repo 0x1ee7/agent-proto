@@ -9,10 +9,12 @@ Uses: `bus-nats` (provisioning and JetStream connections), `a2a-audit`, `a2a-sec
 - Unsafe code exists only in module `platform` (RFC-0012 [0012-060]): `#![deny(unsafe_code)]` at the crate root, `#[allow(unsafe_code)]` on `pub mod platform`, and a SAFETY comment on every `unsafe` block.
 - Validate the whole configuration before starting anything (0012-004). Unknown keys are refused. `[[agent]] id = "bus"` is refused: the broker is configured in `[bus]` (0010-001).
 - Provider keys are never read or forwarded unless listed in `env_allow` (0012-026, 0012-062). Child environment carries `A2AB_*` identity variables and paths only, plus the log filter variables `A2AB_LOG` and `RUST_LOG` forwarded from the parent (0013-038). Seed bytes and grant credentials never appear in argv or environment (0012-027).
+- Provider key conflict (0009-069 vs 0012-062), resolved conservatively: 0009-069 forbids the driver from reading, copying, logging, forwarding or setting provider credentials; 0012-062 keeps provider keys out unless `env_allow` names them. For `acp-*` workers the driver refuses `env_allow` naming a provider key and that refusal stands. A key an agent needs is routed through the agent's own configuration (for claude: `settings.json` under `CLAUDE_CONFIG_DIR` with an `env` block, as in `crates/driver-acp/src/live.rs`). Recorded for D5, 2026-10-27.
 - `[log]` (optional): `level` (EnvFilter directive, default `info`) and `format` (`text` or `json`, default `text`), validated at load (0013-038, 0013-039). Child stdout/stderr logs are opened with `platform::open_log_for_append`, which shares delete on Windows so the host can rotate them.
 - `[[agent]] permission_timeout` (optional, seconds, acp-* workers only): validated at load with `driver_acp::check_permission_timeout`, which requires more than the 300 s worker approval expiry (0009-033). Absent keeps `DEFAULT_PERMISSION_TIMEOUT` (330 s). Refused for other kinds and for `a2a-http`.
 - One supervisor per state directory (0012-005): `run/supervisor.lock` via `fd-lock`; the pid is in `run/supervisor.pid`.
 - Probes are loopback-only and send no credentials (0012-010). Worker readiness is a local ready file written by the worker host.
+- Worker driver health is `run/<id>.health` (JSON `HostHealth`), rewritten by the worker host on each change. The supervisor labels a Ready worker whose driver is not live as `starting` (0004-015). A missing file means not live. Only `Kind::Worker` is affected.
 - Stop order: close the child's stdin (lifeline), then the graceful signal, then forced kill only after grace (0012-014, 0012-016, 0012-061). Windows uses CTRL_BREAK for workers and job-object termination for forced stop (0012-017, 0012-064).
 - Restart backoff 1 s doubling to 60 s; abandon after 5 failures inside 10 min (0012-011, 0012-012).
 - Exit codes follow 0012-055: 0 ok, 1 runtime, 2 usage, 3 config file missing, 4 rejected or denied, 5 stop timed out, 6 bus failure or lock held.
@@ -28,6 +30,7 @@ Uses: `bus-nats` (provisioning and JetStream connections), `a2a-audit`, `a2a-sec
 - 0009-033: `[[agent]] permission_timeout` validation and refusal rules (`config`).
 - 0012-005, 0012-007, 0012-010, 0012-011, 0012-012, 0012-014, 0012-015, 0012-026, 0012-027: supervisor lock, ordering, probes, restart policy, drain and env (`supervisor`).
 - 0013-036, 0013-037: readiness inputs published each tick (sink, spool, per-agent state) and the `/readyz` body (`supervisor`). Sink state means the current file opens for append; M1 has no sink consumer.
+- 0004-015: a Ready worker whose driver is not live is shown as `starting` in `/readyz`; the health file round-trips (`supervisor`, `host`).
 - 0012-017, 0012-019, 0012-021, 0012-025, 0012-066: process containment, start tokens, owner-only ACLs and path length (`platform`).
 - 0007-006, 0007-010, 0007-014, 0012-023, 0012-024, 0012-043, 0015-081, 0015-082: operator key bootstrap, credentials and delegation file (`creds`).
 - 0012-006: state layout creates `creds/`, `ws/`, `artifacts/`, `audit/`, `run/` (`creds`).

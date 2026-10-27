@@ -35,11 +35,15 @@ Layer L3 worker (RFC-0001 section 4.2). Serves one agent's RPC subjects, runs ta
 - Signing off: operator decisions over the bus are accepted pending a supervisor operator channel. RFC-0007 [0007-095] and RFC-0010 [0010-079] say that with signing off they come only from the supervisor's local operator channel (RFC-0012); RFC-0012 [0012-043] makes unsigned decisions the M1 default. This crate follows RFC-0012 [0012-043] until that channel exists. The conflict is open and is not resolved here.
 - No `unsafe`. No `unwrap`, `expect`, `panic`, `todo!`, or `unimplemented!` outside tests.
 - Bytes are passed without copying.
+- RPC serving follows backend health (0014-029, 0008-049, RFC-0011 `NoResponder`). `sync_serving` drops the RPC subscription when the backend is not live and `Backend::can_start` is false, so the bus answers `NoResponder` and the gateway returns `AGENT_UNAVAILABLE`. The worker never replies with that code itself. A backend that can start (cold start, respawn in backoff, start in progress) keeps serving.
+- Conservative reading (0014-029 with 0005-053): while withdrawn every RPC is refused, GetTask included. A turn admitted while not live waits in `awaiting` and survives a flip or respawn (0005-053). An unstartable backend closes it as `BACKEND_CRASHED` with detail `BACKEND_NOT_LIVE: ...`. No new wire code.
+- `Backend::can_start` defaults to `true`. A backend that can refuse starts must override it (`driver-acp` and the mock do).
 - Each requirement ID appears in the name of the test that guards it.
 
 ## Requirement IDs guarded
 
 - 0005-028: a context over its waiting quota gets QUEUE_FULL; other contexts are unaffected. Guarded in `tests::req_0005`.
+- 0005-053: a turn admitted while the backend is starting survives a flip or respawn; a health loss fails the turn with `BACKEND_NOT_LIVE` detail. Guarded in `tests::req_0005`.
 - 0005-054: contexts run concurrently and each context stays FIFO. Guarded in `tests::req_0005`.
 - 0006-006: a lease context supplies path and mode. Guarded in `workspace` tests.
 - 0006-034: a settled child returns its unused allowance to the parent. No defect was found; a test pins it. Guarded in `tests::req_0015`.
@@ -56,6 +60,7 @@ Layer L3 worker (RFC-0001 section 4.2). Serves one agent's RPC subjects, runs ta
 - 0009-074: mock injects faults without a turn reference. Guarded in `mock` tests.
 - 0010-079: with signing enabled, an operator decision must verify under an operator-role key and be relayed by `cli` or `tui`. An unsigned decision is refused with SIGNATURE_MISSING and a non-operator key with KEY_ROLE_DENIED; a refusal changes no state. Signing off is unchanged. Guarded in `tests::req_0010`.
 - 0012-067: a session workspace is keyed by its context id. An opaque (non-UUID) context id maps to a derived version-8 UUID, so its workspace is leased; a canonical UUID keeps its short id. Guarded in `workspace` tests.
+- 0014-029: an unstartable backend withdraws RPC serving (`NoResponder`); a startable backend is not refused; a turn waiting on an unstartable backend fails `BACKEND_CRASHED`. Guarded in `tests::req_0014`.
 - 0015-043: five authentication failures in 60 s lock out the endpoint, including the correct credential. Guarded in `delegation` and `tests::req_0015` tests.
 - 0015-054, 0015-058: refused and return-to-chain calls create no child. Guarded in `tests::req_0015`.
 - 0015-062: a crash between the remote accept and the `sent` record does not orphan the child. The `prepared` record carries the wire message, its transport id and its `return_immediately` flag; recovery resends it with the same ids and flag, so the remote returns the child it already holds, and `sent` is written once. A send that fails is closed by `abandoned`. Guarded in `tests::req_0015`.

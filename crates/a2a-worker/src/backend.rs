@@ -508,6 +508,15 @@ pub trait Backend: Send {
     /// Returns liveness and restart state.
     fn health(&self) -> Health;
 
+    /// Returns whether a turn can be accepted now and started later, after a lazy spawn or a
+    /// respawn. `false` means the backend is closed, failed, or has given up until operator action;
+    /// while it is `false` and the backend is not live, the Worker refuses requests by withdrawing
+    /// its RPC subscription (0014-029). Defaults to `true`, so a backend without a stricter rule
+    /// keeps serving as before.
+    fn can_start(&self) -> bool {
+        true
+    }
+
     /// Attaches the event sink. Called once before the first `start`.
     fn attach(&mut self, sink: Box<dyn BackendSink>);
 

@@ -209,6 +209,8 @@ fn req_0006_017_expiry_wins_over_backend_crash_at_same_instant() {
         wait_for_state(bus, &task.id, pb::TaskState::InputRequired).await;
 
         mock.crash("driver permission timeout");
+        // A down mock withdraws the RPC subscription (0014-029); restart it to read the outcome.
+        mock.restart();
         advance(bus, APPROVAL_EXPIRY_MS);
         let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
         assert_eq!(failure_code(&failed).as_deref(), Some("APPROVAL_TIMEOUT"));
@@ -227,6 +229,8 @@ fn req_0006_017_backend_crash_before_expiry_keeps_crash() {
         wait_for_state(bus, &task.id, pb::TaskState::InputRequired).await;
 
         mock.crash("driver exited");
+        // A down mock withdraws the RPC subscription (0014-029); restart it to read the outcome.
+        mock.restart();
         advance(bus, APPROVAL_EXPIRY_MS - 1);
         let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
         assert_eq!(failure_code(&failed).as_deref(), Some("BACKEND_CRASHED"));

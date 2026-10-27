@@ -28,7 +28,7 @@ use bus_api::name::SubjectPattern;
 
 use crate::audit::AuditRecorder;
 use crate::backend::{
-    Backend, BackendError, BackendEvent, ChannelSink, FaultKind, PermissionAnswer,
+    Backend, BackendError, BackendEvent, ChannelSink, FaultKind, Health, PermissionAnswer,
     PermissionOption, PermissionRequest, RequestId, StartTurn, TurnRef,
 };
 use crate::config::{ApprovalMode, WorkerConfig};
@@ -72,7 +72,11 @@ pub(crate) struct Offered {
 pub struct Worker<B: Bus, D: Backend, S: TaskStore> {
     pub(crate) config: WorkerConfig,
     pub(crate) bus: Arc<B>,
-    pub(crate) requests: B::Requests,
+    /// RPC request stream; `None` while withdrawn because the backend is not live and cannot
+    /// start (0014-029). The bus then answers no-responder (0008-049).
+    pub(crate) requests: Option<B::Requests>,
+    /// RPC subject pattern served while the stream is up.
+    pub(crate) pattern: SubjectPattern,
     pub(crate) backend: D,
     pub(crate) events: Receiver<BackendEvent>,
     pub(crate) clock: Arc<dyn Clock>,
@@ -93,6 +97,9 @@ pub struct Worker<B: Bus, D: Backend, S: TaskStore> {
     pub(crate) restarts_seen: u32,
     /// Whether the backend was live at the last health check (a start is not a loss).
     pub(crate) live_seen: bool,
+    /// Accepted turns admitted while the backend was not live. They have not reached an agent
+    /// child, so a flip or a respawn does not fail them; they are cleared once it is live.
+    pub(crate) awaiting: BTreeSet<String>,
     /// `(task, artifact)` pairs already published; the next chunk is an append.
     pub(crate) artifacts: BTreeSet<(String, String)>,
     pub(crate) audit: Vec<AuditNote>,
@@ -162,7 +169,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         let mut worker = Self {
             config,
             bus: Arc::new(bus),
-            requests,
+            requests: Some(requests),
+            pattern,
             backend,
             events,
             clock: Arc::from(clock),
@@ -176,6 +184,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             permissions: BTreeMap::new(),
             restarts_seen: initial.restarts,
             live_seen: initial.live,
+            awaiting: BTreeSet::new(),
             artifacts: BTreeSet::new(),
             audit: Vec::new(),
             audit_sink: None,
@@ -193,7 +202,11 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
 
     /// Awaits one inbound request, answers it, then pumps.
     pub async fn serve_one(&mut self) -> Result<(), WorkerError> {
-        let request = self.requests.next().await?;
+        let Some(requests) = self.requests.as_mut() else {
+            // Withdrawn (0014-029): no request can arrive until the next pump restores it.
+            return std::future::pending().await;
+        };
+        let request = requests.next().await?;
         self.serve_request(request).await?;
         self.pump().await
     }
@@ -231,7 +244,12 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 if let Poll::Ready(value) = call.as_mut().poll(cx) {
                     return Poll::Ready(Turn::Done(value));
                 }
-                match pin!(self.requests.next()).poll(cx) {
+                let polled = match self.requests.as_mut() {
+                    Some(requests) => pin!(requests.next()).poll(cx),
+                    // Withdrawn while the backend cannot start (0014-029): no request arrives.
+                    None => Poll::Pending,
+                };
+                match polled {
                     Poll::Ready(request) => Poll::Ready(Turn::Request(request)),
                     Poll::Pending => Poll::Pending,
                 }
@@ -259,6 +277,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
         let effects = self.check_health(now)?;
         self.run(effects, now)?;
+        self.sync_serving().await;
         self.workspace_maintenance(now);
         let due: Vec<String> = self
             .cancel_deadlines
@@ -299,6 +318,34 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             self.audit(None, note);
         }
         Ok(())
+    }
+
+    /// Keeps the RPC subscription in step with whether the backend can take requests (0014-029).
+    /// While the backend is not live and cannot start, the subscription is withdrawn, so the bus
+    /// answers no-responder and the gateway reports AGENT_UNAVAILABLE (0008-049). It is restored
+    /// once the backend is live or can still start. A bus failure is recorded and retried on the
+    /// next pump, so it never fails the worker.
+    async fn sync_serving(&mut self) {
+        let serving = self.backend.health().live || self.backend.can_start();
+        match (serving, self.requests.is_some()) {
+            (true, false) => match self.bus.serve(&self.config.principal, &self.pattern).await {
+                Ok(requests) => {
+                    self.requests = Some(requests);
+                    self.audit(None, "RPC_SERVING_RESUMED");
+                }
+                Err(err) => self.audit(None, format!("RPC_SERVE_FAILED: {err}")),
+            },
+            (false, true) => {
+                self.requests = None;
+                self.audit(None, "RPC_WITHDRAWN: backend not live and cannot start");
+            }
+            _ => {}
+        }
+    }
+
+    /// The backend's health as the worker last read it; the host publishes it as agent state.
+    pub fn backend_health(&self) -> Health {
+        self.backend.health()
     }
 
     /// Earliest absolute time (ms) at which [`Worker::pump`] must run again, if any.
@@ -533,8 +580,13 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             origin: pending.origin,
             peer_tools,
         };
+        // A turn admitted while the backend is not live waits for it (0005-053).
+        let awaiting = !self.backend.health().live;
         match self.backend.start(cmd) {
             Ok(()) => {
+                if awaiting {
+                    self.awaiting.insert(task.to_owned());
+                }
                 self.open.insert(task.to_owned(), 0);
             }
             Err(err) => {
@@ -673,34 +725,44 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         Ok(out)
     }
 
+    /// Fails the open turns a backend health change has cost. A turn the driver accepted while
+    /// the backend was starting has not reached an agent child, so it waits for the backend and
+    /// survives a flip or a respawn (0005-053, 0009-008).
     fn check_health(&mut self, now: u64) -> Result<Vec<Effect>, WorkerError> {
         let health = self.backend.health();
+        self.awaiting.retain(|task| self.open.contains_key(task));
         let restarted = health.restarts != self.restarts_seen;
         let was_live = std::mem::replace(&mut self.live_seen, health.live);
         self.restarts_seen = health.restarts;
-        // A backend that is still starting has no turn to lose: its turns wait for it. Only a
-        // live backend that stops, or a restart, drops the open turns.
-        if health.live && !restarted {
-            return Ok(Vec::new());
-        }
-        if !health.live && !was_live && !restarted {
-            return Ok(Vec::new());
-        }
-        let text = match (health.live, health.reason.as_deref()) {
-            (false, Some(reason)) => format!("backend not live: {reason}"),
-            (false, None) => "backend not live".to_owned(),
-            (true, _) => "backend restarted; the open turn was lost".to_owned(),
-        };
-        let detail = cause("BACKEND_NOT_LIVE", &text);
-        let open: Vec<String> = self.open.keys().cloned().collect();
         let mut out = Vec::new();
-        for task in open {
-            out.extend(self.close_turn_with_detail(
-                &task,
-                StopReason::Crashed,
-                Some(detail.clone()),
-                now,
-            )?);
+        // A backend that cannot start has lost every turn, awaiting ones included. A backend
+        // still starting keeps the turns it accepted (0005-053, 0009-008).
+        let cannot_start = !health.live && !self.backend.can_start();
+        if restarted || (was_live && !health.live) || cannot_start {
+            let text = match (health.live, health.reason.as_deref()) {
+                (false, Some(reason)) => format!("backend not live: {reason}"),
+                (false, None) => "backend not live".to_owned(),
+                (true, _) => "backend restarted; the open turn was lost".to_owned(),
+            };
+            let detail = cause("BACKEND_NOT_LIVE", &text);
+            let lost: Vec<String> = self
+                .open
+                .keys()
+                .filter(|task| cannot_start || !self.awaiting.contains(*task))
+                .cloned()
+                .collect();
+            for task in lost {
+                out.extend(self.close_turn_with_detail(
+                    &task,
+                    StopReason::Crashed,
+                    Some(detail.clone()),
+                    now,
+                )?);
+            }
+        }
+        if health.live {
+            // Live: every accepted turn is now on its agent child, so a later loss fails it.
+            self.awaiting.clear();
         }
         Ok(out)
     }

@@ -1123,3 +1123,30 @@ fn claude_ask_all_config_starts_the_agent() {
     thread::sleep(Duration::from_millis(300));
     assert_eq!(f.counters.spawns.load(Ordering::SeqCst), 1);
 }
+
+/// Agent that exits on every spawn, before it answers the handshake.
+fn crash_on_start(_rec: &Rec, _frame: &Value) -> Step {
+    Step::Crash
+}
+
+/// 0009-061: five unexpected exits inside the window make the driver unhealthy. It then never
+/// respawns, and a turn is refused until an operator restart.
+#[test]
+fn unhealthy_driver_refuses_start_0009_061() {
+    let mut f = open(harness(crash_on_start), config());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !f
+        .driver
+        .health()
+        .reason
+        .is_some_and(|r| r.contains("driver unhealthy"))
+    {
+        assert!(Instant::now() < deadline, "driver never became unhealthy");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!f.driver.can_start());
+    assert!(matches!(
+        f.driver.start(start("hello", "t1", None)),
+        Err(BackendError::Closed)
+    ));
+}

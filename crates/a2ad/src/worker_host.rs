@@ -53,7 +53,7 @@ use tokio::runtime::Runtime;
 use crate::broker;
 use crate::config::{self, AgentSpec, Backend as SpecBackend, Config, WorkspacePolicy};
 use crate::creds;
-use crate::host::{HostControl, HostError};
+use crate::host::{HostControl, HostError, HostHealth};
 use crate::hosts;
 
 /// Poll interval of the serve loop when no backend wakeup is due sooner.
@@ -102,6 +102,13 @@ impl Backend for AnyBackend {
         match self {
             Self::Acp(backend) => backend.health(),
             Self::Http(backend) => backend.health(),
+        }
+    }
+
+    fn can_start(&self) -> bool {
+        match self {
+            Self::Acp(backend) => backend.can_start(),
+            Self::Http(backend) => backend.can_start(),
         }
     }
 
@@ -174,6 +181,10 @@ impl Backend for SharedBackend {
 
     fn health(&self) -> Health {
         self.with(|backend| backend.health())
+    }
+
+    fn can_start(&self) -> bool {
+        self.with(|backend| backend.can_start())
     }
 
     fn attach(&mut self, sink: Box<dyn BackendSink>) {
@@ -745,6 +756,7 @@ async fn drive<B: Bus, D: Backend, S: task::TaskStore>(
     control: &HostControl,
     pipeline: &Mutex<Pipeline>,
     drain: Duration,
+    reporter: &mut HealthPublisher<'_>,
 ) -> Result<(), HostError> {
     let mut draining_since: Option<Instant> = None;
     let mut last_flush = Instant::now();
@@ -757,6 +769,7 @@ async fn drive<B: Bus, D: Backend, S: task::TaskStore>(
             return Ok(());
         }
         step(worker).await?;
+        reporter.publish(worker);
         // Audit records reach the pipeline through the sink; the buffered notes are not needed.
         let _ = worker.take_audit();
         if last_flush.elapsed() >= FLUSH_EVERY {
@@ -797,9 +810,11 @@ async fn await_backend_live<B: Bus, D: Backend, S: task::TaskStore>(
     backend: &SharedBackend,
     control: &HostControl,
     timeout: Duration,
+    reporter: &mut HealthPublisher<'_>,
 ) -> Result<bool, HostError> {
     let started = Instant::now();
     loop {
+        reporter.publish(worker);
         let health = backend.health();
         match live_wait(
             health.live,
@@ -824,6 +839,32 @@ async fn await_backend_live<B: Bus, D: Backend, S: task::TaskStore>(
             .await
             .map_err(|err| HostError::Bus(err.to_string()))?;
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Publishes the driver health to the supervisor, writing only when it changes (RFC-0004
+/// 0004-015). The supervisor keeps the agent out of `ready` while the backend is not live.
+struct HealthPublisher<'a> {
+    control: &'a HostControl,
+    last: Option<HostHealth>,
+}
+
+impl HealthPublisher<'_> {
+    /// Writes the driver health unless it equals the last value written. A failed write is logged
+    /// and retried on the next pass; the supervisor keeps its last value meanwhile.
+    fn publish<B: Bus, D: Backend, S: task::TaskStore>(&mut self, worker: &Worker<B, D, S>) {
+        let health = worker.backend_health();
+        let report = HostHealth {
+            live: health.live,
+            reason: health.reason,
+        };
+        if self.last.as_ref() == Some(&report) {
+            return;
+        }
+        match self.control.report_health(&report) {
+            Ok(()) => self.last = Some(report),
+            Err(err) => tracing::warn!(error = %err, "could not publish driver health"),
+        }
     }
 }
 
@@ -900,17 +941,28 @@ pub fn run_worker(
             .attach_delegation(delegation)
             .map_err(|err| HostError::Bus(err.to_string()))?;
     }
+    let mut reporter = HealthPublisher {
+        control,
+        last: None,
+    };
     let served = match runtime.block_on(await_backend_live(
         &mut worker,
         &backend,
         control,
         spec.readiness.timeout,
+        &mut reporter,
     )) {
         Ok(true) => control
             .report_ready()
             .map_err(HostError::from)
             .and_then(|()| {
-                runtime.block_on(drive(&mut worker, control, &pipeline, config.drain()))
+                runtime.block_on(drive(
+                    &mut worker,
+                    control,
+                    &pipeline,
+                    config.drain(),
+                    &mut reporter,
+                ))
             }),
         Ok(false) => Ok(()),
         Err(err) => Err(err),

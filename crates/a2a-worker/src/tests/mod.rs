@@ -487,6 +487,20 @@ pub(crate) async fn call_ttl(
     extensions: Vec<String>,
     ttl_ms: u64,
 ) -> Reply {
+    try_call_ttl(bus, sender, op, body, extensions, ttl_ms)
+        .await
+        .unwrap()
+}
+
+/// As [`call_ttl`], but a bus error is returned instead of panicking.
+pub(crate) async fn try_call_ttl(
+    bus: &MemBus,
+    sender: &str,
+    op: Op,
+    body: RequestBody,
+    extensions: Vec<String>,
+    ttl_ms: u64,
+) -> Result<Reply, BusError> {
     let parts = RequestParts {
         tenant: tenant(),
         agent: agent(WORKER),
@@ -512,7 +526,6 @@ pub(crate) async fn call_ttl(
         Duration::from_secs(60),
     )
     .await
-    .unwrap()
 }
 
 fn text_part(text: &str) -> pb::Part {
@@ -558,7 +571,25 @@ pub(crate) async fn send_text(
     task_id: &str,
     text: &str,
 ) -> Result<pb::SendMessageResponse, ReplyDecodeError> {
-    let body = RequestBody::SendMessage(pb::SendMessageRequest {
+    let body = send_body(context_id, task_id, text);
+    let reply = call(bus, REQUESTER, Op::Send, body, Vec::new()).await;
+    envelope::decode_reply::<pb::SendMessageResponse>(&reply)
+}
+
+/// As [`send_text`], but a bus error is returned instead of panicking. A request with no
+/// responder fails with `NoResponder` (RFC-0011), which is how a refused agent looks to a client.
+pub(crate) async fn try_send_text(
+    bus: &MemBus,
+    context_id: &str,
+    task_id: &str,
+    text: &str,
+) -> Result<Reply, BusError> {
+    let body = send_body(context_id, task_id, text);
+    try_call_ttl(bus, REQUESTER, Op::Send, body, Vec::new(), TTL_MS).await
+}
+
+fn send_body(context_id: &str, task_id: &str, text: &str) -> RequestBody {
+    RequestBody::SendMessage(pb::SendMessageRequest {
         tenant: TENANT.to_owned(),
         message: Some(message(context_id, task_id, vec![text_part(text)])),
         configuration: Some(pb::SendMessageConfiguration {
@@ -566,9 +597,7 @@ pub(crate) async fn send_text(
             ..Default::default()
         }),
         ..Default::default()
-    });
-    let reply = call(bus, REQUESTER, Op::Send, body, Vec::new()).await;
-    envelope::decode_reply::<pb::SendMessageResponse>(&reply)
+    })
 }
 
 pub(crate) async fn get(bus: &MemBus, id: &str) -> pb::Task {

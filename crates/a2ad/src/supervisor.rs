@@ -192,6 +192,8 @@ struct Slot {
     socket: Option<PathBuf>,
     record: Option<RunRecord>,
     exit_reason: Option<&'static str>,
+    /// Driver liveness the worker host last published; workers only (0004-015).
+    live: bool,
 }
 
 impl Slot {
@@ -208,6 +210,7 @@ impl Slot {
             socket: None,
             record: None,
             exit_reason: None,
+            live: false,
         }
     }
 }
@@ -367,6 +370,7 @@ impl Supervisor {
                 Phase::Backoff { until } if now >= until => self.try_start(i, now),
                 Phase::Starting => self.check_ready(i, now),
                 Phase::Ready => {
+                    self.observe_live(i);
                     if let Some(since) = self.slots[i].ready_since
                         && now.saturating_duration_since(since) >= STABLE_AFTER
                     {
@@ -388,13 +392,50 @@ impl Supervisor {
         let agents: BTreeMap<String, String> = self
             .slots
             .iter()
-            .map(|slot| (slot.id.clone(), phase_name(slot.phase).to_owned()))
+            .enumerate()
+            .map(|(i, slot)| (slot.id.clone(), self.agent_label(i).to_owned()))
             .collect();
         self.health.update(|health| {
             health.sink_writing = sink_writing;
             health.spool_ratio = spool_ratio;
             health.agents = agents;
         });
+    }
+
+    /// The supervisor state label of agent `i` (0013-037). A worker whose driver is not live is
+    /// `starting` even though its host is up (0004-015); readiness does not gate on it (0013-036).
+    fn agent_label(&self, i: usize) -> &'static str {
+        let slot = &self.slots[i];
+        match slot.phase {
+            Phase::Ready if !slot.live && self.config.agents()[i].is_worker() => "starting",
+            phase => phase_name(phase),
+        }
+    }
+
+    /// Adopts the driver liveness the worker host published (0004-015). A worker host that has
+    /// published nothing is not live; an unreadable file keeps the last value. Other kinds publish
+    /// no driver health.
+    fn observe_live(&mut self, i: usize) {
+        let spec = &self.config.agents()[i];
+        if !spec.is_worker() {
+            return;
+        }
+        let state = self.config.state_dir().to_path_buf();
+        let id = spec.id.clone();
+        let (live, reason) = match host::read_health(&state, &id) {
+            Ok(Some(health)) => (health.live, health.reason),
+            Ok(None) => (false, Some("driver health not published".to_owned())),
+            Err(_) => return,
+        };
+        if live != self.slots[i].live {
+            self.slots[i].live = live;
+            let _ = log_event(
+                &state,
+                "AGENT_HEALTH",
+                Some(&id),
+                json!({ "live": live, "reason": reason }),
+            );
+        }
     }
 
     fn reap(&mut self, i: usize, now: Instant) {
@@ -503,6 +544,7 @@ impl Supervisor {
         if ready {
             self.slots[i].phase = Phase::Ready;
             self.slots[i].ready_since = Some(now);
+            self.observe_live(i);
             self.persist(i);
             let _ = log_event(&state, "AGENT_READY", Some(&id), json!({}));
             return;
@@ -527,6 +569,8 @@ impl Supervisor {
         let spec = self.config.agents()[i].clone();
         let state = self.config.state_dir().to_path_buf();
         let _ = fs::remove_file(host::ready_path(&state, &spec.id));
+        let _ = fs::remove_file(host::health_path(&state, &spec.id));
+        self.slots[i].live = false;
 
         let parent = parent_env();
         let base = child_env(&parent, &spec, &[]);
@@ -1547,5 +1591,40 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body["agents"]["omp"], "ready");
         assert_eq!(body["agents"]["worker"], "pending");
+    }
+
+    /// 0004-015 with 0013-037: a ready worker whose driver is not live is reported `starting`, and
+    /// the report follows the driver health its host publishes. Readiness does not gate on it
+    /// (0013-036).
+    #[test]
+    fn req_0004_015_agent_state_follows_driver_health() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let repo = state.path().display().to_string().replace('\\', "\\\\");
+        let agents = format!(
+            "[[agent]]\nid = \"omp\"\nkind = \"worker\"\nbackend = \"acp-omp\"\ncommand = [\"omp\", \"--mode\", \"acp\"]\nrepo = \"{repo}\"\n"
+        );
+        let mut sup = ready_supervisor(state.path(), &agents);
+        sup.slots
+            .iter_mut()
+            .find(|slot| slot.id == "omp")
+            .expect("omp slot")
+            .phase = Phase::Ready;
+        let health = state.path().join("run").join("omp.health");
+        fs::create_dir_all(health.parent().expect("run dir")).expect("create run dir");
+
+        fs::write(
+            &health,
+            br#"{"live":false,"reason":"agent exited too often; driver unhealthy"}"#,
+        )
+        .expect("write health");
+        sup.tick(Instant::now());
+        let (status, body) = readiness(&sup);
+        assert_eq!(status, 200);
+        assert_eq!(body["agents"]["omp"], "starting");
+
+        fs::write(&health, br#"{"live":true,"reason":null}"#).expect("write health");
+        sup.tick(Instant::now());
+        let (_, body) = readiness(&sup);
+        assert_eq!(body["agents"]["omp"], "ready");
     }
 }

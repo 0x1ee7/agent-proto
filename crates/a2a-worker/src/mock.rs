@@ -63,6 +63,8 @@ struct OpenTurn {
     next_no: u64,
     steps: VecDeque<Step>,
     held: bool,
+    /// Accepted while the backend was starting; the respawn keeps it (see `restart`).
+    awaiting: bool,
 }
 
 struct State {
@@ -283,6 +285,11 @@ impl Backend for MockBackend {
         }
     }
 
+    /// Refuses exactly when `start` does: a closed mock (`crash`, `go_down`) cannot start.
+    fn can_start(&self) -> bool {
+        lock(&self.state).alive
+    }
+
     fn attach(&mut self, sink: Box<dyn BackendSink>) {
         lock(&self.state).sink = Some(sink);
     }
@@ -301,11 +308,13 @@ impl Backend for MockBackend {
         state.log.push(Command::Start(Box::new(cmd.clone())));
         let steps: VecDeque<Step> = state.scripts.pop_front().unwrap_or_default().into();
         let session = cmd.turn.clone();
+        let awaiting = state.starting;
         state.open.push(OpenTurn {
             turn: cmd.turn,
             next_no: 1,
             steps,
             held: false,
+            awaiting,
         });
         state.run(&session);
         Ok(())
@@ -411,9 +420,16 @@ impl MockControl {
     /// The open turn of the prior incarnation is dropped without a terminal event (0009-008).
     pub fn restart(&self) {
         let mut state = lock(&self.state);
-        state.open.clear();
-        state.pending.clear();
+        // A turn accepted while starting has not reached an agent child, so the respawn keeps it
+        // (0005-053). Every other open turn is dropped without a terminal event (0009-008).
+        state.open.retain(|open| open.awaiting);
+        for open in &mut state.open {
+            open.awaiting = false;
+        }
+        let kept: Vec<TurnRef> = state.open.iter().map(|open| open.turn.clone()).collect();
+        state.pending.retain(|(turn, _)| kept.contains(turn));
         state.alive = true;
+        state.starting = false;
         state.down_reason = None;
         state.restarts += 1;
     }

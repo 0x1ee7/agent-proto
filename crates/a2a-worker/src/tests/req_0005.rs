@@ -262,6 +262,14 @@ fn req_0005_053_health_not_live_fails_turn_with_detail() {
         wait_for_state(bus, &task.id, pb::TaskState::Working).await;
         mock.go_down("connection to agent lost");
         advance(bus, 1);
+        // Let the worker observe the loss before the driver is back.
+        yield_now().await;
+        // The worker refuses RPC while the backend cannot start (0014-029), so the outcome is
+        // read once the driver is back.
+        mock.restart();
+        advance(bus, 1);
+        // Let the worker re-serve the restored backend before the outcome is read.
+        yield_now().await;
         let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
         assert_eq!(failure_code(&failed).as_deref(), Some("BACKEND_CRASHED"));
         let detail = failure_detail(&failed).expect("health failure carries a detail");
@@ -282,6 +290,8 @@ fn req_0005_049_backend_exit_fails_turn_with_detail() {
         let task = submit(bus, "exit").await;
         wait_for_state(bus, &task.id, pb::TaskState::Working).await;
         mock.crash("agent exited with status 1");
+        // A down mock withdraws the RPC subscription (0014-029); restart it to read the outcome.
+        mock.restart();
         let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
         let detail = failure_detail(&failed).expect("backend exit carries a detail");
         assert!(detail.contains("agent exited with status 1"), "{detail}");
@@ -326,6 +336,58 @@ fn req_0005_053_starting_backend_keeps_open_turn() {
         advance(bus, 1);
         mock.release();
         let done = wait_for_state(bus, &task.id, pb::TaskState::Completed).await;
+        assert_eq!(state(&done), pb::TaskState::Completed as i32);
+    });
+}
+
+/// 0005-053, 0009-008: a turn the driver accepted while its backend was starting has not reached
+/// an agent child yet. A respawn does not lose it; it completes once the backend is live.
+#[test]
+fn req_0005_053_turn_admitted_while_starting_survives_respawn() {
+    let mut rig = rig_starting();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![
+            Step::Hold,
+            Step::Terminal(crate::backend::Outcome::Completed),
+        ]);
+        let task = submit(bus, "starting").await;
+        wait_for_state(bus, &task.id, pb::TaskState::Working).await;
+
+        mock.restart();
+        advance(bus, 1);
+        assert_eq!(state(&get(bus, &task.id).await), WORKING);
+
+        mock.release();
+        let done = wait_for_state(bus, &task.id, pb::TaskState::Completed).await;
+        assert_eq!(state(&done), pb::TaskState::Completed as i32);
+    });
+}
+
+/// 0005-053: a backend that stops being live fails the turn in flight. A turn admitted in the
+/// same window (the driver accepted it while the backend was starting) is not part of that loss,
+/// even though the worker observes the flip only after admitting it.
+#[test]
+fn req_0005_053_turn_admitted_during_flip_is_not_closed_by_it() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    mock.set_max_open(2);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold]);
+        let first = submit(bus, "in flight").await;
+        wait_for_state(bus, &first.id, pb::TaskState::Working).await;
+
+        mock.set_starting(true);
+        mock.enqueue(vec![Step::Hold, completed()]);
+        let second = submit(bus, "admitted during flip").await;
+
+        let lost = wait_for_state(bus, &first.id, pb::TaskState::Failed).await;
+        assert_eq!(failure_code(&lost).as_deref(), Some("BACKEND_CRASHED"));
+        assert_eq!(state(&get(bus, &second.id).await), WORKING);
+
+        mock.set_starting(false);
+        mock.release();
+        let done = wait_for_state(bus, &second.id, pb::TaskState::Completed).await;
         assert_eq!(state(&done), pb::TaskState::Completed as i32);
     });
 }

@@ -42,6 +42,8 @@ pub(crate) enum Command {
     Resolve(RequestId, PermissionAnswer),
     Cancel(TurnRef, Sender<Result<(), BackendError>>),
     Health(Sender<Health>),
+    /// Whether a turn can start now or after a respawn (see `startable`).
+    CanStart(Sender<bool>),
     Shutdown(Duration, Sender<()>),
     /// Ends the agent process tree; the actor keeps running (0009-036).
     Kill(Duration, Sender<()>),
@@ -303,6 +305,9 @@ impl Core {
             Command::Health(reply) => {
                 let _ = reply.send(self.health());
             }
+            Command::CanStart(reply) => {
+                let _ = reply.send(self.startable());
+            }
             Command::Shutdown(grace, reply) => {
                 self.shutdown(grace);
                 let _ = reply.send(());
@@ -402,8 +407,15 @@ impl Core {
             .unwrap_or(fallback)
     }
 
+    /// Whether a turn can start now or after a respawn. A closed, failed, or unhealthy driver
+    /// never starts again; unhealthy is five exits in the window and waits for operator action
+    /// (0009-061). Everything else can start, including a lazy spawn and a restart in backoff.
+    fn startable(&self) -> bool {
+        !(self.closed || self.failed || self.unhealthy)
+    }
+
     fn start(&mut self, cmd: StartTurn) -> Result<(), BackendError> {
-        if self.closed || self.failed || self.unhealthy {
+        if !self.startable() {
             return Err(BackendError::Closed);
         }
         if self.turn.is_some() {
