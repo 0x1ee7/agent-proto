@@ -13,6 +13,7 @@ use a2a_cli::app;
 use a2a_cli::cli::{ApprovalsAction, Cli, Command};
 use a2a_cli::config::{self, Overrides, Settings};
 use a2a_cli::error::{CliError, Exit};
+use a2a_cli::keys::{load_operator_signer, operator_creds_dir};
 use a2a_cli::output::{self, Io};
 use a2a_client::SigningHook;
 use a2a_core::envelope::SystemClock;
@@ -78,11 +79,7 @@ fn load_trust(path: &Path) -> Result<TrustStore, CliError> {
 
 /// Reads the NKey seed from its file. The seed is never accepted inline.
 fn read_seed(settings: &Settings) -> Result<Seed, CliError> {
-    let path = settings.seed_file.as_ref().ok_or_else(|| {
-        CliError::Unavailable(
-            "no NKey seed file: set [bus] seed_file or A2A_NKEY_SEED_FILE".to_owned(),
-        )
-    })?;
+    let path = &settings.seed_file;
     let text = std::fs::read_to_string(path).map_err(|error| {
         CliError::Unavailable(format!(
             "cannot read NKey seed file {}: {error}",
@@ -97,12 +94,8 @@ async fn run(cli: &Cli) -> Result<Exit, CliError> {
     let windows = cfg!(windows);
     let overrides = Overrides::from_cli(cli);
     let (_path, file) = config::load_file(&overrides, &env, windows)?;
-    let security_default = a2a_security::storage::default_config_dir().map_err(|error| {
-        CliError::Failed(format!(
-            "cannot locate the security config directory: {error}"
-        ))
-    })?;
-    let settings = config::resolve(&overrides, &env, &file, &security_default)?;
+    let state_default = config::default_state_dir(&env, windows)?;
+    let settings = config::resolve(&overrides, &env, &file, &state_default)?;
 
     let stdout = io::stdout();
     let stderr = io::stderr();
@@ -137,15 +130,7 @@ async fn run(cli: &Cli) -> Result<Exit, CliError> {
 
     let trust = Arc::new(load_trust(&settings.trust_file)?);
     let operator: Option<Arc<dyn SigningHook>> = if needs_signing(&cli.command) {
-        let signer = a2a_security::storage::load_signer(
-            &settings.security_dir,
-            &trust,
-            &settings.operator,
-            &[],
-        )
-        .map_err(|error| {
-            CliError::Failed(format!("cannot load the operator signing key: {error}"))
-        })?;
+        let signer = load_operator_signer(&operator_creds_dir(&settings), &trust)?;
         Some(a2a_client::signing::envelope_hook(
             Arc::new(signer),
             Arc::new(SystemClock),

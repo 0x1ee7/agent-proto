@@ -20,6 +20,14 @@ pub struct Cli {
     /// Operator agent id that sends requests and signs decisions. Overrides `A2A_OPERATOR`.
     #[arg(long, global = true, value_name = "ID")]
     pub operator: Option<String>,
+    /// State directory holding `creds/` and the default trust file. Overrides `A2AB_STATE_DIR`.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub state_dir: Option<PathBuf>,
+    /// Trust file. Defaults to `[security] trust_file` from the CLI config, else
+    /// `<state-dir>/trust.toml`. The a2ad config is not read: an operator whose a2ad config
+    /// sets `[security] trust_file` must pass `--trust` with the same path.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub trust: Option<PathBuf>,
     /// Bound on each request, in seconds.
     #[arg(long, global = true, value_name = "SECS")]
     pub timeout: Option<u64>,

@@ -4,6 +4,7 @@
 mod common;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use a2a_cli::app;
@@ -11,17 +12,30 @@ use a2a_cli::approvals;
 use a2a_cli::cli::{Command, DecideArgs, DiscoverArgs, Scope, SendArgs};
 use a2a_cli::commands::{self, print_message, print_task};
 use a2a_cli::error::{CliError, Exit, classify};
+use a2a_cli::keys::load_operator_signer;
+use a2a_client::signing::envelope_hook;
 use a2a_client::{ApprovalError, ClientError};
 use a2a_core::approval::{ALLOW_ONCE_ID, REJECT_ONCE_ID};
 use a2a_core::envelope::RequestBody;
 use a2a_core::errors::WireError;
+use a2a_core::headers as hdr;
 use a2a_core::headers::{KID, SIG};
 use a2a_core::subject::Op;
+use a2a_security::clock::ManualClock;
+use a2a_security::envelope::{Envelope, MessageClass, VerifyContext, verify_request};
+use a2a_security::identity::{Signer, encode_public_key};
+use a2a_security::mode::Policy;
+use a2a_security::replay::ReplayCache;
+use a2a_security::storage::{generate_signer, key_path, operator_key_path};
+use a2a_security::trust::TrustStore;
+use a2a_types::ids::{AgentId, TenantId};
 use a2a_types::proto::a2a as pb;
 use a2a_types::vocab::ext::APPROVAL;
 use bus_api::bus::RequestStream;
 use bus_api::error::BusError;
-use common::{Fixture, NOW_MS, Streams};
+use bus_api::headers::Headers;
+use bus_api::message::Request;
+use common::{Fixture, NOW_MS, Streams, TENANT};
 use pbjson_types::{Struct, Value as PbValue};
 use serde_json::json;
 
@@ -352,6 +366,36 @@ async fn req_0012_057_non_tty_decision_needs_yes_and_sends_nothing() {
     assert!(nothing.is_err(), "no decision reached the worker");
 }
 
+// [0012-057] `approvals list` shows the approval a worker attaches to an INPUT_REQUIRED snapshot
+// (RFC-0006 0006-007), read from the status message of ListTasks.
+#[tokio::test]
+async fn req_0012_057_list_shows_input_required_approval() {
+    let fx = Fixture::new();
+    let session = fx.session(vec![fx.worker_id.clone()], true);
+    let mut lists = fx.serve(Op::List).await;
+    let mut streams = Streams::new("");
+    let worker = async {
+        let inbound = tokio::time::timeout(WORKER_WAIT, fx.next_inbound(&mut lists))
+            .await
+            .expect("list reached the worker");
+        fx.reply(
+            inbound,
+            &list_answer(vec![approval_task("t-9", EXPIRES_AT)]),
+        );
+    };
+    let (result, ()) = {
+        let mut io = streams.io(false, false);
+        tokio::join!(
+            approvals::list(&session, false, None, &mut io, NOW_MS),
+            worker
+        )
+    };
+    assert_eq!(result.expect("list succeeds"), Exit::Success);
+    let text = streams.out_text();
+    assert!(text.contains("agent worker-a"), "{text}");
+    assert!(text.contains("remove build directory"), "{text}");
+}
+
 // [0012-057] With `--yes` the decision is sent as a SendMessage naming the offered option, and
 // the resulting task is reported. Its envelope carries the operator's signature headers (0012-058).
 #[tokio::test]
@@ -398,6 +442,131 @@ async fn req_0012_057_yes_sends_the_decision_once() {
     assert_eq!(decision["taskId"], "t-9");
     assert!(streams.out_text().contains("decided req-1"));
     assert!(streams.out_text().contains("TASK_STATE_WORKING"));
+}
+
+/// Rebuilds the security envelope of a received request from its raw headers ([0007-034]).
+fn security_envelope(request: &Request) -> Envelope {
+    let headers: &Headers = &request.headers;
+    let value = |name: &str| headers.get(name).unwrap_or_default().to_owned();
+    let block = |name: &str| headers.get(name).map(str::to_owned);
+    Envelope {
+        subject: request.subject.as_str().to_owned(),
+        msg_id: value(hdr::MSG_ID),
+        sender: value(hdr::SENDER),
+        version: value(hdr::A2A_VERSION),
+        extensions: value(hdr::A2A_EXTENSIONS),
+        origin: value(hdr::ORIGIN),
+        ttl_ms: value(hdr::TTL_MS),
+        causation_id: value(hdr::CAUSATION_ID),
+        payload_type: value(hdr::PAYLOAD_TYPE),
+        after_seq: value(hdr::AFTER_SEQ),
+        content_type: value(hdr::CONTENT_TYPE),
+        semantic: headers
+            .iter()
+            .filter_map(|(name, text)| {
+                name.strip_prefix(hdr::SP_PREFIX)
+                    .map(|key| (key.to_owned(), text.to_owned()))
+            })
+            .collect(),
+        kid: block(hdr::KID),
+        ts: block(hdr::TS),
+        nonce: block(hdr::NONCE),
+        signature: block(hdr::SIG),
+    }
+}
+
+// [0012-043] [0007-038] The operator key is loaded from creds/ and signs the decision. The
+// envelope verifies as an operator decision relayed by `cli`, and never as one relayed by a peer.
+#[tokio::test]
+async fn req_0012_043_approval_is_signed_with_operator_key_from_creds() {
+    let fx = Fixture::new();
+    let root = std::env::temp_dir().join(format!("a2a-cli-req043-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let config = root.join("config");
+    let creds = root.join("creds");
+    std::fs::create_dir_all(&creds).expect("creds dir");
+    let operator = AgentId::parse("operator").expect("operator id");
+    let generated = generate_signer(&config, &operator, &[]).expect("operator key generated");
+    let kid_text = generated.kid().to_string();
+    let trust_text = format!(
+        "schema = \"a2abus.trust/1\"\n[[key]]\nkid = \"{kid_text}\"\nagent = \"operator\"\nrole = \"operator\"\ntenants = [\"{TENANT}\"]\npublic_key = \"{}\"\n",
+        encode_public_key(&generated.public_key()),
+    );
+    let trust = TrustStore::parse(&trust_text).expect("trust loads");
+    std::fs::rename(
+        key_path(&config, generated.kid()),
+        operator_key_path(&creds, generated.kid()).expect("operator kid"),
+    )
+    .expect("key moved into creds");
+    let loaded = load_operator_signer(&creds, &trust).expect("operator key loads from creds");
+    let session = fx.session_with_operator(
+        vec![fx.worker_id.clone()],
+        Some(envelope_hook(Arc::new(loaded), fx.clock.clone())),
+    );
+
+    let mut lists = fx.serve(Op::List).await;
+    let mut sends = fx.serve(Op::Send).await;
+    let mut streams = Streams::new("");
+    let args = decide_args(Some("worker-a"), true, None);
+    let worker = async {
+        let inbound = tokio::time::timeout(WORKER_WAIT, fx.next_inbound(&mut lists))
+            .await
+            .expect("list reached the worker");
+        fx.reply(
+            inbound,
+            &list_answer(vec![approval_task("t-9", EXPIRES_AT)]),
+        );
+        let request = tokio::time::timeout(WORKER_WAIT, fx.next_request(&mut sends))
+            .await
+            .expect("decision reached the worker");
+        assert_eq!(request.headers.get(KID), Some(kid_text.as_str()));
+        let envelope = security_envelope(&request);
+        let payload = request.payload.clone();
+        let clock = ManualClock::new(NOW_MS as i64);
+        let tenant = TenantId::parse(TENANT).expect("tenant");
+        let relayed_by = |publisher: &str| {
+            let publisher = AgentId::parse(publisher).expect("publisher id");
+            let ctx = VerifyContext {
+                trust: &trust,
+                clock: &clock,
+                policy: Policy::default(),
+                tenant: &tenant,
+            };
+            verify_request(
+                &ctx,
+                MessageClass::OperatorDecision {
+                    publisher: &publisher,
+                },
+                &ReplayCache::new(64),
+                &envelope,
+                &payload,
+            )
+        };
+        assert!(
+            relayed_by("cli")
+                .expect("operator decision verifies as relayed by cli")
+                .is_some(),
+            "signed decision is verified"
+        );
+        assert!(
+            relayed_by("worker-a").is_err(),
+            "a peer may not relay an operator decision"
+        );
+        let inbound = fx.decode(request);
+        let decision = decision_of(&inbound.body);
+        fx.reply(inbound, &send_answer(task("t-9", pb::TaskState::Working)));
+        decision
+    };
+    let (result, decision) = {
+        let mut io = streams.io(false, false);
+        tokio::join!(
+            approvals::decide(&session, &args, true, &mut io, NOW_MS),
+            worker
+        )
+    };
+    assert_eq!(result.expect("decided"), Exit::Success);
+    assert_eq!(decision["optionId"], ALLOW_ONCE_ID);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // [0012-058] Decisions are never sent without an operator signing hook.

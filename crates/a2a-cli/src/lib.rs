@@ -14,6 +14,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod keys;
 pub mod output;
 
 pub use error::{CliError, Exit};

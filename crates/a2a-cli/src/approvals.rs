@@ -128,11 +128,7 @@ pub async fn open_approvals<B: Bus>(
     for agent in candidate_agents(session, explicit)? {
         let mut page_token = String::new();
         loop {
-            let request = pb::ListTasksRequest {
-                status: pb::TaskState::InputRequired as i32,
-                page_token: page_token.clone(),
-                ..Default::default()
-            };
+            let request = list_request(&page_token);
             let reply = session.client.list_tasks(&agent, request, &opts).await?;
             for task in &reply.value.tasks {
                 if let Some(pending) = PendingApproval::from_task(task)? {
@@ -149,6 +145,16 @@ pub async fn open_approvals<B: Bus>(
         }
     }
     Ok(found)
+}
+
+/// The ListTasks request for one page. The worker rejects a status or context filter with
+/// `LIST_FILTER_UNSUPPORTED`, so the request is unfiltered; [`PendingApproval::from_task`] keeps
+/// only `INPUT_REQUIRED` tasks that carry an approval request.
+fn list_request(page_token: &str) -> pb::ListTasksRequest {
+    pb::ListTasksRequest {
+        page_token: page_token.to_owned(),
+        ..Default::default()
+    }
 }
 
 /// Prints one approval card to the diagnostic stream, before any decision.
@@ -284,5 +290,20 @@ pub async fn run<B: Bus>(
         }
         ApprovalsAction::Approve(args) => decide(session, args, true, io, now_ms).await,
         ApprovalsAction::Deny(args) => decide(session, args, false, io, now_ms).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Req [0005-004], worker `list_tasks`: a status or context filter is rejected, so the
+    /// approval listing must send an unfiltered request and keep the page token.
+    #[test]
+    fn req_0005_004_approval_listing_sends_unfiltered_pages() {
+        let request = list_request("page-2");
+        assert_eq!(request.status, 0);
+        assert!(request.context_id.is_empty());
+        assert_eq!(request.page_token, "page-2");
     }
 }

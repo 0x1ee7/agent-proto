@@ -17,6 +17,12 @@ pub const DEFAULT_BUS_URL: &str = "nats://127.0.0.1:4222";
 pub const DEFAULT_OPERATOR: &str = "tui";
 /// Default tenant (`[supervisor] tenant`).
 pub const DEFAULT_TENANT: &str = "local";
+/// Creds directory under the state directory (RFC-0012 4.2).
+pub const CREDS_DIR: &str = "creds";
+/// CLI NKey seed file name under [`CREDS_DIR`].
+pub const CLI_SEED_FILE: &str = "cli.nk";
+/// Trust file name under the state directory.
+pub const TRUST_FILE: &str = "trust.toml";
 
 /// Config file layout used by the CLI (subset of RFC-0012 section 4.1; unknown keys are ignored).
 #[derive(Debug, Default, Deserialize)]
@@ -26,10 +32,10 @@ pub struct FileConfig {
     pub supervisor: SupervisorSection,
     /// `[bus]` table.
     pub bus: BusSection,
+    /// `[paths]` table.
+    pub paths: PathsSection,
     /// `[security]` table.
     pub security: SecuritySection,
-    /// `[audit]` table.
-    pub audit: AuditSection,
     /// `[[agent]]` entries.
     #[serde(rename = "agent")]
     pub agents: Vec<AgentSection>,
@@ -51,24 +57,23 @@ pub struct SupervisorSection {
 pub struct BusSection {
     /// NATS URL.
     pub url: Option<String>,
-    /// File holding the operator NKey seed. The seed never appears in the config.
-    pub seed_file: Option<PathBuf>,
 }
 
 /// `[security]` table.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct SecuritySection {
-    /// Directory with keys and `trust.toml`.
-    pub config_dir: Option<PathBuf>,
+    /// Trust file for the operator and checkpoint verification; same key as a2ad's
+    /// `[security] trust_file`.
+    pub trust_file: Option<PathBuf>,
 }
 
-/// `[audit]` table.
+/// `[paths]` table.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct AuditSection {
-    /// Trust file for checkpoint verification.
-    pub trust_file: Option<PathBuf>,
+pub struct PathsSection {
+    /// State directory (RFC-0012 4.2), overriding the platform default.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// `[[agent]]` entry.
@@ -91,6 +96,10 @@ pub struct Overrides {
     pub operator: Option<String>,
     /// `--timeout`, seconds.
     pub timeout_secs: Option<u64>,
+    /// `--state-dir`.
+    pub state_dir: Option<PathBuf>,
+    /// `--trust`.
+    pub trust: Option<PathBuf>,
 }
 
 impl Overrides {
@@ -103,6 +112,8 @@ impl Overrides {
             tenant: cli.tenant.clone(),
             operator: cli.operator.clone(),
             timeout_secs: cli.timeout,
+            state_dir: cli.state_dir.clone(),
+            trust: cli.trust.clone(),
         }
     }
 }
@@ -112,15 +123,17 @@ impl Overrides {
 pub struct Settings {
     /// NATS URL.
     pub bus_url: String,
-    /// Operator NKey seed file. Required by the binary to connect.
-    pub seed_file: Option<PathBuf>,
+    /// Operator NKey seed file (`A2A_NKEY_SEED_FILE`), defaulting to
+    /// `<state_dir>/creds/cli.nk`.
+    pub seed_file: PathBuf,
+    /// State directory: holds `creds/` with the NKey seeds and `operator-<K>.key`, and the
+    /// default trust file.
+    pub state_dir: PathBuf,
     /// Tenant.
     pub tenant: TenantId,
     /// Operator agent id.
     pub operator: AgentId,
-    /// Security config directory (keys and `trust.toml`).
-    pub security_dir: PathBuf,
-    /// Trust file, from `[audit] trust_file` or `<security_dir>/trust.toml`.
+    /// Trust file: `--trust`, else `[security] trust_file`, else `<state_dir>/trust.toml`.
     pub trust_file: PathBuf,
     /// Configured agents, searched by `watch`, `cancel` and `approvals`.
     pub agents: Vec<AgentId>,
@@ -140,6 +153,39 @@ pub fn default_config_path(env: EnvFn<'_>, windows: bool) -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".config")))?;
     Some(base.join("a2abus").join("config.toml"))
+}
+
+/// Default state directory, as the supervisor resolves it (RFC-0012 4.2): `%LOCALAPPDATA%\a2abus`
+/// on Windows; otherwise `$XDG_STATE_HOME/a2abus` (absolute values only) or `~/.local/state/a2abus`.
+///
+/// # Errors
+/// Returns [`CliError::Failed`] when the variables needed to locate it are unset.
+pub fn default_state_dir(env: EnvFn<'_>, windows: bool) -> Result<PathBuf, CliError> {
+    if windows {
+        return env("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("a2abus"))
+            .ok_or_else(|| {
+                CliError::Failed(
+                    "LOCALAPPDATA is not set; cannot locate the state directory".to_owned(),
+                )
+            });
+    }
+    if let Some(base) = env("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(base.join("a2abus"));
+    }
+    env("HOME")
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("a2abus")
+        })
+        .ok_or_else(|| {
+            CliError::Failed("HOME is not set; cannot locate the state directory".to_owned())
+        })
 }
 
 /// Locates and parses the config file. An explicit path (flag or `A2A_CONFIG`) must exist; the
@@ -188,8 +234,8 @@ pub fn parse_file(text: &str) -> Result<FileConfig, String> {
     toml::from_str(text).map_err(|error| error.to_string())
 }
 
-/// Resolves settings. `default_security_dir` is the platform default (from
-/// `a2a_security::storage::default_config_dir`), passed in so resolution stays pure.
+/// Resolves settings. `default_state_dir` is the platform default, from
+/// [`default_state_dir`], passed in so resolution stays pure.
 ///
 /// # Errors
 /// Returns [`CliError::Usage`] for an invalid tenant, operator or agent id, or a bad timeout.
@@ -197,7 +243,7 @@ pub fn resolve(
     overrides: &Overrides,
     env: EnvFn<'_>,
     file: &FileConfig,
-    default_security_dir: &Path,
+    default_state_dir: &Path,
 ) -> Result<Settings, CliError> {
     let bus_url = overrides
         .bus_url
@@ -205,9 +251,15 @@ pub fn resolve(
         .or_else(|| env("A2A_BUS_URL"))
         .or_else(|| file.bus.url.clone())
         .unwrap_or_else(|| DEFAULT_BUS_URL.to_owned());
+    let state_dir = overrides
+        .state_dir
+        .clone()
+        .or_else(|| env("A2AB_STATE_DIR").map(PathBuf::from))
+        .or_else(|| file.paths.state_dir.clone())
+        .unwrap_or_else(|| default_state_dir.to_path_buf());
     let seed_file = env("A2A_NKEY_SEED_FILE")
         .map(PathBuf::from)
-        .or_else(|| file.bus.seed_file.clone());
+        .unwrap_or_else(|| state_dir.join(CREDS_DIR).join(CLI_SEED_FILE));
     let tenant_text = overrides
         .tenant
         .clone()
@@ -223,15 +275,11 @@ pub fn resolve(
         .or_else(|| file.supervisor.operator_id.clone())
         .unwrap_or_else(|| DEFAULT_OPERATOR.to_owned());
     let operator = parse_agent(&operator_text)?;
-    let security_dir = env("A2A_SECURITY_DIR")
-        .map(PathBuf::from)
-        .or_else(|| file.security.config_dir.clone())
-        .unwrap_or_else(|| default_security_dir.to_path_buf());
-    let trust_file = file
-        .audit
-        .trust_file
+    let trust_file = overrides
+        .trust
         .clone()
-        .unwrap_or_else(|| a2a_security::storage::trust_file(&security_dir));
+        .or_else(|| file.security.trust_file.clone())
+        .unwrap_or_else(|| a2a_security::storage::trust_file(&state_dir));
     let agents = file
         .agents
         .iter()
@@ -241,9 +289,9 @@ pub fn resolve(
     Ok(Settings {
         bus_url,
         seed_file,
+        state_dir,
         tenant,
         operator,
-        security_dir,
         trust_file,
         agents,
         timeout,
@@ -276,8 +324,8 @@ mod tests {
         }
     }
 
-    fn security_default() -> PathBuf {
-        PathBuf::from("/defaults/security")
+    fn state_default() -> PathBuf {
+        PathBuf::from("/defaults/state")
     }
 
     // req_0012_054_config_precedence
@@ -292,12 +340,12 @@ mod tests {
             tenant: Some("flagt".to_owned()),
             ..Overrides::default()
         };
-        let settings = resolve(&flags, &env, &file, &security_default()).expect("resolves");
+        let settings = resolve(&flags, &env, &file, &state_default()).expect("resolves");
         assert_eq!(settings.bus_url, "nats://env:4222");
         assert_eq!(settings.tenant.as_str(), "flagt");
         assert_eq!(settings.operator.as_str(), "filer");
         assert_eq!(settings.timeout, None);
-        assert_eq!(settings.trust_file, security_default().join("trust.toml"));
+        assert_eq!(settings.trust_file, state_default().join("trust.toml"));
     }
 
     // req_0012_054_defaults
@@ -307,27 +355,26 @@ mod tests {
             &Overrides::default(),
             &env_of(&[]),
             &FileConfig::default(),
-            &security_default(),
+            &state_default(),
         )
         .expect("resolves");
         assert_eq!(settings.bus_url, DEFAULT_BUS_URL);
         assert_eq!(settings.tenant.as_str(), DEFAULT_TENANT);
         assert_eq!(settings.operator.as_str(), DEFAULT_OPERATOR);
         assert!(settings.agents.is_empty());
-        assert!(settings.seed_file.is_none());
+        assert_eq!(settings.state_dir, state_default());
+        assert_eq!(
+            settings.seed_file,
+            state_default().join(CREDS_DIR).join(CLI_SEED_FILE)
+        );
     }
 
     // req_0012_054_invalid_agent_rejected_before_bus
     #[test]
     fn req_0012_054_invalid_agent_rejected_before_bus() {
         let file = parse_file("[[agent]]\nid = \"Bad Id!\"\n").expect("valid toml");
-        let error = resolve(
-            &Overrides::default(),
-            &env_of(&[]),
-            &file,
-            &security_default(),
-        )
-        .expect_err("invalid configured agent id");
+        let error = resolve(&Overrides::default(), &env_of(&[]), &file, &state_default())
+            .expect_err("invalid configured agent id");
         assert!(matches!(error, CliError::Usage(_)));
         assert!(matches!(parse_agent("UPPER"), Err(CliError::Usage(_))));
         assert!(parse_agent("omp").is_ok());
@@ -344,7 +391,7 @@ mod tests {
             &flags,
             &env_of(&[]),
             &FileConfig::default(),
-            &security_default(),
+            &state_default(),
         )
         .expect("resolves");
         assert_eq!(settings.timeout, Some(Duration::from_secs(7)));
@@ -373,6 +420,135 @@ mod tests {
             Some(PathBuf::from("/home/op/.config/a2abus/config.toml"))
         );
         assert_eq!(default_config_path(&env_of(&[]), true), None);
+    }
+
+    // req_0012_043_state_dir_from_paths_table
+    #[test]
+    fn req_0012_043_state_dir_from_paths_table() {
+        let file = parse_file("[paths]\nstate_dir = \"/custom/state\"\n").expect("valid config");
+        let settings = resolve(&Overrides::default(), &env_of(&[]), &file, &state_default())
+            .expect("resolves");
+        assert_eq!(settings.state_dir, PathBuf::from("/custom/state"));
+        assert_eq!(
+            settings.seed_file,
+            PathBuf::from("/custom/state")
+                .join(CREDS_DIR)
+                .join(CLI_SEED_FILE)
+        );
+    }
+
+    // req_0012_043_state_dir_precedence
+    #[test]
+    fn req_0012_043_state_dir_precedence() {
+        let file = parse_file("[paths]\nstate_dir = \"/file\"\n").expect("valid config");
+        let env = env_of(&[("A2AB_STATE_DIR", "/env")]);
+        let flags = Overrides {
+            state_dir: Some(PathBuf::from("/flag")),
+            ..Overrides::default()
+        };
+        let by_flag = resolve(&flags, &env, &file, &state_default()).expect("resolves");
+        assert_eq!(by_flag.state_dir, PathBuf::from("/flag"));
+        let by_env =
+            resolve(&Overrides::default(), &env, &file, &state_default()).expect("resolves");
+        assert_eq!(by_env.state_dir, PathBuf::from("/env"));
+        let by_file = resolve(&Overrides::default(), &env_of(&[]), &file, &state_default())
+            .expect("resolves");
+        assert_eq!(by_file.state_dir, PathBuf::from("/file"));
+        let by_default = resolve(
+            &Overrides::default(),
+            &env_of(&[]),
+            &FileConfig::default(),
+            &state_default(),
+        )
+        .expect("resolves");
+        assert_eq!(by_default.state_dir, state_default());
+    }
+
+    // req_0012_043_trust_file_flag_or_state_dir
+    #[test]
+    fn req_0012_043_trust_file_flag_or_state_dir() {
+        let flags = Overrides {
+            trust: Some(PathBuf::from("/flag/trust.toml")),
+            ..Overrides::default()
+        };
+        let by_flag = resolve(
+            &flags,
+            &env_of(&[]),
+            &FileConfig::default(),
+            &state_default(),
+        )
+        .expect("resolves");
+        assert_eq!(by_flag.trust_file, PathBuf::from("/flag/trust.toml"));
+        let by_state = resolve(
+            &Overrides::default(),
+            &env_of(&[]),
+            &FileConfig::default(),
+            &state_default(),
+        )
+        .expect("resolves");
+        assert_eq!(by_state.trust_file, state_default().join(TRUST_FILE));
+    }
+
+    // req_0012_043_trust_file_config_before_state_dir
+    #[test]
+    fn req_0012_043_trust_file_config_before_state_dir() {
+        let file =
+            parse_file("[security]\ntrust_file = \"/cfg/trust.toml\"\n").expect("valid config");
+        let by_file = resolve(&Overrides::default(), &env_of(&[]), &file, &state_default())
+            .expect("resolves");
+        assert_eq!(by_file.trust_file, PathBuf::from("/cfg/trust.toml"));
+        let flags = Overrides {
+            trust: Some(PathBuf::from("/flag/trust.toml")),
+            ..Overrides::default()
+        };
+        let by_flag = resolve(&flags, &env_of(&[]), &file, &state_default()).expect("resolves");
+        assert_eq!(by_flag.trust_file, PathBuf::from("/flag/trust.toml"));
+    }
+
+    // req_0012_043_bus_seed_file_key_not_read
+    #[test]
+    fn req_0012_043_bus_seed_file_key_not_read() {
+        let file = parse_file("[bus]\nseed_file = \"/x.nk\"\n").expect("valid config");
+        let settings = resolve(&Overrides::default(), &env_of(&[]), &file, &state_default())
+            .expect("resolves");
+        assert_eq!(
+            settings.seed_file,
+            state_default().join(CREDS_DIR).join(CLI_SEED_FILE)
+        );
+    }
+
+    // req_0012_043_default_state_dir
+    #[test]
+    fn req_0012_043_default_state_dir() {
+        let windows = env_of(&[("LOCALAPPDATA", "C:\\Users\\op\\AppData\\Local")]);
+        assert_eq!(
+            default_state_dir(&windows, true).expect("set"),
+            PathBuf::from("C:\\Users\\op\\AppData\\Local").join("a2abus")
+        );
+        assert!(matches!(
+            default_state_dir(&env_of(&[]), true),
+            Err(CliError::Failed(_))
+        ));
+        let absolute = if cfg!(windows) {
+            "C:\\xdg\\state"
+        } else {
+            "/xdg/state"
+        };
+        let pairs = [("XDG_STATE_HOME", absolute), ("HOME", "/home/op")];
+        let xdg = env_of(&pairs);
+        assert_eq!(
+            default_state_dir(&xdg, false).expect("set"),
+            PathBuf::from(absolute).join("a2abus")
+        );
+        let relative = env_of(&[("XDG_STATE_HOME", "state"), ("HOME", "/home/op")]);
+        assert_eq!(
+            default_state_dir(&relative, false).expect("set"),
+            PathBuf::from("/home/op/.local/state/a2abus")
+        );
+        assert!(matches!(
+            default_state_dir(&env_of(&[]), false),
+            Err(CliError::Failed(_))
+        ));
     }
 
     // req_0012_054_missing_explicit_config_is_usage

@@ -35,6 +35,10 @@ Uses: `a2a-client` (requester runtime, signing hook), `a2a-audit` (chain verific
 - Decisions go only through `Client::decide_signed`, with the operator hook the session holds. The
   signer is loaded only for approve and deny, so read-only commands work without a key. An
   unsigned session never decides ([0012-058]).
+- The CLI reads its own config (`--config`, else `A2A_CONFIG`, else the platform default) and never
+  the a2ad config. An operator whose a2ad config sets `[security] trust_file` must pass `--trust`
+  with the same path, or `--config <a2ad.toml>`; otherwise the CLI signs with a key a2ad does not
+  trust ([0007-020]).
 - The crate never reads or names provider API keys ([0012-058]).
 - Color is ANSI only on a terminal, with `NO_COLOR` unset. There is no color flag ([0012-059]).
 - Audit verification exits 0 on a clean chain and 1 on the first broken line, naming that line

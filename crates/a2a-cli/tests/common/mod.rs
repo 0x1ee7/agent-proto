@@ -11,7 +11,7 @@ use a2a_cli::commands::Session;
 use a2a_cli::config::Settings;
 use a2a_cli::output::Io;
 use a2a_client::signing::envelope_hook;
-use a2a_client::{Client, Config};
+use a2a_client::{Client, Config, SigningHook};
 use a2a_core::envelope::{self, Clock, Inbound, ReplyOptions};
 use a2a_core::subject::{self, Op};
 use a2a_security::identity::Ed25519Signer;
@@ -287,10 +287,10 @@ impl Fixture {
     pub fn settings(&self, agents: Vec<AgentId>) -> Settings {
         Settings {
             bus_url: "nats://test.invalid:4222".to_owned(),
-            seed_file: None,
+            seed_file: PathBuf::from("state-unused/creds/cli.nk"),
+            state_dir: PathBuf::from("state-unused"),
             tenant: self.tenant.clone(),
             operator: self.operator.clone(),
-            security_dir: PathBuf::from("security-unused"),
             trust_file: PathBuf::from("trust-unused.toml"),
             agents,
             timeout: Some(Duration::from_secs(5)),
@@ -304,6 +304,15 @@ impl Fixture {
             let signer = Ed25519Signer::from_seed(&self.operator, &[9; 32]);
             envelope_hook(Arc::new(signer), self.clock.clone())
         });
+        self.session_with_operator(agents, operator)
+    }
+
+    /// Session over a fresh client with the given operator signing hook.
+    pub fn session_with_operator(
+        &self,
+        agents: Vec<AgentId>,
+        operator: Option<Arc<dyn SigningHook>>,
+    ) -> Session<Shared> {
         Session {
             client: self.client(),
             settings: self.settings(agents),
