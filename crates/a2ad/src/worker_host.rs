@@ -34,6 +34,7 @@ use a2a_worker::backend::{
     StartTurn, TurnRef,
 };
 use a2a_worker::config::{ApprovalMode, WorkerBuilder};
+use a2a_worker::error::WorkerError;
 use a2a_worker::presence::{CardSigning, Publication, Timing};
 use a2a_worker::store::FileStore;
 use a2a_worker::worker::Worker;
@@ -59,6 +60,13 @@ use crate::hosts;
 const POLL: Duration = Duration::from_millis(100);
 /// Interval between audit flushes (RFC-0013 spool drain).
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
+/// Window in which a restarted worker retries its claim while the previous instance's presence
+/// record expires (RFC-0004 0004-025): the 30 s presence TTL (a2a-worker default) plus a margin.
+const CLAIM_RETRY_WINDOW: Duration = Duration::from_secs(45);
+/// Pause between claim attempts.
+const CLAIM_RETRY_EVERY: Duration = Duration::from_secs(1);
+/// a2a-worker refusal when another live instance holds the agent id (presence.rs).
+const SERVED_ELSEWHERE: &str = "agent id is served by another live instance";
 /// Poll interval of the audit bridge thread's inbox.
 const AUDIT_POLL: Duration = Duration::from_millis(5);
 /// Agent default task deadline in milliseconds (RFC-0005 0005-040).
@@ -380,6 +388,9 @@ pub(crate) fn build_backend(
                 .clone()
                 .unwrap_or_else(|| profile.default_approval_mode().to_owned());
             config.acknowledge_dangerous = spec.dangerous;
+            if let Some(timeout) = spec.permission_timeout {
+                config.permission_timeout = timeout;
+            }
             config.env = env.to_vec();
             AcpDriver::new(config)
                 .map(AnyBackend::Acp)
@@ -507,19 +518,6 @@ pub(crate) fn worker_builder(
         )?);
     }
     Ok(builder)
-}
-
-/// Opens the worker on the given bus, backend and task store (RFC-0005).
-pub(crate) async fn open_worker<B: Bus, D: Backend, S: task::TaskStore>(
-    builder: WorkerBuilder,
-    bus: B,
-    backend: D,
-    store: S,
-) -> Result<Worker<B, D, S>, HostError> {
-    builder
-        .build(bus, backend, store, Box::new(SystemClock))
-        .await
-        .map_err(|err| HostError::Bus(err.to_string()))
 }
 
 /// One audit record handed from the pipeline to the bus bridge thread.
@@ -872,13 +870,31 @@ pub fn run_worker(
     let sink: Arc<Mutex<dyn AuditRecorder>> = pipeline.clone();
 
     let runtime = hosts::runtime()?;
-    let seed = hosts::read_seed(&seed_path)?;
-    let bus = runtime.block_on(hosts::connect_bus(url, &spec.id, seed, tenant.clone()))?;
-    let store = FileStore::open(agent_dir.join("tasks.log"))
-        .map_err(|err| HostError::Config(format!("task store: {err}")))?;
     let delegation = delegation_config(&run_dir, &tenant, spec)?;
-    let builder = worker_builder(config, spec, &work_dir, sink)?;
-    let mut worker = runtime.block_on(open_worker(builder, bus, backend.clone(), store))?;
+    let claim_deadline = Instant::now() + CLAIM_RETRY_WINDOW;
+    let mut worker = loop {
+        let seed = hosts::read_seed(&seed_path)?;
+        let bus = runtime.block_on(hosts::connect_bus(
+            url.clone(),
+            &spec.id,
+            seed,
+            tenant.clone(),
+        ))?;
+        let store = FileStore::open(agent_dir.join("tasks.log"))
+            .map_err(|err| HostError::Config(format!("task store: {err}")))?;
+        let builder = worker_builder(config, spec, &work_dir, sink.clone())?;
+        match runtime.block_on(builder.build(bus, backend.clone(), store, Box::new(SystemClock))) {
+            Ok(worker) => break worker,
+            Err(WorkerError::Config(SERVED_ELSEWHERE)) if Instant::now() < claim_deadline => {
+                tracing::info!(
+                    agent = %spec.id,
+                    "previous presence record still live; retrying claim"
+                );
+                std::thread::sleep(CLAIM_RETRY_EVERY);
+            }
+            Err(err) => return Err(HostError::Bus(err.to_string())),
+        }
+    };
     if let Some(delegation) = delegation {
         worker
             .attach_delegation(delegation)

@@ -267,6 +267,9 @@ pub struct AgentSpec {
     pub approval_mode: Option<String>,
     /// True when `approval_mode` is a dangerous mode the operator acknowledged (0012-051).
     pub dangerous: bool,
+    /// Driver permission backstop (0009-033) in seconds-precision; `None` keeps the driver default
+    /// (`DEFAULT_PERMISSION_TIMEOUT`). Set only for acp-* workers, validated at load.
+    pub permission_timeout: Option<Duration>,
     /// Peer settings (required for a2a-http, refused otherwise).
     pub peer: Option<PeerSpec>,
     /// Non-secret environment variables added to the child. `A2AB_*` and provider keys are refused.
@@ -668,6 +671,7 @@ struct RawAgent {
     env_passthrough: Option<String>,
     readiness: Option<RawReadiness>,
     restart: Option<String>,
+    permission_timeout: Option<u64>,
     delegation: Option<RawDelegation>,
 }
 
@@ -1115,6 +1119,7 @@ fn build_agent(raw: RawAgent, index: usize) -> Result<AgentSpec, ConfigError> {
         workspace: None,
         approval_mode: None,
         dangerous: false,
+        permission_timeout: None,
         peer: None,
         env,
         env_require,
@@ -1125,6 +1130,13 @@ fn build_agent(raw: RawAgent, index: usize) -> Result<AgentSpec, ConfigError> {
         delegation: Delegation::default(),
     };
 
+    if kind != Kind::Worker {
+        refuse(
+            raw.permission_timeout.is_some(),
+            "permission_timeout",
+            &table,
+        )?;
+    }
     match kind {
         Kind::Worker => build_worker(&raw, &mut spec, &table)?,
         Kind::Gateway => build_gateway(&raw, &mut spec, &table)?,
@@ -1152,6 +1164,18 @@ fn build_worker(raw: &RawAgent, spec: &mut AgentSpec, table: &str) -> Result<(),
     let backend = parse_backend(backend_text, table)?;
     spec.backend = Some(backend);
     refuse(raw.gateway_config.is_some(), "gateway_config", table)?;
+    if raw.permission_timeout.is_some() && !backend.is_acp() {
+        return Err(ConfigError::new(
+            table,
+            "permission_timeout applies to acp backends only (0009-033)",
+        ));
+    }
+    if let Some(seconds) = raw.permission_timeout {
+        let timeout = Duration::from_secs(seconds);
+        driver_acp::check_permission_timeout(timeout)
+            .map_err(|err| ConfigError::new(table, err.to_string()))?;
+        spec.permission_timeout = Some(timeout);
+    }
 
     if backend.is_acp() {
         refuse(raw.peer.is_some(), "peer", table)?;
@@ -1507,6 +1531,26 @@ mod tests {
     #[test]
     fn req_0007_020_security_table_is_strict() {
         assert!(parse(&doc("\n[security]\nfile = \"x\"\n")).is_err());
+    }
+
+    #[test]
+    fn req_0009_033_permission_timeout_must_outlast_worker_expiry() {
+        let cfg = parse(&doc(&worker_omp("permission_timeout = 330\n"))).unwrap();
+        let spec = cfg.agent("omp").expect("agent");
+        assert_eq!(
+            spec.permission_timeout,
+            Some(std::time::Duration::from_secs(330))
+        );
+        assert!(parse(&doc(&worker_omp("permission_timeout = 300\n"))).is_err());
+        assert!(parse(&doc(&worker_omp("permission_timeout = 0\n"))).is_err());
+    }
+
+    #[test]
+    fn req_0009_033_permission_timeout_refused_outside_acp_workers() {
+        let http = "[[agent]]\nid = \"hermes\"\nkind = \"worker\"\nbackend = \"a2a-http\"\npeer = { base_url = \"http://127.0.0.1:9900\" }\npermission_timeout = 330\n";
+        assert!(parse(&doc(http)).is_err());
+        let external = "[[agent]]\nid = \"ext\"\nkind = \"external\"\ncommand = [\"ext\"]\npermission_timeout = 330\n";
+        assert!(parse(&doc(external)).is_err());
     }
 
     #[test]

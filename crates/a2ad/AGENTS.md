@@ -10,6 +10,7 @@ Uses: `bus-nats` (provisioning and JetStream connections), `a2a-audit`, `a2a-sec
 - Validate the whole configuration before starting anything (0012-004). Unknown keys are refused. `[[agent]] id = "bus"` is refused: the broker is configured in `[bus]` (0010-001).
 - Provider keys are never read or forwarded unless listed in `env_allow` (0012-026, 0012-062). Child environment carries `A2AB_*` identity variables and paths only, plus the log filter variables `A2AB_LOG` and `RUST_LOG` forwarded from the parent (0013-038). Seed bytes and grant credentials never appear in argv or environment (0012-027).
 - `[log]` (optional): `level` (EnvFilter directive, default `info`) and `format` (`text` or `json`, default `text`), validated at load (0013-038, 0013-039). Child stdout/stderr logs are opened with `platform::open_log_for_append`, which shares delete on Windows so the host can rotate them.
+- `[[agent]] permission_timeout` (optional, seconds, acp-* workers only): validated at load with `driver_acp::check_permission_timeout`, which requires more than the 300 s worker approval expiry (0009-033). Absent keeps `DEFAULT_PERMISSION_TIMEOUT` (330 s). Refused for other kinds and for `a2a-http`.
 - One supervisor per state directory (0012-005): `run/supervisor.lock` via `fd-lock`; the pid is in `run/supervisor.pid`.
 - Probes are loopback-only and send no credentials (0012-010). Worker readiness is a local ready file written by the worker host.
 - Stop order: close the child's stdin (lifeline), then the graceful signal, then forced kill only after grace (0012-014, 0012-016, 0012-061). Windows uses CTRL_BREAK for workers and job-object termination for forced stop (0012-017, 0012-064).
@@ -23,6 +24,7 @@ Uses: `bus-nats` (provisioning and JetStream connections), `a2a-audit`, `a2a-sec
 
 - 0010-001, 0010-002, 0010-069: broker identities, rendered configuration and binary digest (`broker`).
 - 0007-020, 0012-002, 0012-003, 0012-004, 0012-007, 0012-010, 0012-015, 0012-022, 0012-023, 0012-026, 0012-027, 0012-030, 0012-051, 0012-060, 0012-062: configuration rules and trust file location (`config`).
+- 0009-033: `[[agent]] permission_timeout` validation and refusal rules (`config`).
 - 0012-005, 0012-007, 0012-010, 0012-011, 0012-012, 0012-014, 0012-015, 0012-026, 0012-027: supervisor lock, ordering, probes, restart policy, drain and env (`supervisor`).
 - 0012-017, 0012-019, 0012-021, 0012-025, 0012-066: process containment, start tokens, owner-only ACLs and path length (`platform`).
 - 0007-006, 0007-010, 0007-014, 0012-023, 0012-024, 0012-043, 0015-081, 0015-082: operator key bootstrap, credentials and delegation file (`creds`).
