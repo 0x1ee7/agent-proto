@@ -5,6 +5,7 @@ Behaviour is chosen from the last user message (keywords) and whether the last m
 Every request body is appended to <log-dir>/requests.jsonl so the probe can inspect what omp sent.
 
 Usage: python stub_openai.py <port> <log-dir>
+    "A2A_SEND:<agent>:<text>" -> tool a2a_send(agent, text) on the MCP peer tool (name matched by suffix), then text = tool result verbatim
 Scripted scenarios:
   "WRITE_FILE"   -> tool call write(path=written.txt, content=hello), then text DONE
   "READ_FILE"    -> tool call read(path=read-me.txt), then text = tool result verbatim
@@ -74,6 +75,13 @@ def decide(body: dict) -> dict:
     if "CODE_WORD" in up:
         seen = any("PINEAPPLE" in text_of(m.get("content")) for m in msgs[:-1])
         return {"text": "PINEAPPLE" if seen else "UNKNOWN"}
+    if "A2A_SEND:" in last_user:
+        spec = last_user[last_user.index("A2A_SEND:") + len("A2A_SEND:"):].strip()
+        agent, _, text = spec.partition(":")
+        name = next((n for n in tool_names(body) if n == "a2a_send" or n.endswith("__a2a_send") or n.endswith("_a2a_send")), None)
+        if name is None:
+            return {"text": "NO_A2A_TOOL"}
+        return {"tool": (name, {"agent": agent.strip(), "text": text.strip() or "ping"})}
     return {"text": "OK"}
 
 

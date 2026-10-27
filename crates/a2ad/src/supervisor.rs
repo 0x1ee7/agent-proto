@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fd_lock::RwLock;
@@ -22,6 +23,7 @@ use serde_json::{Value, json};
 use crate::broker::{self, Broker, BrokerError};
 use crate::config::{AgentSpec, Config, Probe, Readiness, Restart, is_provider_key};
 use crate::creds::{self, CredsError, DELEGATION_FILE, DelegationFile, Grant, LOGS_DIR, RUN_DIR};
+use crate::health::{HealthHandle, HealthServeError, HealthServer};
 use crate::host;
 use crate::platform::{self, Containment, PlatformError};
 
@@ -219,6 +221,7 @@ pub struct Supervisor {
     order: Vec<usize>,
     slots: Vec<Slot>,
     broker: Option<Broker>,
+    health_stop: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for Supervisor {
@@ -251,6 +254,7 @@ impl Supervisor {
             order,
             slots,
             broker: None,
+            health_stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -266,7 +270,12 @@ impl Supervisor {
             keys.push((identity, key));
         }
         let _ = fs::remove_file(stop_request_path(&state));
+        let health_server = HealthServer::bind(self.config.health_listen())
+            .map_err(|err| SupervisorError::Io(io::Error::other(err.to_string())))?;
         self.broker = Some(Broker::start(&self.config, &keys)?);
+        let health_handle = HealthHandle::new();
+        let health_thread = self.start_health(health_server, &health_handle);
+        health_handle.update(|health| health.bus_connected = true);
         let _ = log_event(
             &state,
             "SUPERVISOR_STARTED",
@@ -274,8 +283,22 @@ impl Supervisor {
             json!({"pid": std::process::id()}),
         );
         let outcome = self.supervise();
+        health_handle.update(|health| health.bus_connected = false);
         self.shutdown();
+        self.health_stop.store(true, Ordering::SeqCst);
+        let _ = health_thread.join();
         outcome
+    }
+
+    /// Serves `/healthz` and `/metrics` on a thread until `health_stop` is set (0013-033).
+    fn start_health(
+        &self,
+        server: HealthServer,
+        handle: &HealthHandle,
+    ) -> JoinHandle<Result<(), HealthServeError>> {
+        let thread_handle = handle.clone();
+        let stop = Arc::clone(&self.health_stop);
+        thread::spawn(move || server.run(&thread_handle, &stop))
     }
 
     fn check_path_budget(&self) -> Result<(), SupervisorError> {

@@ -115,7 +115,7 @@ impl Backend {
     /// RFC-0009 0009-063/064).
     const fn modes(self) -> (&'static [&'static str], &'static [&'static str]) {
         match self {
-            Self::AcpOmp => (&["ask-all", "ask-exec"], &["write", "yolo"]),
+            Self::AcpOmp => (&["ask-exec"], &["write", "yolo"]),
             Self::AcpClaude => (
                 &["ask-all", "default", "plan"],
                 &[
@@ -133,7 +133,10 @@ impl Backend {
     /// Default approval mode of the backend.
     #[must_use]
     pub const fn default_approval(self) -> &'static str {
-        DEFAULT_APPROVAL
+        match self {
+            Self::AcpOmp => "ask-exec",
+            Self::AcpClaude | Self::A2aHttp => DEFAULT_APPROVAL,
+        }
     }
 }
 
@@ -1164,6 +1167,12 @@ fn build_worker(raw: &RawAgent, spec: &mut AgentSpec, table: &str) -> Result<(),
         .unwrap_or_else(|| backend.default_approval().to_owned());
     let (safe, dangerous) = backend.modes();
     let is_dangerous = dangerous.contains(&approval.as_str());
+    if matches!(backend, Backend::AcpOmp) && approval == "ask-all" {
+        return Err(ConfigError::new(
+            table,
+            "approval_mode `ask-all` is refused for acp-omp: omp must not run ask-all (RFC-0006 0006-004, RFC-0009 0009-083); use ask-exec",
+        ));
+    }
     if !is_dangerous && !safe.contains(&approval.as_str()) {
         return Err(ConfigError::new(
             table,
@@ -1438,7 +1447,7 @@ mod tests {
         assert_eq!(err.table, "[paths]");
         assert!(err.detail.contains("bogus"), "{err}");
         let err = parse(&doc(&worker_omp(
-            "bogus_key = 1\napproval_mode = \"ask-all\"\n",
+            "bogus_key = 1\napproval_mode = \"ask-exec\"\n",
         )))
         .unwrap_err();
         assert!(err.table.starts_with("[[agent]] #"), "{err}");
@@ -1492,9 +1501,21 @@ mod tests {
     fn stable_0012_004_all_violations_reported_before_start() {
         let text = doc(&format!(
             "{}[[agent]]\nid = \"bad\"\nkind = \"external\"\n",
-            worker_omp("approval_mode = \"ask-all\"\n")
+            worker_omp("approval_mode = \"ask-exec\"\n")
         ));
         assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn stable_0006_004_acp_omp_refuses_ask_all_and_defaults_ask_exec() {
+        let refused = doc(&worker_omp("approval_mode = \"ask-all\"\n"));
+        let err = parse(&refused).unwrap_err();
+        assert!(err.detail.contains("ask-all"), "{err}");
+        assert!(err.detail.contains("ask-exec"), "{err}");
+        let cfg = parse(&doc(&worker_omp(""))).unwrap();
+        let omp = cfg.agent("omp").unwrap();
+        assert_eq!(omp.approval_mode.as_deref(), Some("ask-exec"));
+        assert!(!omp.dangerous);
     }
 
     #[test]

@@ -1,0 +1,26 @@
+config_version = 1
+
+[paths]
+state_dir = 'C:/Users/0x1de/dev/agent-proto/.spikes/e2e/state'
+repos_root = 'C:/Users/0x1de/dev/agent-proto/.spikes/e2e/repos'
+
+[supervisor]
+drain_ms = 5000
+grace_ms = 3000
+operator_id = "cli"
+
+[bus]
+port = 4222
+binary = 'C:/Users/0x1de/dev/agent-proto/.spikes/nats/bin/srv/nats-server-v2.15.2-windows-amd64/nats-server.exe'
+sha256 = "a7785bc14837679c6653a6c8090c79e4c4f7b28a5f7f144f3a734248a302ac41"
+
+[[agent]]
+id = "omp"
+kind = "worker"
+backend = "acp-omp"
+command = ["C:/Users/0x1de/AppData/Local/omp/omp.exe"]
+repo = 'C:/Users/0x1de/dev/agent-proto/.spikes/e2e/repo'
+approval_mode = "ask-exec"
+env = { PI_CODING_AGENT_DIR = 'C:/Users/0x1de/dev/agent-proto/.spikes/e2e/omp-agent' }
+env_passthrough = "all"
+readiness = { kind = "bus-presence" }

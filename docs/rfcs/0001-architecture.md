@@ -97,7 +97,7 @@ Dependencies point downward only. A crate MUST NOT depend on a crate in the same
 | `a2a-security` | L2 | Identity keys, signing and verification, trust allowlist, redaction, provenance marking | `a2a-types` |
 | `a2a-workspace` | L2 | Worktree isolation policy and lifecycle (RFC-0012) | none (git via process) |
 | `a2a-audit` | L2 | Audit event model and sink trait | `a2a-types` |
-| `a2a-worker` | L3 | Worker runtime: serves the card, receives tasks, runs lifecycle, approvals, budgets against a `Backend` | L2 crates, `bus-api` |
+| `a2a-worker` | L3 | Worker runtime: serves the card, receives tasks, runs lifecycle, approvals, budgets against a `Backend`; hosts the delegation endpoint (RFC-0015) | L2 crates (incl. `a2a-mcp`), `bus-api`, and `a2a-client` for outbound delegation (the single same-layer edge, RFC-0015 [0015-001]) |
 | `a2a-client` | L3 | Requester runtime: discovery, SendMessage, streaming, resume, cancel | L2 crates, `bus-api` |
 | `driver-acp` | L4 | `Backend` implementation speaking ACP as client over stdio to omp and claude-agent-acp | `a2a-worker`, `a2a-types` |
 | `driver-a2a-http` | L4 | `Backend` implementation speaking A2A v1.0 HTTP to an external agent (Hermes); this is the HTTP client bridge that puts an external A2A agent on the bus | `a2a-worker`, `a2a-types` |

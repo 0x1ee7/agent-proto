@@ -30,3 +30,11 @@ Uses: `bus-nats` (provisioning and JetStream connections), `a2a-audit`, `a2a-sec
 ## Live tests
 
 - `worker_host::tests::live_worker_host_smoke` is `#[ignore]` and needs `A2AB_LIVE_CONFIG` and `A2AB_LIVE_AGENT`, plus a running bus. Run with `cargo test -p a2ad -- --ignored`.
+
+## Hosts (worker_host, gateway_host, health, hosts/)
+
+- Worker and gateway hosts expose sync `run_*` entry points; only those touch NATS. Inner logic is generic over `Bus` and tested with bus-mem.
+- Secrets are `env:`/`file:` references only; errors never echo values; `file:` requires an owner-only ACL (`platform::verify_owner_only`).
+- Health is served by `health::serve` from the supervisor; hosts report readiness via `HostControl::report_ready`.
+- Delegation endpoints are per run; shim is `delegation.shim_path` or `a2abus-mcp-shim` next to the current exe (`.exe` on Windows).
+- Tests are named `req_<rfc>_<id>_*`; live tests are `#[ignore]`.

@@ -25,7 +25,7 @@ use a2a_core::budget::{Allowance, Metering};
 use a2a_core::envelope::{Clock, SystemClock};
 use a2a_core::task;
 use a2a_types::ids::{AgentId, TenantId};
-use a2a_types::proto::a2a::{AgentCapabilities, AgentCard, AgentInterface};
+use a2a_types::proto::a2a::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill};
 use a2a_types::proto::a2abus::{AuditEvent, EmitterKind};
 use a2a_worker::DelegationConfig;
 use a2a_worker::audit::AuditRecorder;
@@ -251,10 +251,16 @@ fn reject_reserved(spec: &AgentSpec, name: &str) -> Result<(), HostError> {
     Ok(())
 }
 
-/// Maps the agent's approval mode to the worker's (RFC-0012 0012-051). `ask-all` (the default)
-/// asks for every permission; any other mode asks for execution requests.
+/// Maps the agent's approval mode to the worker's (RFC-0012 0012-051). The mode is the configured
+/// one or, when none is set, the backend default (RFC-0006 0006-004). `ask-all` asks for every
+/// permission; any other mode asks for execution requests.
 pub(crate) fn approval_mode(spec: &AgentSpec) -> ApprovalMode {
-    match spec.approval_mode.as_deref().unwrap_or(DEFAULT_APPROVAL) {
+    let mode = spec
+        .approval_mode
+        .as_deref()
+        .or_else(|| spec.backend.map(SpecBackend::default_approval))
+        .unwrap_or(DEFAULT_APPROVAL);
+    match mode {
         DEFAULT_APPROVAL => ApprovalMode::AskAll,
         _ => ApprovalMode::AskExec,
     }
@@ -263,9 +269,10 @@ pub(crate) fn approval_mode(spec: &AgentSpec) -> ApprovalMode {
 /// Builds the presence card of the worker (RFC-0004). The card names the agent, advertises one
 /// bus interface and omits signing (the card is served over the bus only).
 pub(crate) fn agent_card(tenant: &TenantId, spec: &AgentSpec) -> AgentCard {
+    let description = spec.description.clone().unwrap_or_else(|| spec.id.clone());
     AgentCard {
         name: spec.id.clone(),
-        description: spec.description.clone().unwrap_or_else(|| spec.id.clone()),
+        description: description.clone(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         supported_interfaces: vec![AgentInterface {
             url: format!("bus://{}/{}", tenant.as_str(), spec.id),
@@ -281,6 +288,17 @@ pub(crate) fn agent_card(tenant: &TenantId, spec: &AgentSpec) -> AgentCard {
         }),
         default_input_modes: vec!["text/plain".to_owned()],
         default_output_modes: vec!["text/plain".to_owned()],
+        // A card must declare at least one skill (presence.rs). Each worker offers one general
+        // text skill named after the agent; its text is untrusted (RFC-0004 0004-040).
+        skills: vec![AgentSkill {
+            id: spec.id.clone(),
+            name: spec.id.clone(),
+            description,
+            tags: vec!["text".to_owned()],
+            input_modes: vec!["text/plain".to_owned()],
+            output_modes: vec!["text/plain".to_owned()],
+            ..Default::default()
+        }],
         ..Default::default()
     }
 }
@@ -360,7 +378,7 @@ pub(crate) fn build_backend(
             config.approval_mode = spec
                 .approval_mode
                 .clone()
-                .unwrap_or_else(|| DEFAULT_APPROVAL.to_owned());
+                .unwrap_or_else(|| profile.default_approval_mode().to_owned());
             config.acknowledge_dangerous = spec.dangerous;
             config.env = env.to_vec();
             AcpDriver::new(config)
@@ -591,6 +609,13 @@ fn open_link(route: &AuditRoute) -> Result<BridgeLink, HostError> {
     })
 }
 
+/// Drops `value` while `runtime` is entered. async-nats spawns its unsubscribe work from `Drop`,
+/// which needs a reactor; dropping after `block_on` returned panicked with `there is no reactor
+/// running`.
+fn drop_in_runtime<T>(runtime: &tokio::runtime::Runtime, value: T) {
+    runtime.block_on(async move { drop(value) });
+}
+
 /// Bridge thread body: connects, reports readiness, then appends each job until the pipeline is
 /// dropped. Blocking receives are avoided so the bus connection's tasks keep running.
 fn run_bridge(route: AuditRoute, inbox: Receiver<AuditJob>, ready: SyncSender<Result<(), String>>) {
@@ -626,6 +651,7 @@ fn run_bridge(route: AuditRoute, inbox: Receiver<AuditJob>, ready: SyncSender<Re
             }
         }
     });
+    drop_in_runtime(&runtime, bus);
 }
 
 async fn append(
@@ -800,6 +826,7 @@ pub fn run_worker(
 
     let served = runtime.block_on(drive(&mut worker, control, &pipeline, config.drain()));
     worker.shutdown_delegation();
+    drop_in_runtime(&runtime, worker);
     let stopped = backend.shutdown(config.grace());
     let flushed = flush(&pipeline);
     served?;
@@ -812,6 +839,28 @@ pub fn run_worker(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Stands in for an async-nats subscriber: its `Drop` spawns a task, which needs a reactor.
+    struct SpawnOnDrop;
+
+    impl Drop for SpawnOnDrop {
+        fn drop(&mut self) {
+            drop(tokio::spawn(async {}));
+        }
+    }
+
+    /// Regression: the worker's bus must be dropped inside the runtime, so its `Drop` finds a reactor.
+    #[test]
+    fn drop_in_runtime_gives_drop_a_reactor() {
+        let runtime = hosts::runtime().expect("runtime");
+        drop_in_runtime(&runtime, SpawnOnDrop);
+    }
+
+    /// Guards the premise of the fix: a drop that spawns panics outside a runtime.
+    #[test]
+    fn dropping_outside_runtime_panics_without_reactor() {
+        assert!(std::panic::catch_unwind(|| drop(SpawnOnDrop)).is_err());
+    }
 
     const SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -907,14 +956,27 @@ mod tests {
         assert!(child_env(&spec, "acme", &host()).is_err());
     }
 
-    // req_0012_051: the default approval mode asks for everything; other modes ask for execution.
+    // req_0012_051: an explicit mode is mapped; `ask-all` asks for everything, others ask for exec.
     #[test]
     fn req_0012_051_approval_mode_mapping() {
         let dir = tempfile::tempdir().unwrap();
         let mut spec = spec_of(dir.path());
+        spec.approval_mode = Some("ask-all".to_owned());
         assert!(matches!(approval_mode(&spec), ApprovalMode::AskAll));
         spec.approval_mode = Some("ask-exec".to_owned());
         assert!(matches!(approval_mode(&spec), ApprovalMode::AskExec));
+    }
+
+    // req_0006_004: with no configured mode, omp starts with ask-exec and other backends ask-all.
+    #[test]
+    fn req_0006_004_backend_default_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = spec_of(dir.path());
+        spec.approval_mode = None;
+        spec.backend = Some(SpecBackend::AcpOmp);
+        assert!(matches!(approval_mode(&spec), ApprovalMode::AskExec));
+        spec.backend = Some(SpecBackend::AcpClaude);
+        assert!(matches!(approval_mode(&spec), ApprovalMode::AskAll));
     }
 
     // req_0004_001: the card names the agent and advertises the bus interface.
@@ -929,6 +991,10 @@ mod tests {
         let interface = &card.supported_interfaces[0];
         assert_eq!(interface.url, "bus://acme/omp");
         assert_eq!(interface.protocol_binding, BINDING);
+        // presence.rs rejects a card without skills; every worker must declare one.
+        assert_eq!(card.skills.len(), 1);
+        assert_eq!(card.skills[0].id, "omp");
+        assert_eq!(card.skills[0].input_modes, vec!["text/plain".to_owned()]);
     }
 
     // req_0009_011: a worker needs a command for its ACP driver.
