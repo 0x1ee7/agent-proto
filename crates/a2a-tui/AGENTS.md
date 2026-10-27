@@ -29,8 +29,13 @@ Layer L5 operator console (RFC-0001 crate table). Binary plus library.
 - Decisions are gated locally (dwell, connection, expiry, operator identity). A decision whose
   outcome is unknown after send shows `unknown` and is never resent. Only a local approval
   check failure shows `refused`.
-- The console's bus principal is `tui`. Keys are loaded for `operator` and missing or rejected
-  keys make the console read-only.
+- The console's bus principal is `tui`. Paths resolve from the state directory: `--state-dir`,
+  then `A2AB_STATE_DIR`, then the platform default (matches a2ad `default_state_dir`). Trust is
+  `<state>/trust.toml` (`--trust` overrides) and the operator key is
+  `<state>/creds/operator-<K>.key`. Missing or rejected keys make the console read-only.
+- The console does not read the a2ad config. An operator whose a2ad config sets
+  `[security] trust_file` must pass `--trust` with the same path, or the console signs with a
+  key a2ad does not trust.
 - No `unsafe`. No `unwrap`, `expect`, `panic`, or `todo!` outside tests.
 
 ## Requirements guarded

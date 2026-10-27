@@ -1,8 +1,10 @@
 //! `a2a-tui`: the local operator console (RFC-0012 sec 4.10).
 //!
 //! This binary is the only place that names the concrete NATS binding (RFC-0001 0001-001). It
-//! connects twice as the console identity `tui` (control and audit), loads the operator key when
-//! given, and runs the terminal UI on the main thread with the bus driver on a tokio runtime.
+//! connects twice as the console identity `tui` (control and audit), loads the operator key from
+//! the state directory, and runs the terminal UI on the main thread with the bus driver on a
+//! tokio runtime. It does not read the a2ad config: an operator with `[security] trust_file` set
+//! there must pass `--trust` with the same path.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -11,11 +13,10 @@ use std::time::Duration;
 
 use a2a_client::signing::envelope_hook;
 use a2a_core::envelope::SystemClock;
-use a2a_security::storage::{default_config_dir, trust_file};
 use a2a_tui::app::App;
 use a2a_tui::audit_feed::BusAuditFeed;
 use a2a_tui::driver::{self, Msg};
-use a2a_tui::operator::{self, Identity, console_agent};
+use a2a_tui::operator::{self, Identity, console_agent, resolve_state_dir};
 use a2a_tui::ui;
 use a2a_types::ids::TenantId;
 use bus_api::name::{ConsumerName, Principal, StreamName, SubjectPattern};
@@ -23,7 +24,7 @@ use bus_nats::config::{NatsConfig, Seed};
 use bus_nats::layout;
 
 const USAGE: &str = "usage: a2a-tui --seed-file <path> [--url <nats-url>] [--tenant <name>] \
-[--creds <dir>] [--trust <trust-file>] [--root <dir>]...";
+[--state-dir <dir>] [--trust <trust-file>] [--root <dir>]...";
 const DEFAULT_URL: &str = "nats://127.0.0.1:4222";
 const DEFAULT_TENANT: &str = "local";
 const AUDIT_CONSUMER: &str = "tui-audit";
@@ -44,7 +45,7 @@ struct Args {
     url: String,
     seed_file: PathBuf,
     tenant: String,
-    creds: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     trust: Option<PathBuf>,
     roots: Vec<PathBuf>,
 }
@@ -54,7 +55,7 @@ impl Args {
         let mut url = DEFAULT_URL.to_owned();
         let mut seed_file = None;
         let mut tenant = DEFAULT_TENANT.to_owned();
-        let mut creds = None;
+        let mut state_dir = None;
         let mut trust = None;
         let mut roots = Vec::new();
         while let Some(flag) = iter.next() {
@@ -62,7 +63,7 @@ impl Args {
                 "--url" => url = value(&mut iter, &flag)?,
                 "--seed-file" => seed_file = Some(PathBuf::from(value(&mut iter, &flag)?)),
                 "--tenant" => tenant = value(&mut iter, &flag)?,
-                "--creds" => creds = Some(PathBuf::from(value(&mut iter, &flag)?)),
+                "--state-dir" => state_dir = Some(PathBuf::from(value(&mut iter, &flag)?)),
                 "--trust" => trust = Some(PathBuf::from(value(&mut iter, &flag)?)),
                 "--root" => roots.push(PathBuf::from(value(&mut iter, &flag)?)),
                 "-h" | "--help" => return Err(USAGE.to_owned()),
@@ -80,7 +81,7 @@ impl Args {
             url,
             seed_file,
             tenant,
-            creds,
+            state_dir,
             trust,
             roots,
         })
@@ -97,13 +98,9 @@ fn run() -> Result<(), String> {
     let tenant = TenantId::parse(&args.tenant).map_err(|e| format!("tenant: {e}"))?;
     let seed_text =
         std::fs::read_to_string(&args.seed_file).map_err(|e| format!("seed file: {e}"))?;
-    let trust = match args.trust {
-        Some(path) => path,
-        None => {
-            let config = default_config_dir().map_err(|e| format!("config dir: {e}"))?;
-            trust_file(&config)
-        }
-    };
+    let state = resolve_state_dir(args.state_dir, |key| std::env::var(key).ok(), cfg!(windows))?;
+    let trust = args.trust.unwrap_or_else(|| state.join("trust.toml"));
+    let creds = state.join("creds");
     let identity = console_agent();
     let nats = NatsConfig {
         url: args.url,
@@ -136,7 +133,7 @@ fn run() -> Result<(), String> {
         ))
         .map_err(|e| format!("audit feed: {e}"))?;
 
-    let (signing, read_only) = match operator::load(args.creds.as_deref(), &trust, &args.roots) {
+    let (signing, read_only) = match operator::load(&creds, &trust, &args.roots) {
         Identity::Signed(signer) => (Some(envelope_hook(signer, Arc::new(SystemClock))), None),
         Identity::ReadOnly(reason) => (None, Some(reason)),
     };
