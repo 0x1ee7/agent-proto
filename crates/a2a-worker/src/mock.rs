@@ -69,8 +69,13 @@ struct State {
     caps: Capabilities,
     sink: Option<Box<dyn BackendSink>>,
     scripts: VecDeque<Vec<Step>>,
-    open: Option<OpenTurn>,
-    pending: Vec<RequestId>,
+    /// Turns currently open, in start order.
+    open: Vec<OpenTurn>,
+    /// Open-turn limit: `1` models an agent that runs one turn at a time (0009-020); larger
+    /// values model a multi-session backend running contexts concurrently (0005-054).
+    max_open: usize,
+    /// Permission requests awaiting an answer, with the turn that raised each.
+    pending: Vec<(TurnRef, RequestId)>,
     log: Vec<Command>,
     alive: bool,
     restarts: u32,
@@ -84,12 +89,13 @@ impl State {
         }
     }
 
-    /// Runs the open turn's steps until it ends or holds.
-    fn run(&mut self) {
+    /// Runs the open turn `session` until it ends, pauses for a permission, or holds.
+    fn run(&mut self, session: &TurnRef) {
         loop {
-            let Some(open) = self.open.as_mut() else {
+            let Some(index) = self.open.iter().position(|open| &open.turn == session) else {
                 return;
             };
+            let open = &mut self.open[index];
             if open.held {
                 return;
             }
@@ -100,7 +106,7 @@ impl State {
             let event_no = open.next_no;
             let event = match step {
                 Step::Hold => {
-                    open.held = true;
+                    self.open[index].held = true;
                     return;
                 }
                 Step::Status(payload) => BackendEvent::Status {
@@ -127,7 +133,8 @@ impl State {
                     sample,
                 },
                 Step::Permission(request) => {
-                    self.pending.push(request.request_id.clone());
+                    self.pending
+                        .push((turn.clone(), request.request_id.clone()));
                     BackendEvent::PermissionRequest {
                         turn,
                         event_no,
@@ -147,38 +154,51 @@ impl State {
             };
             let terminal = matches!(event, BackendEvent::Terminal { .. });
             let pauses = matches!(event, BackendEvent::PermissionRequest { .. });
-            if let Some(open) = self.open.as_mut() {
+            if let Some(open) = self.open.get_mut(index) {
                 open.next_no += 1;
             }
             self.emit(event);
             if pauses {
-                if let Some(open) = self.open.as_mut() {
+                if let Some(open) = self.open.get_mut(index) {
                     open.held = true;
                 }
                 return;
             }
             if terminal {
-                self.end_turn();
+                self.end_turn(session);
                 return;
             }
         }
     }
 
-    fn end_turn(&mut self) {
-        self.open = None;
-        self.pending.clear();
+    fn end_turn(&mut self, session: &TurnRef) {
+        self.open.retain(|open| &open.turn != session);
+        self.pending.retain(|(owner, _)| owner != session);
     }
 
-    /// Ends the open turn with a terminal event, if one is open.
-    fn terminate(&mut self, outcome: Outcome) {
-        if let Some(open) = self.open.take() {
-            let event = BackendEvent::Terminal {
-                turn: open.turn,
-                event_no: open.next_no,
-                outcome,
-            };
-            self.emit(event);
-            self.pending.clear();
+    /// Ends the open turn at `index` with a terminal event.
+    fn terminate_index(&mut self, index: usize, outcome: Outcome) {
+        let open = self.open.remove(index);
+        let event = BackendEvent::Terminal {
+            turn: open.turn.clone(),
+            event_no: open.next_no,
+            outcome,
+        };
+        self.emit(event);
+        self.pending.retain(|(owner, _)| owner != &open.turn);
+    }
+
+    /// Ends `session` with a terminal event, if it is open.
+    fn terminate_turn(&mut self, session: &TurnRef, outcome: Outcome) {
+        if let Some(index) = self.open.iter().position(|open| &open.turn == session) {
+            self.terminate_index(index, outcome);
+        }
+    }
+
+    /// Ends every open turn, building each terminal outcome with `outcome`.
+    fn terminate_all(&mut self, outcome: impl Fn() -> Outcome) {
+        while !self.open.is_empty() {
+            self.terminate_index(0, outcome());
         }
     }
 }
@@ -225,7 +245,8 @@ impl MockBackend {
             caps,
             sink: None,
             scripts: VecDeque::new(),
-            open: None,
+            open: Vec::new(),
+            max_open: 1,
             pending: Vec::new(),
             log: Vec::new(),
             alive: true,
@@ -266,18 +287,19 @@ impl Backend for MockBackend {
         if state.sink.is_none() {
             return Err(BackendError::NoSink);
         }
-        if state.open.is_some() {
+        if state.open.len() >= state.max_open {
             return Err(BackendError::Busy);
         }
         state.log.push(Command::Start(Box::new(cmd.clone())));
         let steps: VecDeque<Step> = state.scripts.pop_front().unwrap_or_default().into();
-        state.open = Some(OpenTurn {
+        let session = cmd.turn.clone();
+        state.open.push(OpenTurn {
             turn: cmd.turn,
             next_no: 1,
             steps,
             held: false,
         });
-        state.run();
+        state.run(&session);
         Ok(())
     }
 
@@ -288,12 +310,12 @@ impl Backend for MockBackend {
     ) -> Result<(), BackendError> {
         let mut state = lock(&self.state);
         state.log.push(Command::Resolve(request_id.clone(), answer));
-        if let Some(index) = state.pending.iter().position(|id| id == request_id) {
-            state.pending.remove(index);
-            if let Some(open) = state.open.as_mut() {
+        if let Some(index) = state.pending.iter().position(|(_, id)| id == request_id) {
+            let (session, _) = state.pending.remove(index);
+            if let Some(open) = state.open.iter_mut().find(|open| open.turn == session) {
                 open.held = false;
             }
-            state.run();
+            state.run(&session);
         }
         Ok(())
     }
@@ -301,9 +323,9 @@ impl Backend for MockBackend {
     fn cancel(&mut self, turn: &TurnRef) -> Result<(), BackendError> {
         let mut state = lock(&self.state);
         state.log.push(Command::Cancel(turn.clone()));
-        let matches_open = state.open.as_ref().is_some_and(|open| &open.turn == turn);
+        let matches_open = state.open.iter().any(|open| &open.turn == turn);
         if matches_open && !state.ignore_cancel {
-            state.terminate(Outcome::Canceled);
+            state.terminate_turn(turn, Outcome::Canceled);
         }
         Ok(())
     }
@@ -311,7 +333,7 @@ impl Backend for MockBackend {
     fn shutdown(&mut self, grace: Duration) -> Result<(), BackendError> {
         let mut state = lock(&self.state);
         state.log.push(Command::Shutdown(grace));
-        state.terminate(crash_outcome("agent shut down with an open turn"));
+        state.terminate_all(|| crash_outcome("agent shut down with an open turn"));
         state.alive = false;
         Ok(())
     }
@@ -330,19 +352,19 @@ impl MockControl {
 
     /// Returns the open turn reference, if any.
     pub fn open_turn(&self) -> Option<TurnRef> {
-        lock(&self.state)
-            .open
-            .as_ref()
-            .map(|open| open.turn.clone())
+        lock(&self.state).open.first().map(|open| open.turn.clone())
     }
 
     /// Releases a held turn and runs its remaining steps.
     pub fn release(&self) {
         let mut state = lock(&self.state);
-        if let Some(open) = state.open.as_mut() {
-            open.held = false;
+        let sessions: Vec<TurnRef> = state.open.iter().map(|open| open.turn.clone()).collect();
+        for session in sessions {
+            if let Some(open) = state.open.iter_mut().find(|open| open.turn == session) {
+                open.held = false;
+            }
+            state.run(&session);
         }
-        state.run();
     }
 
     /// Makes `cancel` leave the turn open (cancel race, 0009-074).
@@ -350,10 +372,16 @@ impl MockControl {
         lock(&self.state).ignore_cancel = ignore;
     }
 
+    /// Sets how many turns the mock keeps open at once. The default `1` models a
+    /// one-turn-at-a-time agent; a larger limit models concurrent contexts (0005-054).
+    pub fn set_max_open(&self, limit: usize) {
+        lock(&self.state).max_open = limit;
+    }
+
     /// Simulates agent process death: ends any open turn with `Failed` `BACKEND_CRASHED` and marks the backend closed.
     pub fn crash(&self, detail: &str) {
         let mut state = lock(&self.state);
-        state.terminate(crash_outcome(detail));
+        state.terminate_all(|| crash_outcome(detail));
         state.alive = false;
     }
 
@@ -361,7 +389,7 @@ impl MockControl {
     /// The open turn of the prior incarnation is dropped without a terminal event (0009-008).
     pub fn restart(&self) {
         let mut state = lock(&self.state);
-        state.open = None;
+        state.open.clear();
         state.pending.clear();
         state.alive = true;
         state.restarts += 1;

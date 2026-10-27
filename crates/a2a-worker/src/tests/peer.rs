@@ -40,6 +40,7 @@ pub(crate) struct Mesh {
     pub(crate) child: TestWorker,
     pub(crate) parent_mock: MockControl,
     pub(crate) child_mock: MockControl,
+    pub(crate) parent_store: SharedStore,
 }
 
 /// Per-test knobs for the parent Worker. The child always uses default budgets.
@@ -77,7 +78,10 @@ pub(crate) fn mesh(spec: Spec) -> Mesh {
                 subjects: vec![SubjectPattern::parse("a2a.v1.*.ev.>").unwrap()],
                 retention_messages: None,
             }],
-            kv_buckets: Vec::new(),
+            kv_buckets: vec![
+                bus_api::name::Bucket::new(&tenant(), "cards").unwrap(),
+                bus_api::name::Bucket::new(&tenant(), "presence").unwrap(),
+            ],
             grants: mesh_grants(),
             ack_wait: Duration::from_secs(30),
             overload_retry_after: Duration::from_secs(1),
@@ -87,8 +91,21 @@ pub(crate) fn mesh(spec: Spec) -> Mesh {
     ));
     let (parent_backend, parent_mock) = MockBackend::new(capabilities());
     let (child_backend, child_mock) = MockBackend::new(capabilities());
-    let mut parent = node(&bus, PARENT, parent_backend, spec.parent_budget);
-    let mut child = node(&bus, CHILD, child_backend, Allowance::default());
+    let parent_store = SharedStore::default();
+    let mut parent = node(
+        &bus,
+        PARENT,
+        parent_backend,
+        spec.parent_budget,
+        parent_store.clone(),
+    );
+    let mut child = node(
+        &bus,
+        CHILD,
+        child_backend,
+        Allowance::default(),
+        SharedStore::default(),
+    );
     let parent_peers = spec.parent_peers.iter().map(|p| agent(p)).collect();
     parent
         .attach_delegation(DelegationConfig::new(
@@ -106,6 +123,7 @@ pub(crate) fn mesh(spec: Spec) -> Mesh {
         .unwrap();
     Mesh {
         bus,
+        parent_store,
         parent,
         child,
         parent_mock,
@@ -124,7 +142,47 @@ fn capabilities() -> Capabilities {
     }
 }
 
-fn node(bus: &MemBus, name: &str, backend: MockBackend, budget: Allowance) -> TestWorker {
+/// Card and presence publication for a mesh node, so `a2a_discover` can list it (RFC-0004).
+fn publication(name: &str) -> crate::presence::Publication {
+    use a2a_types::proto::a2a::{AgentCapabilities, AgentInterface, AgentSkill};
+    crate::presence::Publication {
+        card: a2a_types::proto::a2a::AgentCard {
+            name: name.to_owned(),
+            description: format!("{name} agent"),
+            version: "1.0.0".to_owned(),
+            supported_interfaces: vec![AgentInterface {
+                url: format!("bus://local/{name}"),
+                protocol_binding: "urn:a2abus:binding:bus:1".to_owned(),
+                tenant: "local".to_owned(),
+                protocol_version: "1.0".to_owned(),
+            }],
+            capabilities: Some(AgentCapabilities {
+                streaming: Some(true),
+                ..Default::default()
+            }),
+            default_input_modes: vec!["text/plain".to_owned()],
+            default_output_modes: vec!["text/plain".to_owned()],
+            skills: vec![AgentSkill {
+                id: "plan".to_owned(),
+                name: "plan".to_owned(),
+                description: "plans".to_owned(),
+                tags: vec!["plan".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        signing: crate::presence::CardSigning::Disabled,
+        timing: crate::presence::Timing::default(),
+    }
+}
+
+fn node(
+    bus: &MemBus,
+    name: &str,
+    backend: MockBackend,
+    budget: Allowance,
+    store: SharedStore,
+) -> TestWorker {
     let tasks = task::Config {
         owner: name.to_owned(),
         agent_deadline_ms: 3_600_000,
@@ -136,11 +194,12 @@ fn node(bus: &MemBus, name: &str, backend: MockBackend, budget: Allowance) -> Te
     };
     let builder = WorkerBuilder::new(tenant(), agent(name), principal(name), tasks)
         .approval(ApprovalMode::AskAll)
-        .working_directory(WORK_DIR, WorkspaceMode::PerSession);
+        .working_directory(WORK_DIR, WorkspaceMode::PerSession)
+        .publication(publication(name));
     block_on(builder.build(
         bus.clone(),
         backend,
-        SharedStore::default(),
+        store,
         Box::new(MeshClock(bus.control())),
     ))
     .unwrap()

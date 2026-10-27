@@ -18,8 +18,12 @@ use crate::presence;
 use crate::worker::Worker;
 use crate::workspace::WorkspaceBinding;
 
-/// Default number of non-terminal tasks before admission answers QUEUE_FULL (0005-028).
+/// Default number of turns open at once across all contexts (0005-054).
 pub const DEFAULT_MAX_ACTIVE: usize = 64;
+
+/// Default number of tasks waiting in one context before admission answers QUEUE_FULL
+/// (0005-028).
+pub const DEFAULT_MAX_WAITING_PER_CONTEXT: usize = 8;
 
 /// Approval modes the worker can enforce (RFC-0006 section 4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +49,11 @@ pub struct WorkerConfig {
     pub tasks: task::Config,
     /// Approval mode in effect.
     pub approval: ApprovalMode,
-    /// Active-task count at which admission answers QUEUE_FULL.
+    /// Turns open at once across all contexts (0005-054).
     pub max_active: usize,
+    /// Tasks waiting in one (origin, context_id) at which admission answers QUEUE_FULL
+    /// (0005-028). A context's first task is never refused for queue depth.
+    pub max_waiting_per_context: usize,
     /// Largest payload carried inline; larger ones go through blobs.
     pub max_inline: usize,
     /// Workspace lease binding (RFC-0012 sections 4.8 and 4.9); `None` runs turns without leases.
@@ -69,7 +76,7 @@ pub struct WorkerBuilder {
 
 impl WorkerBuilder {
     /// Starts a builder with defaults: `ask-all`, the default envelope configuration and
-    /// `DEFAULT_MAX_ACTIVE` pressure threshold.
+    /// `DEFAULT_MAX_WAITING_PER_CONTEXT` queue quota.
     #[must_use]
     pub fn new(
         tenant: TenantId,
@@ -87,6 +94,7 @@ impl WorkerBuilder {
                 tasks,
                 approval: ApprovalMode::AskAll,
                 max_active: DEFAULT_MAX_ACTIVE,
+                max_waiting_per_context: DEFAULT_MAX_WAITING_PER_CONTEXT,
                 max_inline: envelope::MAX_INLINE_BYTES,
                 workspace: None,
                 publication: None,
@@ -118,10 +126,18 @@ impl WorkerBuilder {
         self
     }
 
-    /// Sets the QUEUE_FULL threshold on active tasks.
+    /// Sets the number of turns that may run at once across all contexts (0005-054).
     #[must_use]
     pub fn max_active(mut self, limit: usize) -> Self {
         self.config.max_active = limit;
+        self
+    }
+
+    /// Sets the waiting-task quota per (origin, context_id) at which admission answers
+    /// QUEUE_FULL (0005-028).
+    #[must_use]
+    pub fn max_waiting_per_context(mut self, limit: usize) -> Self {
+        self.config.max_waiting_per_context = limit;
         self
     }
 

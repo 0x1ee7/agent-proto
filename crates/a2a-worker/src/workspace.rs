@@ -474,4 +474,27 @@ mod tests {
         drop(hook);
         let _ = fs::remove_dir_all(base);
     }
+
+    /// RFC-0006 0006-006: an approval raised under a held lease reports the lease path and
+    /// its workspace mode; a task without a lease has no lease context, so the configured
+    /// directory and mode apply.
+    #[test]
+    fn req_0006_006_lease_context_supplies_path_and_mode() {
+        let (mut hook, base) = hook(WorkspaceMode::PerSession, "lease-ctx");
+        assert!(
+            hook.lease_context(TASK_1).is_none(),
+            "no lease, no lease context"
+        );
+        hook.acquire(TASK_1, CONTEXT).expect("acquire");
+        let path = hook.lease_of(TASK_1).expect("lease").path().to_path_buf();
+        let (dir, mode) = hook.lease_context(TASK_1).expect("lease context");
+        assert_eq!(dir, path.to_string_lossy());
+        assert_eq!(mode, mode_token(WorkspaceMode::PerSession));
+        assert!(
+            hook.lease_context(TASK_2).is_none(),
+            "other tasks hold nothing"
+        );
+        drop(hook);
+        let _ = fs::remove_dir_all(base);
+    }
 }

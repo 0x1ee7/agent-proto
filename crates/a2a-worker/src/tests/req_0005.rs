@@ -153,3 +153,57 @@ fn req_0005_054_same_context_turn_waits_for_holder() {
         assert_eq!(count_commands(mock, |c| matches!(c, Command::Start(_))), 2);
     });
 }
+
+/// RFC-0005 0005-028: admission refuses a task with QUEUE_FULL once its context has
+/// `quota` tasks waiting; the refused task is REJECTED and starts no backend turn.
+#[test]
+fn req_0005_028_queue_full_is_a_per_context_quota() {
+    let mut rig = rig_with_quota(ApprovalMode::AskAll, 3_600_000, 2);
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold]);
+        let first = submit(bus, "first").await;
+        wait_for_state(bus, &first.id, pb::TaskState::Working).await;
+        let second = submit_in(bus, &first.context_id, "second").await;
+        let third = submit_in(bus, &first.context_id, "third").await;
+        assert_eq!(state(&second), pb::TaskState::Submitted as i32);
+        assert_eq!(state(&third), pb::TaskState::Submitted as i32);
+
+        let fourth = submit_in(bus, &first.context_id, "fourth").await;
+        assert_eq!(state(&fourth), pb::TaskState::Rejected as i32);
+        assert_eq!(
+            count_commands(mock, |c| matches!(c, Command::Start(_))),
+            1,
+            "the refused task starts no backend turn"
+        );
+    });
+}
+
+/// RFC-0005 0005-054: turns of different contexts run concurrently; a turn queued behind an
+/// open turn of its own context waits, so each context stays FIFO.
+#[test]
+fn req_0005_054_contexts_run_concurrently_and_each_context_stays_fifo() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    mock.set_max_open(8);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold]);
+        let held = submit(bus, "held").await;
+        wait_for_state(bus, &held.id, pb::TaskState::Working).await;
+
+        // A fresh context runs to completion while the first context's turn stays open.
+        mock.enqueue(vec![completed()]);
+        let other = submit(bus, "other context").await;
+        wait_for_state(bus, &other.id, pb::TaskState::Completed).await;
+        assert_eq!(state(&get(bus, &held.id).await), WORKING);
+
+        // Same context as the held turn: admitted behind it and not started.
+        let queued = submit_in(bus, &held.context_id, "queued").await;
+        assert_eq!(state(&queued), pb::TaskState::Submitted as i32);
+        assert_eq!(
+            count_commands(mock, |c| matches!(c, Command::Start(_))),
+            2,
+            "only the held and the other-context turns started"
+        );
+    });
+}

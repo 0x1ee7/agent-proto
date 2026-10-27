@@ -274,7 +274,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         // full queue must not take precedence over it, so only the ancestors are consulted here.
         let reentrant = budget::chain_before_self(&chain, agent)
             .is_some_and(|ancestors| budget::is_reentrant(ancestors, agent));
-        let pressure = if !reentrant && self.tasks.active_count() >= self.config.max_active {
+        // 0005-028: a full waiting queue for this (origin, context_id) refuses the submission.
+        let waiting = self.waiting_in_context(&head.origin, &context_id);
+        let pressure = if !reentrant && waiting >= self.config.max_waiting_per_context {
             Some(FailureCode::QueueFull)
         } else {
             None

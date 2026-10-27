@@ -450,6 +450,16 @@ struct Delta {
     admit: Vec<Admit>,
     breakers: Option<Breakers>,
     approvals: Option<ApprovalBook>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extensions: Vec<Extension>,
+}
+
+/// Opaque owner record persisted beside the task deltas. Core keeps the payload verbatim
+/// and never reads it into task state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Extension {
+    owner: String,
+    payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -541,6 +551,7 @@ pub struct Tasks<S: TaskStore> {
     messages: BTreeMap<String, BTreeMap<String, String>>,
     breakers: Breakers,
     approvals: ApprovalBook,
+    extensions: Vec<Extension>,
 }
 
 fn state_of(raw: i32) -> TaskState {
@@ -696,6 +707,7 @@ impl<S: TaskStore> Tasks<S> {
             messages: BTreeMap::new(),
             breakers: Breakers::default(),
             approvals: ApprovalBook::default(),
+            extensions: Vec::new(),
         };
         for record in core.store.records()? {
             let delta: Delta =
@@ -840,10 +852,12 @@ impl<S: TaskStore> Tasks<S> {
             admit,
             breakers,
             approvals,
+            extensions,
         } = delta;
         for (task_id, rec) in upsert {
             self.tasks.insert(task_id, rec);
         }
+        self.extensions.extend(extensions);
         for event in events {
             self.events
                 .entry(event.task_id.clone())
@@ -1642,6 +1656,33 @@ impl<S: TaskStore> Tasks<S> {
     #[must_use]
     pub fn artifacts(&self, task_id: &str) -> Option<&[TaskArtifact]> {
         self.tasks.get(task_id).map(|rec| rec.artifacts.as_slice())
+    }
+
+    /// Appends an opaque extension record of `owner` to the store (durable). Core never reads
+    /// the payload; the worker uses this for its own records, such as the delegation journal.
+    pub fn append_extension(
+        &mut self,
+        owner: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), TaskError> {
+        let delta = Delta {
+            extensions: vec![Extension {
+                owner: owner.to_owned(),
+                payload,
+            }],
+            ..Delta::default()
+        };
+        self.write(delta)
+    }
+
+    /// Extension records of `owner` in append order, replayed from the store on open.
+    #[must_use]
+    pub fn extensions(&self, owner: &str) -> Vec<&serde_json::Value> {
+        self.extensions
+            .iter()
+            .filter(|e| e.owner == owner)
+            .map(|e| &e.payload)
+            .collect()
     }
 
     /// Breaker status of an origin (RFC-0006 [0006-048]) for the RFC-0015 send path
@@ -3766,5 +3807,28 @@ mod tests {
         ));
         assert_eq!(state(&tasks, &id), TaskState::Failed);
         assert_eq!(failure_code(&tasks, &id), Some(FailureCode::BackendCrashed));
+    }
+
+    #[test]
+    fn req_0015_062_extension_records_round_trip_through_reopen() {
+        let mut tasks = fresh();
+        tasks
+            .append_extension("omp", serde_json::json!({"seq": 1, "key": "k1"}))
+            .expect("append");
+        tasks
+            .append_extension("other", serde_json::json!({"seq": 9}))
+            .expect("append");
+        tasks
+            .append_extension("omp", serde_json::json!({"seq": 2, "key": "k2"}))
+            .expect("append");
+        assert_eq!(tasks.extensions("omp").len(), 2);
+        let (reopened, effects) = reopen(tasks, T0 + 1);
+        assert!(effects.is_empty(), "extension records start no work");
+        let omp = reopened.extensions("omp");
+        assert_eq!(omp.len(), 2);
+        assert_eq!(omp[0]["seq"], 1);
+        assert_eq!(omp[1]["key"], "k2");
+        assert_eq!(reopened.extensions("other")[0]["seq"], 9);
+        assert!(reopened.extensions("nobody").is_empty());
     }
 }

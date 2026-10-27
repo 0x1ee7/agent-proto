@@ -111,8 +111,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Ok(prepared) => prepared,
             Err(err) => return Ok(Err(err)),
         };
-        let child_id = match self.tasks.delegate(task) {
-            Ok((id, _allowance)) => id,
+        let (child_id, allowance) = match self.tasks.delegate(task) {
+            Ok(created) => created,
             Err(TaskError::Delegation(refused)) => {
                 return Ok(Err(budget_exhausted(dimension_of(&refused))));
             }
@@ -120,6 +120,22 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         };
         if let Some(binding) = self.peers.bindings.get_mut(task) {
             binding.sends.admit(now);
+        }
+        // 0015-062: the child is recorded durably before its message is sent (0015-063 entry).
+        let entry = serde_json::json!({
+            "parent": task,
+            "key": params.idempotency_key,
+            "child": child_id,
+            "target": prepared.target.as_str(),
+            "allowance": allowance,
+        });
+        if self
+            .tasks
+            .append_extension(super::JOURNAL_OWNER, entry)
+            .is_err()
+        {
+            self.settle_unsent(task, &child_id, now, effects)?;
+            return Ok(Err(unavailable()));
         }
         let sent = self
             .await_peer(
@@ -156,7 +172,11 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         );
         self.audit(
             Some(task),
-            format!("DELEGATION_CHILD_CREATED {}", prepared.target.as_str()),
+            format!(
+                "DELEGATION_CHILD_CREATED child={child_id} target={} chain_length={}",
+                prepared.target.as_str(),
+                prepared.hop
+            ),
         );
         Ok(Ok((child_id, remote)))
     }

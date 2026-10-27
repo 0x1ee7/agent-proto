@@ -84,6 +84,8 @@ pub struct Worker<B: Bus, D: Backend, S: TaskStore> {
     pub(crate) open: BTreeMap<String, u64>,
     /// Kill deadlines for turns that were asked to cancel.
     pub(crate) cancel_deadlines: BTreeMap<String, u64>,
+    /// Completed turns whose end waits for open delegated children (0015-067).
+    pub(crate) deferred_ends: BTreeMap<String, StopReason>,
     /// Backend permission requests keyed by the approval request id that answers them.
     pub(crate) permissions: BTreeMap<String, Vec<Offered>>,
     pub(crate) restarts_seen: u32,
@@ -129,6 +131,11 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         if config.max_active == 0 {
             return Err(WorkerError::Config("max_active must be at least 1"));
         }
+        if config.max_waiting_per_context == 0 {
+            return Err(WorkerError::Config(
+                "max_waiting_per_context must be at least 1",
+            ));
+        }
         let now = clock.now_ms().ok_or(WorkerError::Clock)?;
         let workspace = WorkspaceHook::for_config(&config)?;
         if config.working_directory.as_os_str().is_empty() {
@@ -156,6 +163,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             pending: BTreeMap::new(),
             queue: VecDeque::new(),
             open: BTreeMap::new(),
+            deferred_ends: BTreeMap::new(),
             cancel_deadlines: BTreeMap::new(),
             permissions: BTreeMap::new(),
             restarts_seen,
@@ -400,10 +408,23 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
     }
 
+    /// Tasks of (origin, context_id) waiting in the queue for an open turn. Admission uses
+    /// this count for the QUEUE_FULL quota (0005-028).
+    pub(crate) fn waiting_in_context(&self, origin: &str, context_id: &str) -> usize {
+        self.queue
+            .iter()
+            .filter(|task| {
+                self.tasks
+                    .task_owner(task)
+                    .is_some_and(|owner| owner.origin == origin && owner.context_id == context_id)
+            })
+            .count()
+    }
+
     /// Starts queued tasks whose context has no open turn (0005-054). Turns of one
     /// (origin, context_id) run one at a time, in admission order; turns of different contexts
     /// run concurrently (0009-020).
-    fn dispatch_next(&mut self, now: u64) -> Result<Vec<Effect>, WorkerError> {
+    pub(crate) fn dispatch_next(&mut self, now: u64) -> Result<Vec<Effect>, WorkerError> {
         let mut out = Vec::new();
         while self.open.len() < self.config.max_active {
             let Some(pos) = self.queue.iter().position(|task| !self.context_held(task)) else {
@@ -701,6 +722,13 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             }
             BackendEvent::Terminal { outcome, .. } => {
                 let reason = wire::stop_reason(&outcome);
+                // 0015-067: a completed parent waits for its open children before COMPLETED.
+                if reason == StopReason::EndTurn && self.has_open_children(&turn) {
+                    self.open.remove(&turn);
+                    self.cancel_deadlines.remove(&turn);
+                    self.deferred_ends.insert(turn, reason);
+                    return Ok(Vec::new());
+                }
                 self.close_turn(&turn, reason, now)
             }
             BackendEvent::Fault { .. } => Ok(Vec::new()),

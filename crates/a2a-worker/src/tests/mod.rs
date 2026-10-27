@@ -263,6 +263,15 @@ pub(crate) fn rig() -> Rig {
 }
 
 pub(crate) fn rig_with(approval: ApprovalMode, agent_deadline_ms: u64) -> Rig {
+    rig_with_quota(
+        approval,
+        agent_deadline_ms,
+        crate::config::DEFAULT_MAX_WAITING_PER_CONTEXT,
+    )
+}
+
+/// A rig whose per-context waiting quota is `quota` (0005-028).
+pub(crate) fn rig_with_quota(approval: ApprovalMode, agent_deadline_ms: u64, quota: usize) -> Rig {
     let bus = MemBus(Arc::new(
         BusMem::new(MemConfig {
             seed: 7,
@@ -300,6 +309,7 @@ pub(crate) fn rig_with(approval: ApprovalMode, agent_deadline_ms: u64) -> Rig {
     };
     let builder = WorkerBuilder::new(tenant(), agent(WORKER), principal(WORKER), tasks)
         .approval(approval)
+        .max_waiting_per_context(quota)
         .working_directory(WORK_DIR, WorkspaceMode::PerSession);
     let worker = block_on(builder.build(
         bus.clone(),

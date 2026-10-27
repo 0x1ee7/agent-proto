@@ -10,13 +10,14 @@ mod policy;
 mod result;
 mod send;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
 use a2a_client::{CallOptions, Client, Config as ClientConfig};
 use a2a_core::budget::Usage;
+use a2a_core::envelope::{Clock, SystemClock};
 use a2a_core::task::{ChildEnd, Effect, TaskError, TaskStore};
 use a2a_mcp::ipc::{
     ClientFrame, GRANT_CREDENTIAL_BYTES, GRANT_ID_BYTES, IpcError, Response, SESSION_SLOT_BYTES,
@@ -108,11 +109,81 @@ impl DelegationConfig {
     }
 }
 
-/// Grant table shared with the IPC server. Revocation is visible immediately.
-#[derive(Debug, Default)]
+/// Failed authentications within [`LOCKOUT_WINDOW_MS`] that start a lockout (0015-043).
+const LOCKOUT_FAILURES: usize = 5;
+/// Length of the failure window and of the lockout, in milliseconds (0015-043).
+const LOCKOUT_WINDOW_MS: u64 = 60_000;
+/// Owner of the delegation journal records in the task store (0015-062, 0015-063).
+pub(crate) const JOURNAL_OWNER: &str = "a2a-worker.delegation";
+
+/// Grant table shared with the IPC server. Revocation is visible immediately. Failed
+/// authentications are counted across connections; after [`LOCKOUT_FAILURES`] within a
+/// window, every authentication is refused until the lockout ends (0015-043).
 pub(crate) struct GrantBook {
     grants: BTreeMap<String, Grant>,
     stopped: bool,
+    clock: Arc<dyn Clock>,
+    /// Times of recent failed authentications inside the window.
+    failures: VecDeque<u64>,
+    /// Authentication is refused while `now` is before this time, in milliseconds.
+    locked_until: u64,
+}
+
+impl Default for GrantBook {
+    fn default() -> Self {
+        Self::new(Arc::new(SystemClock))
+    }
+}
+
+impl GrantBook {
+    pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            grants: BTreeMap::new(),
+            stopped: false,
+            clock,
+            failures: VecDeque::new(),
+            locked_until: 0,
+        }
+    }
+
+    /// Checks a grant id, credential and slot without counting failures.
+    fn verify(
+        &self,
+        grant_id: &str,
+        credential: &Secret,
+        session_slot: &str,
+    ) -> Result<(), IpcError> {
+        let grant = self.grants.get(grant_id);
+        let expected = grant.map_or("", |g| g.credential.as_str());
+        let matches = constant_time_eq(expected.as_bytes(), credential.expose().as_bytes());
+        let Some(grant) = grant.filter(|_| matches) else {
+            return Err(IpcError::new(reason::UNAUTHENTICATED));
+        };
+        if self.stopped || !grant.live {
+            return Err(IpcError::new(reason::GRANT_REVOKED));
+        }
+        if grant.slot != session_slot {
+            return Err(IpcError::new(reason::SLOT_UNBOUND));
+        }
+        Ok(())
+    }
+
+    /// Records a failed authentication at `now`. The fifth failure within the window starts
+    /// a lockout and clears the count.
+    fn record_failure(&mut self, now: u64) {
+        while self
+            .failures
+            .front()
+            .is_some_and(|t| now.saturating_sub(*t) >= LOCKOUT_WINDOW_MS)
+        {
+            self.failures.pop_front();
+        }
+        self.failures.push_back(now);
+        if self.failures.len() >= LOCKOUT_FAILURES {
+            self.failures.clear();
+            self.locked_until = now.saturating_add(LOCKOUT_WINDOW_MS);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -132,23 +203,22 @@ impl GrantTable for Grants {
         credential: &Secret,
         session_slot: &str,
     ) -> Result<(), IpcError> {
-        let book = self
+        let mut book = self
             .0
             .lock()
             .map_err(|_| IpcError::new(reason::UNAVAILABLE))?;
-        let grant = book.grants.get(grant_id);
-        let expected = grant.map_or("", |g| g.credential.as_str());
-        let matches = constant_time_eq(expected.as_bytes(), credential.expose().as_bytes());
-        let Some(grant) = grant.filter(|_| matches) else {
+        let now = book
+            .clock
+            .now_ms()
+            .ok_or_else(|| IpcError::new(reason::UNAVAILABLE))?;
+        if now < book.locked_until {
             return Err(IpcError::new(reason::UNAUTHENTICATED));
-        };
-        if book.stopped || !grant.live {
-            return Err(IpcError::new(reason::GRANT_REVOKED));
         }
-        if grant.slot != session_slot {
-            return Err(IpcError::new(reason::SLOT_UNBOUND));
+        let outcome = book.verify(grant_id, credential, session_slot);
+        if outcome.is_err() {
+            book.record_failure(now);
         }
-        Ok(())
+        outcome
     }
 }
 
@@ -252,6 +322,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             .ok_or(WorkerError::Config("delegation endpoint is not UTF-8"))?
             .to_owned();
         let peers = Peers {
+            grants: Arc::new(Mutex::new(GrantBook::new(Arc::clone(&self.clock)))),
             endpoint: Some(PeerEndpoint {
                 endpoint: config.endpoint.clone(),
                 shim_path: config.shim_path.clone(),
@@ -538,6 +609,45 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         Ok(())
     }
 
+    /// Whether `parent` has a delegated child that has not settled (0015-067).
+    pub(crate) fn has_open_children(&self, parent: &str) -> bool {
+        self.delegation.as_ref().is_some_and(|d| {
+            d.children
+                .values()
+                .any(|c| c.parent == parent && c.settled.is_none())
+        })
+    }
+
+    /// Commits a deferred COMPLETED once `parent` has no open child left (0015-067). A parent that
+    /// already ended, for example through a child failure (0015-070), drops the deferred end.
+    pub(crate) fn finish_deferred(
+        &mut self,
+        d: &Delegation<B>,
+        parent: &str,
+        now: u64,
+        effects: &mut Vec<Effect>,
+    ) -> Result<(), WorkerError> {
+        let open = d
+            .children
+            .values()
+            .any(|c| c.parent == parent && c.settled.is_none());
+        if open || !self.deferred_ends.contains_key(parent) {
+            return Ok(());
+        }
+        let Some(reason) = self.deferred_ends.remove(parent) else {
+            return Ok(());
+        };
+        match self.commit_turn_end(parent, reason, now) {
+            Ok(new_effects) => effects.extend(new_effects),
+            Err(WorkerError::Tasks(
+                TaskError::NotActive | TaskError::Terminal | TaskError::NotFound,
+            )) => {}
+            Err(err) => return Err(err),
+        }
+        effects.extend(self.dispatch_next(now)?);
+        Ok(())
+    }
+
     /// Applies a remote child's observed state. A terminal state settles the child
     /// in the parent task and answers every waiting call.
     pub(crate) fn observe(
@@ -589,15 +699,20 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             Err(TaskError::NotActive | TaskError::Terminal | TaskError::NotFound) => {}
             Err(err) => return Err(WorkerError::Tasks(err)),
         }
+        let chain_length = d.children.get(child_id).map_or(0, |c| c.chain_length);
         if let Some(child) = d.children.get_mut(child_id) {
             for waiter in child.waiters.drain(..) {
                 respond_outcome(waiter.request, &settled);
             }
             child.settled = Some(settled);
         }
+        self.finish_deferred(d, &parent, now, effects)?;
         self.audit(
             Some(&parent),
-            format!("DELEGATION_CHILD_SETTLED {}", result::state_name(state)),
+            format!(
+                "DELEGATION_CHILD_SETTLED {} child={child_id} chain_length={chain_length}",
+                result::state_name(state)
+            ),
         );
         Ok(())
     }
@@ -677,4 +792,82 @@ fn random_token<const N: usize>() -> Result<String, WorkerError> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).map_err(|_| WorkerError::Config("random source unavailable"))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    /// Clock the test moves by hand.
+    struct ManualClock(AtomicU64);
+
+    impl Clock for ManualClock {
+        fn now_ms(&self) -> Option<u64> {
+            Some(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    const ID: &str = "grant-1";
+    const CREDENTIAL: &str = "correct-credential";
+    const SLOT: &str = "slot-1";
+
+    fn table(clock: Arc<ManualClock>) -> Grants {
+        let mut book = GrantBook::new(clock);
+        book.grants.insert(
+            ID.to_owned(),
+            Grant {
+                credential: CREDENTIAL.to_owned(),
+                slot: SLOT.to_owned(),
+                live: true,
+            },
+        );
+        Grants(Arc::new(Mutex::new(book)))
+    }
+
+    fn auth(grants: &Grants, credential: &str) -> Result<(), IpcError> {
+        grants.authenticate(ID, &Secret::new(credential), SLOT)
+    }
+
+    fn code(result: Result<(), IpcError>) -> String {
+        match result {
+            Ok(()) => "ok".to_owned(),
+            Err(err) => err.reason,
+        }
+    }
+
+    /// RFC-0015 0015-043: five failed authentications, across connections, lock out every
+    /// authentication for 60 s; the window of failures is measured on the injected clock.
+    #[test]
+    fn req_0015_043_five_failures_lock_out_for_sixty_seconds() {
+        let clock = Arc::new(ManualClock(AtomicU64::new(1_000)));
+        let grants = table(Arc::clone(&clock));
+        for _ in 0..5 {
+            assert_eq!(code(auth(&grants, "wrong")), reason::UNAUTHENTICATED);
+        }
+        clock.0.store(30_000, Ordering::SeqCst);
+        assert_eq!(
+            code(auth(&grants, CREDENTIAL)),
+            reason::UNAUTHENTICATED,
+            "correct credential is refused during the lockout"
+        );
+        clock.0.store(61_000 - 1, Ordering::SeqCst);
+        assert_eq!(code(auth(&grants, CREDENTIAL)), reason::UNAUTHENTICATED);
+        clock.0.store(61_000, Ordering::SeqCst);
+        assert_eq!(code(auth(&grants, CREDENTIAL)), "ok");
+    }
+
+    /// RFC-0015 0015-043: failures older than the window do not count toward a lockout.
+    #[test]
+    fn req_0015_043_old_failures_do_not_lock_out() {
+        let clock = Arc::new(ManualClock(AtomicU64::new(0)));
+        let grants = table(Arc::clone(&clock));
+        for _ in 0..4 {
+            assert_eq!(code(auth(&grants, "wrong")), reason::UNAUTHENTICATED);
+        }
+        clock.0.store(60_000, Ordering::SeqCst);
+        assert_eq!(code(auth(&grants, "wrong")), reason::UNAUTHENTICATED);
+        assert_eq!(code(auth(&grants, CREDENTIAL)), "ok");
+    }
 }

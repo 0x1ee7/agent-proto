@@ -1,7 +1,9 @@
 //! RFC-0015 delegation scenarios: a parent and a child Worker on one bus-mem bus.
 
 use a2a_mcp::client::{CallOutcome, ClientConfig};
-use a2a_mcp::ipc::{MAX_RESULT_TEXT_BYTES, Secret, Wait, reason};
+use a2a_mcp::ipc::{
+    ClientFrame, DiscoverParams, DiscoverResult, MAX_RESULT_TEXT_BYTES, Secret, Wait, reason,
+};
 
 use super::peer::*;
 use super::*;
@@ -178,7 +180,8 @@ fn req_0015_048_idempotency_key_replays_the_same_child() {
 fn req_0015_046_cancel_call_stops_waiting_without_cancelling_child() {
     let mut m = mesh(Spec::default());
     let h = m.handles();
-    m.child_mock.enqueue(vec![Step::Hold]);
+    m.child_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
     m.parent_mock
         .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
     drive_mesh(&mut m, async move {
@@ -193,6 +196,7 @@ fn req_0015_046_cancel_call_stops_waiting_without_cancelling_child() {
             "cancel-call must not cancel the child"
         );
         h.parent.release();
+        h.child.release();
         until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
     });
 }
@@ -234,8 +238,6 @@ fn req_0015_065_child_input_required_passes_through() {
         assert_eq!(result.state, "INPUT_REQUIRED");
         let parent_now = get_from(&h.bus, PARENT, &parent.id).await;
         assert_eq!(state(&parent_now), pb::TaskState::Working as i32);
-        h.parent.release();
-        until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
     });
 }
 
@@ -405,6 +407,33 @@ fn req_0015_043_wrong_credential_is_unauthenticated() {
     });
 }
 
+/// 0015-043: after five failed authentications the endpoint refuses even the right credential.
+#[test]
+fn req_0015_043_lockout_refuses_the_correct_credential_over_ipc() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.parent_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "lockout").await;
+        let tools = peer_tools(&h.parent).await;
+        for _ in 0..5 {
+            let config = ClientConfig {
+                endpoint: tools.endpoint.to_string_lossy().into_owned(),
+                grant_id: tools.grant_id.clone(),
+                credential: Some(Secret::new("not-the-credential".to_owned())),
+                session_slot: tools.slot.clone(),
+            };
+            let mut call = ipc_call_with(config, send_frame(CHILD, "x", "k1", Wait::Blocking));
+            assert_eq!(refusal(finished(&mut call).await), reason::UNAUTHENTICATED);
+        }
+        let mut call = ipc_call(&tools, send_frame(CHILD, "x", "k1", Wait::Blocking));
+        assert_eq!(refusal(finished(&mut call).await), reason::UNAUTHENTICATED);
+        h.parent.release();
+        until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
+    });
+}
+
 /// 0015-060: a call whose task is WORKING cannot see its own provenance as trusted, and
 /// the child answer is labelled with its source agent.
 #[test]
@@ -424,4 +453,240 @@ fn req_0015_060_result_provenance_names_the_source_agent() {
         h.parent.release();
         until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
     });
+}
+
+fn expect_discover(outcome: CallOutcome) -> DiscoverResult {
+    match outcome {
+        CallOutcome::Done(Ok(response)) => response
+            .into_result::<DiscoverResult>()
+            .unwrap_or_else(|err| panic!("discover refused: {}", err.reason)),
+        other => panic!("discover did not complete: {}", refusal_of(other)),
+    }
+}
+
+fn refusal_of(outcome: CallOutcome) -> String {
+    match outcome {
+        CallOutcome::Done(Err(err)) => err.reason,
+        CallOutcome::Done(Ok(response)) => format!("ok={} {:?}", response.ok, response.error),
+        CallOutcome::Cancelled => "cancelled".to_owned(),
+    }
+}
+
+/// RFC-0015 0015-110: with no peers, `a2a_discover` lists nothing and `a2a_send` is refused
+/// with PERMISSION_DENIED, creating no child.
+#[test]
+fn req_0015_110_empty_peer_list_refuses_send_and_lists_nothing() {
+    let mut m = mesh(Spec {
+        parent_peers: vec![],
+        ..Spec::default()
+    });
+    let h = m.handles();
+    m.parent_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    drive_mesh(&mut m, async move {
+        submit_to(&h.bus, PARENT, "start").await;
+        let tools = peer_tools(&h.parent).await;
+
+        let mut listed = ipc_call(
+            &tools,
+            ClientFrame::Discover {
+                id: 1,
+                deadline_ms: 5_000,
+                params: DiscoverParams::default(),
+            },
+        );
+        assert!(
+            expect_discover(finished(&mut listed).await)
+                .peers
+                .is_empty()
+        );
+
+        let mut sent = ipc_call(
+            &tools,
+            send_frame(CHILD, "compute", "k-empty", Wait::Blocking),
+        );
+        assert_eq!(
+            refusal(finished(&mut sent).await),
+            reason::PERMISSION_DENIED
+        );
+        assert_eq!(
+            count_commands(&h.child, |c| matches!(c, crate::mock::Command::Start(_))),
+            0,
+            "no child may be created"
+        );
+        h.parent.release();
+    });
+}
+
+/// RFC-0015 0015-111: discover answers only with allowlisted peers, and the skill filter
+/// narrows the list (0015-110 to 0015-113).
+#[test]
+fn req_0015_111_discover_lists_only_allowlisted_peers() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.parent_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    drive_mesh(&mut m, async move {
+        submit_to(&h.bus, PARENT, "start").await;
+        let tools = peer_tools(&h.parent).await;
+
+        let mut all = ipc_call(
+            &tools,
+            ClientFrame::Discover {
+                id: 2,
+                deadline_ms: 5_000,
+                params: DiscoverParams::default(),
+            },
+        );
+        let peers = expect_discover(finished(&mut all).await).peers;
+        assert!(!peers.is_empty(), "the allowlisted child is listed");
+        assert!(
+            peers.iter().all(|p| p.agent == CHILD),
+            "only allowlisted agents are listed"
+        );
+
+        let mut none = ipc_call(
+            &tools,
+            ClientFrame::Discover {
+                id: 3,
+                deadline_ms: 5_000,
+                params: DiscoverParams {
+                    skill: Some("no-such-skill".to_owned()),
+                    ..DiscoverParams::default()
+                },
+            },
+        );
+        assert!(expect_discover(finished(&mut none).await).peers.is_empty());
+        h.parent.release();
+    });
+}
+
+/// 0015-058: the return to an agent already in the chain is refused with LOOP_DETECTED, and the
+/// refused return creates no child: the child is started exactly once.
+#[test]
+fn req_0015_058_return_to_chain_creates_no_child() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.parent_mock.enqueue(vec![Step::Hold]);
+    m.child_mock.enqueue(vec![Step::Hold]);
+    drive_mesh(&mut m, async move {
+        let _parent = submit_to(&h.bus, PARENT, "ping").await;
+        let parent_tools = peer_tools(&h.parent).await;
+        let mut to_child = ipc_call(&parent_tools, send_frame(CHILD, "b", "k1", Wait::Blocking));
+        let child_tools = peer_tools(&h.child).await;
+        let mut back = ipc_call(&child_tools, send_frame(PARENT, "a", "k2", Wait::Blocking));
+        assert_eq!(refusal(finished(&mut back).await), reason::LOOP_DETECTED);
+        let starts = h
+            .child
+            .commands()
+            .iter()
+            .filter(|c| matches!(c, Command::Start(_)))
+            .count();
+        assert_eq!(starts, 1, "the refused return must not create a child");
+        finished(&mut to_child).await;
+    });
+}
+
+/// 0015-067: a parent that completes while its child is running stays non-terminal until the
+/// child is terminal, then completes.
+#[test]
+fn req_0015_067_parent_stays_open_until_child_terminal() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.child_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    m.parent_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "fan-out").await;
+        let tools = peer_tools(&h.parent).await;
+        let mut call = ipc_call(&tools, send_frame(CHILD, "x", "k1", Wait::Return));
+        expect_result(finished(&mut call).await);
+        h.parent.release();
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        let task = get_from(&h.bus, PARENT, &parent.id).await;
+        assert_ne!(
+            state(&task),
+            pb::TaskState::Completed as i32,
+            "parent must not complete while its child runs"
+        );
+        h.child.release();
+        until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
+    });
+}
+
+/// 0015-075: each delegation outcome writes one audit note with the child id, target and chain
+/// length, and no message text.
+#[test]
+fn req_0015_075_each_outcome_writes_one_audit_note() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.child_mock.enqueue(vec![
+        text("secret-body"),
+        Step::Terminal(Outcome::Completed),
+    ]);
+    m.parent_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "audit").await;
+        let tools = peer_tools(&h.parent).await;
+        let mut ok = ipc_call(&tools, send_frame(CHILD, "x", "k1", Wait::Blocking));
+        finished(&mut ok).await;
+        let mut bad = ipc_call(&tools, send_frame(OUTSIDER, "x", "k2", Wait::Blocking));
+        assert_eq!(refusal(finished(&mut bad).await), reason::PERMISSION_DENIED);
+        h.parent.release();
+        until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
+    });
+    let notes = m.parent.take_audit();
+    let count = |prefix: &str| {
+        notes
+            .iter()
+            .filter(|n| n.reason.starts_with(prefix))
+            .count()
+    };
+    assert_eq!(count("DELEGATION_CHILD_CREATED"), 1);
+    assert_eq!(count("DELEGATION_CHILD_SETTLED"), 1);
+    assert_eq!(count("DELEGATION_REFUSED"), 1);
+    let created = notes
+        .iter()
+        .find(|n| n.reason.starts_with("DELEGATION_CHILD_CREATED"))
+        .expect("created note");
+    assert!(created.reason.contains("child=") && created.reason.contains("chain_length="));
+    assert!(notes.iter().all(|n| !n.reason.contains("secret-body")));
+}
+
+/// 0015-063: each created child has one journal entry holding its target and allowance, written
+/// before the child message is sent (0015-062).
+#[test]
+fn req_0015_063_journal_holds_one_entry_per_child_with_allowance() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.child_mock
+        .enqueue(vec![Step::Terminal(Outcome::Completed)]);
+    m.parent_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "journal").await;
+        let tools = peer_tools(&h.parent).await;
+        let mut call = ipc_call(&tools, send_frame(CHILD, "x", "k1", Wait::Blocking));
+        expect_result(finished(&mut call).await);
+        h.parent.release();
+        until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
+    });
+    let entries: Vec<String> = m
+        .parent_store
+        .records()
+        .unwrap()
+        .iter()
+        .map(|raw| String::from_utf8_lossy(raw).into_owned())
+        .filter(|text| text.contains(crate::delegation::JOURNAL_OWNER))
+        .collect();
+    assert_eq!(entries.len(), 1, "one journal entry per created child");
+    assert!(
+        entries[0].contains("allowance"),
+        "entry carries the allowance"
+    );
+    assert!(entries[0].contains(CHILD), "entry names the child target");
 }
