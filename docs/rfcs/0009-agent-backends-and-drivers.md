@@ -252,6 +252,7 @@ After `reject-once`:
 ```
 
 - [0009-088] For omp, the driver MUST relay both approval channels: form elicitation (0009-082) and `session/request_permission` (0009-032). It MUST NOT suppress or auto-answer either one. The channel for each tool kind follows the omp table in RFC-0006 0006-003.
+- [0009-089] For omp, a peer-call route (`xd://mcp__<server>_<tool>`, RFC-0015 [0015-116]) reaches the driver as a `write` form elicitation under 0009-082. The driver MUST relay it as a `PermissionRequest` whose tier and summary come from the name only, MUST NOT suppress or auto-answer it (0009-088), and MUST NOT attach peer-call attribution to the request. Any auto-allow is decided by the Worker under RFC-0006 [0006-061].
 
 #### 4.5.6 Cancel
 
@@ -554,6 +555,7 @@ Level values: `contract` (mock backend in `a2a-conformance`), `driver` (real age
 | 0009-086 | Claude prompt usage is counted once per turn; a cancelled turn reports zero; `cost` samples are cumulative and the worker charges high-water differences (RFC-0006 0006-037). | contract |
 | 0009-087 | omp launch has no `--session-dir`; load and resume restore after restart with the same `PI_CODING_AGENT_DIR` and `cwd`; a different `cwd` or `PI_CODING_AGENT_DIR` gives the fresh-session outcome of 0009-013. | contract |
 | 0009-088 | omp bash approval arrives as `session/request_permission` and write and read approvals as form elicitation; both are answered and neither is suppressed. | contract |
+| 0009-089 | omp peer-call route arrives as a write form elicitation, relayed as PermissionRequest; no peer-call attribution attached; not auto-answered | contract |
 
 ## 9. Open issues
 

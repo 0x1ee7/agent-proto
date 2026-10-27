@@ -18,6 +18,7 @@ Scripted scenarios:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +51,18 @@ def tool_props(body: dict, name: str) -> set:
     return set()
 
 
+
+def mcp_route(msgs: list, tool: str) -> str | None:
+    """Return the xd:// route name (e.g. mcp__a2abus_a2a_send) that omp advertises for an MCP tool."""
+    pattern = re.compile(r"xd://(mcp__[A-Za-z0-9_]*" + re.escape(tool) + r")\b")
+    for m in msgs:
+        if m.get("role") == "system":
+            found = pattern.search(text_of(m.get("content")))
+            if found:
+                return found.group(1)
+    return None
+
+
 def decide(body: dict) -> dict:
     msgs = body.get("messages", [])
     last = msgs[-1] if msgs else {}
@@ -76,12 +89,18 @@ def decide(body: dict) -> dict:
         seen = any("PINEAPPLE" in text_of(m.get("content")) for m in msgs[:-1])
         return {"text": "PINEAPPLE" if seen else "UNKNOWN"}
     if "A2A_SEND:" in last_user:
-        spec = last_user[last_user.index("A2A_SEND:") + len("A2A_SEND:"):].strip()
+        spec = last_user[last_user.index("A2A_SEND:") + len("A2A_SEND:"):].split("\n")[0].strip()
         agent, _, text = spec.partition(":")
+        args = {"agent": agent.strip(), "text": text.strip() or "ping"}
+        # omp 18.12.6 mounts MCP tools as xd:// routes ("## MCP Tool Routes" in the system prompt);
+        # the model invokes them with write(path=route, content=<json args>).
+        route = mcp_route(msgs, "a2a_send")
+        if route is not None and "write" in tool_names(body):
+            return {"tool": ("write", {"path": f"xd://{route}", "content": json.dumps(args)})}
         name = next((n for n in tool_names(body) if n == "a2a_send" or n.endswith("__a2a_send") or n.endswith("_a2a_send")), None)
         if name is None:
             return {"text": "NO_A2A_TOOL"}
-        return {"tool": (name, {"agent": agent.strip(), "text": text.strip() or "ping"})}
+        return {"tool": (name, args)}
     return {"text": "OK"}
 
 

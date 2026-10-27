@@ -282,6 +282,16 @@ Driver decision (proposal): advertise no `elicitation` capability in v1 unless i
 - `omp` config path, `PI_CONFIG_FILES` uses `;` on Windows (OMP-SETTINGS line 306).
 - `bash` on Windows: `[UNVERIFIED]`. Not checked.
 
+### 3.7 MCP tools as the model sees them (live E2E)
+
+Source: live run S1Debug, reported by Main; not yet recorded in `docs/spikes/e2e-m1.md`. That file still records S1 (0014-010) as FAIL with `BACKEND_CRASHED` before the tools reached the model, so S1 has not passed end to end.
+
+- omp does NOT expose client-provided MCP tools as function tools. It lists them in the system prompt under `## MCP Tool Routes` as `xd://mcp__<server>_<tool>` (for example `xd://mcp__a2abus_a2a_send`).
+- The model invokes such a tool by calling omp's `write` tool with `path` set to the route and `content` set to the JSON arguments. `tools.xdev` (default true) enables the route surface.
+- The settings `tools.discoveryMode` and `mcp.discoveryMode` had no observed effect on the route list.
+- Approval consequence: under `always-ask-cached` the call is a `write`, so it arrives as a `write` form elicitation (`Allow tool: write`, RFC-0006 [0006-052]). The route text is in the untrusted `Path:` line (RFC-0006 [0006-060]).
+- claude's expected tool name form `mcp__<server>__<tool>` is `[UNVERIFIED]`; not observed.
+
 ---
 
 ## 4. claude-agent-acp (`@agentclientprotocol/claude-agent-acp`)

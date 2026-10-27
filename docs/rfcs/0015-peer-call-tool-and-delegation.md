@@ -152,6 +152,7 @@ The IPC types are defined in the `a2a-mcp` crate. They are not bus messages and 
   - `delegation.max_sends_per_min`: integer 1 to 600; default 30.
   - `delegation.max_calls_per_min`: integer 1 to 1200; default 120.
   - `delegation.shim_path`: optional absolute path.
+  - `delegation.auto_allow_peer_tools`: boolean; default false; per agent. When true, the owner Worker MAY auto-allow a peer-call approval only under RFC-0006 [0006-061].
 - [0015-088] On worker stop the supervisor MUST remove the endpoint (socket file or pipe), delete the delegation file, and record the removal in the run record (RFC-0012 [0012-021]).
 
 ### 4.9 Agent-side requirements
@@ -168,11 +169,13 @@ Observed facts (cited):
 - A stdio entry with a non-existent command is accepted silently by omp at `session/new` (`docs/spikes/omp-acp.md`, Q2). The bus therefore cannot learn that the shim failed from the session response.
 - omp exits with its stdin closed; its stdio MCP child exits with it (`docs/spikes/omp-acp.md`, shutdown). claude is stopped with SIGTERM in the headless spike (`docs/spikes/claude-acp.md`).
 - claude's headless `system` init event lists `mcp_servers` and `mcp_server_errors` (`docs/spikes/claude-acp.md`, CC-HEADLESS). That is the only observed channel for MCP health.
+- omp does not expose client MCP tools as function tools. Its system prompt lists them under `## MCP Tool Routes` as `xd://mcp__<server>_<tool>` (for example `xd://mcp__a2abus_a2a_send`). The model calls one by calling omp's `write` tool with `path` set to the route and `content` set to the JSON arguments (`tools.xdev` default true). Source: live run S1Debug (`docs/interop/acp-omp-claude.md` 3.7).
+- The settings `tools.discoveryMode` and `mcp.discoveryMode` had no observed effect on the route list (same source).
 - [0015-102] The M1 claude driver MUST NOT pass `--bare` to claude until a spike shows that `--bare` keeps session-level `mcpServers` working.
 
 Unverified (all [UNVERIFIED] until the M1 spike):
 
-- The tool name the model sees. For claude, the expected form is `mcp__a2abus__<tool>`; for omp it is not known.
+- The tool name the model sees for claude, expected `mcp__a2abus__<tool>`. The omp form is observed (route text, section 5.1).
 - Whether omp and claude send `notifications/cancelled`, and their tool-call timeouts.
 - MCP protocol version negotiation and the reaction to a pinned-version mismatch.
 - Whether `--bare` in the claude driver suppresses session-level `mcpServers`; see [0015-102].
@@ -181,6 +184,10 @@ Requirement for slot readiness:
 
 - [0015-100] The worker MUST treat a slot as delegation-ready only after it receives an authenticated `auth` on the endpoint with that slot id. A slot that is not ready within 10 seconds of `session/new` MUST be recorded in the audit log, and the turn MUST continue; the agent simply has no working peer tools.
 - [0015-101] The worker MUST NOT fail a task because a shim is absent, late or disconnected. Only a `send` attempted while unbound or disconnected fails, with the reasons of section 4.5.
+
+Requirement for peer-call identity:
+
+- [0015-116] The worker MUST NOT infer a peer call, its target or its tool from route text an agent writes (for omp, `xd://mcp__<server>_<tool>`, section 5.1) or from the text of an approval message (RFC-0006 [0006-052]). A peer call is identified only by the `tools/call` that reaches the shim (section 4.2 [0015-020]). Route text MAY be shown to the operator as untrusted text (RFC-0006 [0006-060]).
 
 ### 5.2 Worked example: S1 (omp -> claude)
 
@@ -399,8 +406,9 @@ Levels: MUST = required for conformance of `a2a-mcp` and the worker delegation p
 | [0015-113] | Grant credential absent from child messages, peer messages and audit events | MUST |
 | [0015-114] | S1 end-to-end run (RFC-0014 [0014-010]) on the live omp and claude drivers | SHOULD |
 | [0015-115] | Child in the S1 shared context delegating back to omp is created FAILED LOOP_DETECTED at admission, with no queueing; both tasks terminal before the deadline | MUST |
+| [0015-116] | Peer-call identity: no route string or approval text names a peer call or target; no test relies on the model's route text | MUST |
 
-Note: the table above is the complete set of normative IDs of this RFC. IDs [0015-110] to [0015-113] are defined in section 6.1, [0015-114] in section 5.2 and [0015-115] in section 5.2.
+Note: the table above is the complete set of normative IDs of this RFC. IDs [0015-110] to [0015-113] are defined in section 6.1, [0015-114] and [0015-115] in section 5.2, and [0015-116] in section 5.1.
 
 ## 9. Open issues
 
