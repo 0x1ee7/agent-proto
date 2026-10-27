@@ -6,7 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod boundaries;
 pub mod bus_contract;
 pub mod driver;
 pub mod fixtures;
 pub mod report;
+#[cfg(feature = "scenarios")]
+pub mod scenarios;

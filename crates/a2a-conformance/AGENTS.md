@@ -41,6 +41,33 @@ Uses: `bus-api` (seam, `BusControl`, profile check), `a2a-types`, `bytes`, `sha2
   report as undeclared; the profile check must then fail naming that flag (0011-034,
   0011-035).
 
+## Architecture boundaries (`boundaries`)
+
+Checks RFC-0001 rules [0001-001]..[0001-006] from `cargo metadata`: binding, driver,
+gateway, core I/O, crate-file, seam and layer rules. Dev edges are exempt. The layer
+exception `a2a-worker -> a2a-client` (RFC-0015 [0015-001], staleness-checked) is the
+only named allowance. Tests: `req_0001_*`, including a mutation test.
+
+## In-process scenarios (`scenarios`, feature `scenarios`, off by default)
+
+Runs RFC-0014 section 4.2 cases on `bus-mem` with the real `a2a-client`, `a2a-worker`
+(MockBackend), and `a2a-workspace`, plus negatives. `run_all()` returns a
+`ScenarioReport` mapping each case to `Pass`, `Fail(reason)`, or `NotRun(reason)`.
+Live-tier cases run only as in-process substitutes; `mode` says which.
+
+- Exec (17): 0014-010, 013, 014, 015, 016, 017, 018, 019, 021, 023, 024, 025; N-OVERSIZE,
+  N-UNKNOWN-PEER, N-VERSION (0002-080), N-EXTENSION (0002-081), N-QUEUE-FULL (0005-028).
+  0014-023 runs the gateway router in-process with a non-loopback source; it checks the
+  401 `UNAUTHORIZED` response and that no backend command ran. It does not exercise the
+  loopback-anonymous rule (0008-022) and uses no socket.
+- NotRun (9): 0014-011 and 012 (live omp/Hermes), 020 (pinned Python a2a-sdk client),
+  022 (live coding backends), 026 (needs nats-server), 027 (live drivers), 028 and 029
+  (a2ad supervisor kill). N-SIGNATURE: message signing and verification are disabled in
+  M1 (RFC-0007; `a2a-client` `Config.verify` is `None`), so there is no path to exercise.
+
+Each NotRun row states its reason in the table. Test: `cargo test -p
+a2a-conformance --all-features`.
+
 ## Tests and the requirements they guard
 
 The check bodies live in `bus_contract::{messaging, kv, profile, faults, tenancy,

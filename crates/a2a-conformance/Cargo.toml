@@ -13,3 +13,18 @@ a2a-types = { version = "0.1.0", path = "../a2a-types" }
 bus-api = { version = "0.1.0", path = "../bus-api" }
 bytes = "1.12.1"
 sha2 = "0.11.0"
+serde_json = "1.0.154"
+a2a-core = { version = "0.1.0", path = "../a2a-core", optional = true }
+a2a-client = { version = "0.1.0", path = "../a2a-client", optional = true }
+a2a-workspace = { version = "0.1.0", path = "../a2a-workspace", optional = true }
+a2a-worker = { version = "0.1.0", path = "../a2a-worker", features = ["testkit"], optional = true }
+bus-mem = { version = "0.1.0", path = "../bus-mem", optional = true }
+a2a-mcp = { version = "0.1.0", path = "../a2a-mcp", features = ["runtime", "testkit"], optional = true }
+tokio = { version = "1.54.1", features = ["rt", "time", "sync"], optional = true }
+gateway-http = { version = "0.1.0", path = "../gateway-http", optional = true }
+axum = { version = "0.8.9", optional = true }
+tower = { version = "0.5.3", features = ["util"], optional = true }
+
+[features]
+default = []
+scenarios = ["dep:a2a-core", "dep:a2a-client", "dep:a2a-worker", "dep:a2a-workspace", "dep:bus-mem", "dep:a2a-mcp", "dep:tokio", "dep:gateway-http", "dep:axum", "dep:tower"]
