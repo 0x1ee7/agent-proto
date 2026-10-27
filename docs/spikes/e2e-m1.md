@@ -9,6 +9,41 @@ calls. No real user config or credential was read or changed.
 Legend: PASS = observed as specified. FAIL = observed defect (see evidence).
 NOT RUN = not exercised in this pass; reason given.
 
+## Pass on `.spikes/e2e/s1debug.toml` (ports 4252 / 9485 / 18777 / 18786)
+
+Stack: `.spikes/e2e/s1debug.toml`, state `.spikes/e2e/state-s1`, built with `CARGO_TARGET_DIR=target-s1final3` (the shared `target/` binaries were locked by LiveE2EAgent). Stubs: omp `spikes/omp-acp/stub/stub_openai.py 18786`, claude `.spikes/e2e/claude_stub.py 18777`. Supervisor, stubs and nats-server were stopped at the end; no listeners remain on the four ports.
+
+Stub-only exception (decided by Main): the claude child needs an auth key to pass the adapter's login check. The fake key `sk-stub-not-real` and `ANTHROPIC_BASE_URL=http://127.0.0.1:18777` are written to `.spikes/e2e/claude-cfg/settings.json` under `env`. That file is throwaway and lives inside `.spikes/e2e`. No real credential was read or written. The supervisor and driver env path stays key-free, and the driver still refuses provider key names in `[[agent]] env`.
+
+Defects found and fixed or observed in this pass:
+
+| Defect | Evidence | Status |
+|---|---|---|
+| Claude `ask-all` rejected by the driver mapping: `mode::canonical` had no `(Claude, "ask-all")` entry, while a2ad accepts it for `acp-claude`. `ensure_process` then returned silently, so no ACP child spawned | `crates/driver-acp/src/mode.rs` line 16; regression `claude_ask_all_config_starts_the_agent` | Fixed (AcpDriverAgent). Silent refusal fixed: reason now in `health().reason` |
+| Permission request ids were `perm-N` with a counter reset per process. The persisted task store refused the restarted host's request with `request id already exists` | `crates/driver-acp/src/core.rs` `next_pending_id`; now `perm-<epoch>-<n>`. Observed live: `perm-1793073600661953500-1` to `-4` across the run | Fixed. No dedicated regression test yet |
+| Restart cascade: a crashed host's presence record survives its death, so the restarted host got `served by another live instance` and the supervisor logged `AGENT_ABANDONED` after 5 failures | `.spikes/e2e/state-s1/logs/supervisor.jsonl` (earlier runs) | Fix landed (SupervisorHosts): claim retried every 1 s for up to 45 s. Runtime path not yet exercised: check omp log for `previous presence record still live; retrying claim` |
+| S4c: approval expiry ends the task `BACKEND_CRASHED` with null detail, not `APPROVAL_TIMEOUT` | See S4c below | Open |
+| `a2a send` without `--wait` blocks until the task is terminal, so a cancel must come from a separate process | Timing in S8 below | Observation (CLI) |
+| `README.md` task fixture: `.spikes/e2e/repo` has `README.txt` only | Not changed | Open |
+| `a2a watch` returns `wire: UnsupportedOperation` | Not investigated | Open (CLI) |
+| `approvals list` fails when any configured agent is unavailable | `crates/a2a-cli/src/approvals.rs` ~103–128. Not re-checked | Open (CLI) |
+
+Case results:
+
+| Case | Verdict | Evidence |
+|---|---|---|
+| Main task `A2A_SEND:claude:review README.md` (0014-010, child hops == 1) | PASS | `a2a send omp "A2A_SEND:claude:review README.md" --wait` returned `TASK_STATE_INPUT_REQUIRED` for the write-to-xd-route approval `perm-1793073600661953500-1`. `a2a approvals approve <id> --scope once --yes` moved the task to WORKING. Parent task `01a17b84-3f61-72aa-aaf2-5e8478e3d0eb` reached state 3 (COMPLETED). Child claude task `01a17b84-5025-7622-a5c6-992131e4b7f8` reached state 3. omp `tasks.log` ledger: `hops 1, children 1` |
+| S4a (0014-013) write approve | PASS | `a2a send omp "WRITE_FILE" --wait` returned INPUT_REQUIRED. Approval `perm-1793073600661953500-2` approved with allow_once. Task `01a17b85-01f6-7502-b07a-7a4a5f6f70b4` reached COMPLETED. `ws/local/omp/01a17b8501f6/written.txt` exists |
+| S4b (0014-014) write deny | PASS | Approval `perm-1793073600661953500-3` denied with reject_once. Task `01a17b85-6582-70d6-9f4a-d6231447fe80` reached COMPLETED with no failure. `ws/local/omp/01a17b856582/` has no `written.txt`. Matches RFC 0014 "COMPLETED without the write if the turn succeeds" |
+| S4c (0014-015) no decision | FAIL | Approval `perm-1793073600661953500-4` (expires 04:07:29.274). Task `01a17b86-1a76-758e-b236-897360332a52` ended state 4 at 04:07:29.281 with `failure.code = BACKEND_CRASHED`, detail null. Expected `APPROVAL_TIMEOUT` and `cancelled` to the backend. No `written.txt`. Cause not yet confirmed [INFERENCE]: the driver's own 300 s `permission_timeout` and the worker's approval expiry fire at the same instant, and the driver path wins with a null-detail crash. `commit_expired` only maps to `APPROVAL_TIMEOUT` when the worker's expiry runs first |
+| S8 (0014-019) cancel LONG_STREAM | PASS (CANCELED within 15 s) | Task `01a17b8d-b91c-7496-a2cc-6347f592feec`. `a2a cancel` at 04:10:53.52 returned WORKING. CANCELED (state 5) committed at `at_ms 1793074253688`, about 0.2 s after the request. "No child process remains" is NOT VERIFIED: omp is a persistent host, and no tree check was done |
+
+Earlier S8 attempts were invalid. The first ran while S4c's approval still held omp's turn, so it failed with `BACKEND_START_FAILED: a turn is already open`. A later attempt cancelled after the stream had already completed (`TaskNotCancelable`).
+
+Test status: `cargo build -p a2ad -p a2a-cli -p a2a-mcp` passes. `cargo test -p driver-acp`: 67 passed, 0 failed, 2 ignored on the last run (AcpDriverAgent also fixed the `peer_tools_with_operator_servers_refused_0015_084` race and the silent refusal). Checks for Main: `cargo test -p a2ad -p a2a-worker -p a2a-cli`.
+
+
+
 ## Defects found and fixed in this pass
 
 | Defect | Evidence | Status |
