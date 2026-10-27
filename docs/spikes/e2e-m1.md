@@ -188,3 +188,35 @@ Pass counts: no cargo tests or clippy were run (no source changed). Live verdict
 Processes: started and stopped by this run: both supervisor generations, the omp, Hermes and claude stubs (service IDs m1-omp-stub, m1-hermes-stub, m1-claude-stub, all stopped), and the omp host pid 49424 killed deliberately and restored by the supervisor. Not touched: omp.exe 32988, 43184, 14360, 16684; the AuditGatewayE2E stack (a2ad 12532, 23176, nats 49260, omp 57888, stub 2676); Hermes gateway pid 60820 and the `a2a-spike` profile. Listeners on 4262, 9495, 9930, 18796, 9922, 9921 and 18797 were checked after cleanup: none.
 
 Nothing committed; no source changed.
+
+## Re-run 2026-10-27e: GatewayTimeouts (D7 fix, D5 route, S3 on new ports)
+
+Build: `CARGO_INCREMENTAL=0 cargo build -p a2ad -p a2a-cli -p a2a-mcp`, exit 0 (16.6 s), after the bus-nats fix. Stack `.spikes/e2e/s3/` (gitignored scratch): bus 4272, health 9505, gateway 9940, claude stub 18806, Hermes-side endpoint `spikes/hermes-a2a/card_server.py` on 9931. Peer bearer from `.spikes/e2e/s3/secrets/peer.token` (copied from m1, owner-only ACL, not logged).
+
+Summary: D7 FIXED, PASS live (a blocking call returns the worker's COMPLETED task at 11.64 s). D5: the driver refusal stands (0009-069); the route is the agent's own `settings.json`. S3 NOT PASS: the outbound `a2a_send` never reached a peer, because claude's session was never offered the a2abus MCP tools. That attach path is outside this worker's ownership.
+
+| Case | Scenario | Verdict | Evidence / reason |
+|---|---|---|---|
+| D7 (0011-011, 0008-052) | Blocking SendMessage above 10 s | PASS live; fix in bus-nats | Before: `req_0011_011_request_honors_call_timeout_over_connection_default` (bus-nats `tests/live.rs`, connection `request_timeout` 1 s, call timeout 5 s, reply after 2 s) panics `Timeout` at `live.rs:136`, FAILED in 2.42 s. Cause: `bus.rs` `request()` used `request_with_headers`, which takes the connection-wide timeout and ignores the per-call one. Fix: `send_request` with `Request::timeout(Some(timeout))`. After: ok in 2.44 s. Round 2 (27d) before evidence: `blocking_wait_ms = 100000` returned `DEADLINE_EXCEEDED` at 10.05 s with the task WORKING. After (S3 stack, `blocking_wait_ms = 100000`, `STUB:LONG` on claude, about 10 s of output): HTTP 200 at 11.64 s, `TASK_STATE_COMPLETED`, 1690-char artifact, no `error`. Response `.spikes/e2e/s3/logs/d7-resp.json`. |
+
+Gateway guard: `req_0008_052_blocking_wait_above_ten_seconds_returns_the_working_task` (gateway-http requirements) uses paused time, a 100 s wait and a 30 s worker. It passes both before and after, because bus-mem already honors per-call timeouts. It guards the gateway contract; it does not reproduce D7. The bus-nats live test is the failing-before test.
+
+D5 (driver refuses `env_allow` for `ANTHROPIC_API_KEY`):
+
+- Conflict: 0009-069 forbids the driver to read, copy, log, forward or set provider credentials; 0012-062 keeps provider keys out unless `env_allow` names them. Conservative reading: 0009-069 governs, so the driver refusal stands. Recorded as a static rule in `crates/a2ad/AGENTS.md`.
+- Route: `CLAUDE_CONFIG_DIR/settings.json` = `{"permissions":{"defaultMode":"default"},"env":{"ANTHROPIC_API_KEY":"sk-stub-not-real"}}`. `s3.toml` has no `env_allow`. Same route as `crates/driver-acp/src/live.rs` lines 130-144. Claude completed turns against the stub (text replies at stub requests 1 and 2).
+
+S3 (0014-012, claude reaches Hermes): NOT PASS.
+
+- Trigger: `SendMessage` to `claude` through the gateway, text `STUB:A2A:hermes:S3 research question`. HTTP 200, task `01a17ea7-ee10-702e-89ae-99ed8a947f7f` WORKING, COMPLETED about 2 s later.
+- Claude stub: requests 3 and 5 emitted `tool_use` named `a2a_send`. The offered `tools` in those requests (16 names, Agent through Write) contain no `mcp__a2abus__*`, so the name did not resolve to an offered tool.
+- No child task in the claude store. The Hermes-side `card_server` log was never created (no POST arrived). The hermes worker `tasks.log` is 0 bytes. `approvals list --agent claude --pending` is empty.
+- Shim standalone: `a2abus-mcp-shim.exe --grant ... --endpoint ... --slot <16-byte base64url>` answered `initialize` (server `a2abus`) and `tools/list` (`a2a_discover`, `a2a_send`, ...). The shim is fine. The break is attaching the a2abus MCP server to the claude session (driver-acp `acp.rs` `mcp_servers`, peer-tools path). Not edited: owned by HealthAdmission, who was messaged.
+
+Commands used (repo root): `target/debug/a2ad.exe run|stop --config .spikes/e2e/s3/s3.toml`; `python spikes/hermes-a2a/card_server.py 9931 .spikes/e2e/s3/logs/hermes-endpoint.jsonl`; `python .spikes/e2e/m1/run_claude_stub.py 18806 .spikes/e2e/s3/stubws .spikes/e2e/s3/logs/claude-stub.jsonl`; `curl -X POST http://127.0.0.1:9940/agents/claude` with `A2A-Version: 1.0`; `target/debug/a2a.exe --bus-url nats://127.0.0.1:4272 --state-dir .spikes/e2e/s3/state --operator cli approvals list --agent claude --pending`.
+
+Processes: started and stopped by this run: s3-supervisor (pid 14572, exit 0), s3-claude-stub, s3-hermes-endpoint (both stopped by service kill). Not touched: omp.exe 32988, 43184, 14360, 16684; AuditGatewayE2E stack (a2ad 12532, 23176; nats 49260; omp 57888; stub 2676); Hermes gateway pid 60820 and profile `a2a-spike`.
+
+Not done: S3 PASS (blocked on the a2abus MCP attach, above). D6 and D8 are out of scope for this ticket.
+
+Pass counts: `CARGO_INCREMENTAL=0 cargo test -p gateway-http -p a2ad -p bus-nats`: 242 passed, 0 failed, 14 ignored (11 bus-nats live tests; 3 others not run). Bus-nats live D7 test `req_0011_011_request_honors_call_timeout_over_connection_default` with `--ignored`: ok in 2.43 s. Clippy `-D warnings` on the three crates: finished with no errors. `cargo fmt -p` on the three crates: applied. Live verdicts: D7 PASS; D5 route verified only by S3 completing turns; S3 NOT PASS.
