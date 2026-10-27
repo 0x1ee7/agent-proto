@@ -32,6 +32,9 @@ Uses: `a2a-client` (requester runtime, signing hook), `a2a-audit` (chain verific
   ([0012-056]).
 - Approval decisions show the request card on stderr before any prompt. Without a terminal, a
   decision needs `--yes`; otherwise nothing is decided ([0012-057]).
+- `approvals list` and `decide` read every candidate agent. An agent that cannot be listed is
+  reported on stderr as `agent <id>: <error>`; the others are still listed. A listing fails only
+  when no agent answers, and `decide` says not-found only when every agent answered ([0012-057]).
 - Decisions go only through `Client::decide_signed`, with the operator hook the session holds. The
   signer is loaded only for approve and deny, so read-only commands work without a key. An
   unsigned session never decides ([0012-058]).

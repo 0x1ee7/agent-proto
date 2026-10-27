@@ -1,9 +1,10 @@
 //! TLS listener setup for non-loopback binds (RFC-0008 4.9, 0008-066 and 0008-068).
 //!
 //! Only TLS 1.3 is offered. The certificate and key are read from PEM files. The key file must be
-//! owner-only: on Unix it must grant no group or other permission bits; on Windows its access list
-//! must name only the current user and carry no inherited entries (checked with `icacls`). If the
-//! access list cannot be read, the key is refused.
+//! owner-only: on Unix it must grant no group or other permission bits; on Windows every access
+//! entry must name the current user, `NT AUTHORITY\SYSTEM` or `BUILTIN\Administrators` (the
+//! principals of the default Windows ACL, inherited or not), checked with `icacls`. If the access
+//! list cannot be read, the key is refused.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -155,28 +156,47 @@ fn icacls_path() -> PathBuf {
     PathBuf::from(root).join("System32").join("icacls.exe")
 }
 
-/// Decides whether an `icacls <path>` listing is owner-only (0008-066, 0007-012). The listing must
-/// hold at least one access entry, every entry must name `user` (bare, or after a `DOMAIN\`
-/// prefix, compared case-insensitively), and no entry may be inherited (`(I)`).
+/// Access-list principals of the default Windows ACL that may hold a key besides its owner: the
+/// SYSTEM account and the local Administrators group, by name and by SID (0008-066).
+#[cfg(any(windows, test))]
+const TRUSTED_PRINCIPALS: [&str; 4] = [
+    r"NT AUTHORITY\SYSTEM",
+    "*S-1-5-18",
+    r"BUILTIN\Administrators",
+    "*S-1-5-32-544",
+];
+
+/// Decides whether an `icacls <path>` listing is owner-only (0008-066). The listing
+/// must hold at least one access entry, and every entry must name `user` (bare, or after a
+/// `DOMAIN\` prefix, compared case-insensitively) or a principal in [`TRUSTED_PRINCIPALS`].
+/// Inherited entries are allowed: the default ACL of a profile directory is inherited, and the
+/// principal decides.
 #[cfg(any(windows, test))]
 fn owner_only_listing(listing: &str, path: &str, user: &str) -> bool {
     let mut entries = 0usize;
     for line in listing.lines() {
         let rest = line.strip_prefix(path).unwrap_or(line).trim();
-        let Some((principal, rights)) = rest.split_once(":(") else {
+        let Some((principal, _rights)) = rest.split_once(":(") else {
             continue;
         };
         entries += 1;
-        let names_user = principal.eq_ignore_ascii_case(user)
-            || principal
-                .rsplit_once('\\')
-                .is_some_and(|(_, name)| name.eq_ignore_ascii_case(user));
-        let inherited = format!("({rights}").contains("(I)");
-        if !names_user || inherited {
+        if !trusted_principal(principal, user) {
             return false;
         }
     }
     entries > 0
+}
+
+#[cfg(any(windows, test))]
+fn trusted_principal(principal: &str, user: &str) -> bool {
+    let names_user = principal.eq_ignore_ascii_case(user)
+        || principal
+            .rsplit_once('\\')
+            .is_some_and(|(_, name)| name.eq_ignore_ascii_case(user));
+    names_user
+        || TRUSTED_PRINCIPALS
+            .iter()
+            .any(|trusted| principal.eq_ignore_ascii_case(trusted))
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -215,9 +235,58 @@ mod tests {
     }
 
     #[test]
-    fn req_0008_066_inherited_entry_for_the_user_is_not_owner_only() {
+    fn req_0008_066_inherited_entry_for_the_user_is_owner_only() {
         let listing = format!("{PATH} DESKTOP-1\\{USER}:(I)(F)\n");
-        assert!(!owner_only_listing(&listing, PATH, USER));
+        assert!(owner_only_listing(&listing, PATH, USER));
+    }
+
+    #[test]
+    fn req_0008_066_default_windows_acl_is_owner_only() {
+        let listing = format!(
+            "{PATH} NT AUTHORITY\\SYSTEM:(I)(F)\n                BUILTIN\\Administrators:(I)(F)\n                DESKTOP-1\\{USER}:(I)(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n"
+        );
+        assert!(owner_only_listing(&listing, PATH, USER));
+    }
+
+    #[test]
+    fn req_0008_066_system_and_administrators_by_sid_are_owner_only() {
+        let listing = format!(
+            "{PATH} *S-1-5-18:(F)\n                *S-1-5-32-544:(F)\n                {USER}:(F)\n"
+        );
+        assert!(owner_only_listing(&listing, PATH, USER));
+    }
+
+    #[test]
+    fn req_0008_066_other_principals_make_the_key_wide() {
+        for principal in [
+            "Everyone",
+            r"NT AUTHORITY\Authenticated Users",
+            r"BUILTIN\Users",
+            "*S-1-1-0",
+            "*S-1-5-11",
+            r"DESKTOP-1\Guest",
+        ] {
+            let listing = format!("{PATH} {USER}:(F)\n                {principal}:(I)(R)\n");
+            assert!(
+                !owner_only_listing(&listing, PATH, USER),
+                "{principal} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn req_0008_066_look_alike_system_and_administrators_are_refused() {
+        for principal in [
+            r"DESKTOP-1\SYSTEM",
+            r"EVIL\Administrators",
+            r"NT AUTHORITY\Administrators",
+        ] {
+            let listing = format!("{PATH} {principal}:(F)\n");
+            assert!(
+                !owner_only_listing(&listing, PATH, USER),
+                "{principal} accepted"
+            );
+        }
     }
 
     #[test]
@@ -280,13 +349,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn req_0008_066_windows_key_with_inherited_entries_is_refused() {
+    fn req_0008_066_windows_default_key_acl_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let key = windows_key(&dir);
-        assert!(matches!(
-            check_key_permissions(&key),
-            Err(TlsError::KeyPermissions { .. })
-        ));
+        assert!(check_key_permissions(&key).is_ok());
     }
 
     #[cfg(windows)]

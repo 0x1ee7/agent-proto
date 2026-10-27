@@ -20,7 +20,8 @@ use crate::trust::{OPERATOR_AGENT, Role};
 /// Where a decision came from. The layer that authenticated the origin constructs this.
 #[derive(Clone, Copy, Debug)]
 pub enum DecisionOrigin<'a> {
-    /// The envelope signature verified for this sender ([0007-034]).
+    /// The envelope signature verified for this sender ([0007-034]). Refused while signing is
+    /// disabled, when only the local operator channel decides ([0007-095]).
     Signed(&'a VerifiedSender),
     /// The local operator channel. Accepted only while signing is disabled ([0007-095]).
     LocalOperatorChannel,
@@ -332,6 +333,10 @@ fn authorize_origin(
 ) -> Result<String, BusError> {
     let signing_on = ctx.policy.signing == SigningMode::Enabled;
     match origin {
+        // With signing disabled only the local operator channel decides ([0007-095]).
+        DecisionOrigin::Signed(sender) if !signing_on => {
+            Err(BusError::new(Reason::KeyRoleDenied).with_kid(sender.kid().to_string()))
+        }
         DecisionOrigin::Signed(sender) => {
             if sender.role() != Role::Operator {
                 return Err(BusError::new(Reason::KeyRoleDenied).with_kid(sender.kid().to_string()));
@@ -764,6 +769,28 @@ mod tests {
             )
             .expect_err("unsigned direct decision is not a local operator decision");
         assert_eq!(unsigned_disabled.reason(), Reason::KeyRoleDenied);
+    }
+
+    #[test]
+    fn req_0007_095_signed_decision_is_refused_while_signing_is_disabled() {
+        let h = Harness::new();
+        let d = decision_for("allow-once", &h.digest);
+        let op = sender(agent(OPERATOR_AGENT), Role::Operator);
+        let err = h
+            .decide(SigningMode::Disabled, DecisionOrigin::Signed(&op), &d)
+            .expect_err("with signing disabled only the local operator channel decides");
+        assert_eq!(err.reason(), Reason::KeyRoleDenied);
+        assert!(err.kid().is_some(), "kid is attached to the refusal");
+
+        // The refused signed decision did not close the request.
+        let outcome = h
+            .decide(
+                SigningMode::Disabled,
+                DecisionOrigin::LocalOperatorChannel,
+                &d,
+            )
+            .expect("local channel still decides the open request");
+        assert_eq!(outcome.decision().decided_by(), OPERATOR_AGENT);
     }
 
     #[test]

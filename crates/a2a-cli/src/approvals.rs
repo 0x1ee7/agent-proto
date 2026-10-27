@@ -21,6 +21,22 @@ pub struct Open {
     pub pending: PendingApproval,
 }
 
+/// An agent that could not be listed, and the error that stopped it.
+#[derive(Debug)]
+pub struct AgentFailure {
+    pub agent: AgentId,
+    pub error: CliError,
+}
+
+/// The approvals of every candidate agent that answered, and one failure per agent that did not.
+#[derive(Debug, Default)]
+pub struct Listing {
+    pub open: Vec<Open>,
+    pub failures: Vec<AgentFailure>,
+    /// Candidates that answered, whether or not they held an approval.
+    pub answered: usize,
+}
+
 /// Whether a request's expiry is at or before `now_ms`. A missing or unreadable expiry counts as
 /// expired, so an approval that cannot be bounded is never offered as pending.
 #[must_use]
@@ -115,36 +131,73 @@ fn candidate_agents<B: Bus>(
     Ok(session.settings.agents.clone())
 }
 
-/// Collects open approvals from the candidate agents, following every page.
+/// Collects open approvals from the candidate agents, following every page of each. An agent that
+/// fails on any page contributes nothing and is reported as a failure, so a partial list is never
+/// shown as complete.
 ///
 /// # Errors
-/// Returns the mapped client error of a failed list, or of a malformed approval.
+/// Returns usage when no agent is named or configured. Agent failures are not errors here.
 pub async fn open_approvals<B: Bus>(
     session: &Session<B>,
     explicit: Option<&str>,
-) -> Result<Vec<Open>, CliError> {
-    let opts = session.opts();
-    let mut found = Vec::new();
+) -> Result<Listing, CliError> {
+    let mut listing = Listing::default();
     for agent in candidate_agents(session, explicit)? {
-        let mut page_token = String::new();
-        loop {
-            let request = list_request(&page_token);
-            let reply = session.client.list_tasks(&agent, request, &opts).await?;
-            for task in &reply.value.tasks {
-                if let Some(pending) = PendingApproval::from_task(task)? {
-                    found.push(Open {
-                        agent: agent.clone(),
-                        pending,
-                    });
-                }
+        match agent_approvals(session, &agent).await {
+            Ok(pending) => {
+                listing.answered += 1;
+                listing.open.extend(pending.into_iter().map(|pending| Open {
+                    agent: agent.clone(),
+                    pending,
+                }));
             }
-            if reply.value.next_page_token.is_empty() {
-                break;
-            }
-            page_token.clone_from(&reply.value.next_page_token);
+            Err(error) => listing.failures.push(AgentFailure { agent, error }),
         }
     }
+    Ok(listing)
+}
+
+/// Every pending approval one agent holds, following all of its pages.
+///
+/// # Errors
+/// Returns the mapped client error of a failed page, or of a malformed approval.
+async fn agent_approvals<B: Bus>(
+    session: &Session<B>,
+    agent: &AgentId,
+) -> Result<Vec<PendingApproval>, CliError> {
+    let opts = session.opts();
+    let mut found = Vec::new();
+    let mut page_token = String::new();
+    loop {
+        let request = list_request(&page_token);
+        let reply = session.client.list_tasks(agent, request, &opts).await?;
+        for task in &reply.value.tasks {
+            if let Some(pending) = PendingApproval::from_task(task)? {
+                found.push(pending);
+            }
+        }
+        if reply.value.next_page_token.is_empty() {
+            break;
+        }
+        page_token.clone_from(&reply.value.next_page_token);
+    }
     Ok(found)
+}
+
+/// Writes one diagnostic line per agent that could not be listed.
+fn report_failures(io: &mut Io<'_>, failures: &[AgentFailure]) -> Result<(), CliError> {
+    for failure in failures {
+        writeln!(io.err, "agent {}: {}", failure.agent, failure.error)
+            .map_err(|error| CliError::Failed(format!("writing agent error: {error}")))?;
+    }
+    Ok(())
+}
+
+/// Exit class of a listing in which no agent answered: the class of its first failure.
+fn exit_of_failures(failures: &[AgentFailure]) -> Exit {
+    failures
+        .first()
+        .map_or(Exit::Failure, |failure| failure.error.exit())
 }
 
 /// The ListTasks request for one page. The worker rejects a status or context filter with
@@ -164,10 +217,12 @@ fn write_card(io: &mut Io<'_>, request: &ApprovalRequest) -> Result<(), CliError
         .map_err(|error| CliError::Failed(format!("writing approval card: {error}")))
 }
 
-/// `a2a approvals list`.
+/// `a2a approvals list`. Lists the approvals of every agent that answers; an agent that cannot be
+/// listed is reported on stderr. Success when at least one agent answered, otherwise the exit class
+/// of the first failure (0012-055).
 ///
 /// # Errors
-/// Returns usage, client, or output errors.
+/// Returns usage, or output errors.
 pub async fn list<B: Bus>(
     session: &Session<B>,
     pending_only: bool,
@@ -175,7 +230,15 @@ pub async fn list<B: Bus>(
     io: &mut Io<'_>,
     now_ms: u64,
 ) -> Result<Exit, CliError> {
-    let mut open = open_approvals(session, agent).await?;
+    let Listing {
+        mut open,
+        failures,
+        answered,
+    } = open_approvals(session, agent).await?;
+    report_failures(io, &failures)?;
+    if answered == 0 {
+        return Ok(exit_of_failures(&failures));
+    }
     if pending_only {
         open.retain(|item| !is_expired(item.pending.request(), now_ms));
     }
@@ -198,7 +261,8 @@ pub async fn list<B: Bus>(
 /// # Errors
 /// Returns usage for an unsupported `--note` or missing terminal confirmation, rejected for an
 /// absent option, an expired request, or a declined confirmation, failure when the session has no
-/// signing key, not-found for an unknown request, or the mapped client error.
+/// signing key, not-found for an unknown request once every candidate agent answered, or the
+/// mapped client error.
 pub async fn decide<B: Bus>(
     session: &Session<B>,
     args: &DecideArgs,
@@ -217,13 +281,21 @@ pub async fn decide<B: Bus>(
                 .to_owned(),
         ));
     };
-    let open = open_approvals(session, args.agent.as_deref()).await?;
-    let found = open
+    let Listing { open, failures, .. } = open_approvals(session, args.agent.as_deref()).await?;
+    report_failures(io, &failures)?;
+    let Some(found) = open
         .into_iter()
         .find(|item| item.pending.request().request_id == args.request_id)
-        .ok_or_else(|| {
-            CliError::NotFound(format!("no open approval request {}", args.request_id))
-        })?;
+    else {
+        // An agent that could not be listed may hold the request, so its absence is not proven.
+        if failures.is_empty() {
+            return Err(CliError::NotFound(format!(
+                "no open approval request {}",
+                args.request_id
+            )));
+        }
+        return Ok(exit_of_failures(&failures));
+    };
     let request = found.pending.request();
     if is_expired(request, now_ms) {
         return Err(CliError::Rejected(format!(

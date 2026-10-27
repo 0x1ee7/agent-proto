@@ -396,6 +396,89 @@ async fn req_0012_057_list_shows_input_required_approval() {
     assert!(text.contains("remove build directory"), "{text}");
 }
 
+// [0012-057] An agent that cannot be reached must not hide the approvals of the others. The
+// reachable worker's approval is listed, and the unreachable agent is reported as its own error.
+#[tokio::test]
+async fn req_0012_057_list_survives_an_unreachable_agent() {
+    let fx = Fixture::new();
+    let ghost = AgentId::parse("ghost").expect("ghost id");
+    let session = fx.session(vec![ghost, fx.worker_id.clone()], true);
+    let mut lists = fx.serve(Op::List).await;
+    let mut streams = Streams::new("");
+    let worker = async {
+        let inbound = tokio::time::timeout(WORKER_WAIT, fx.next_inbound(&mut lists))
+            .await
+            .expect("list reached the worker");
+        fx.reply(
+            inbound,
+            &list_answer(vec![approval_task("t-9", EXPIRES_AT)]),
+        );
+    };
+    let (result, ()) = {
+        let mut io = streams.io(false, false);
+        tokio::join!(
+            approvals::list(&session, false, None, &mut io, NOW_MS),
+            worker
+        )
+    };
+    assert_eq!(result.expect("list succeeds"), Exit::Success);
+    let text = streams.out_text();
+    assert!(text.contains("agent worker-a"), "{text}");
+    assert!(text.contains("remove build directory"), "{text}");
+    assert!(
+        streams.err_text().contains("agent ghost:"),
+        "{}",
+        streams.err_text()
+    );
+}
+
+// [0012-057] When no agent can be listed, each failure is reported on stderr and the exit class
+// is the failure's, with no listing on stdout (not even an empty JSON array).
+#[tokio::test]
+async fn req_0012_057_list_with_no_reachable_agent_exits_unavailable() {
+    let fx = Fixture::new();
+    let ghost = AgentId::parse("ghost").expect("ghost id");
+    let session = fx.session(vec![ghost], true);
+    let mut streams = Streams::new("");
+    let exit = {
+        let mut io = streams.io(false, true);
+        approvals::list(&session, false, None, &mut io, NOW_MS)
+            .await
+            .expect("list reports the failure")
+    };
+    assert_eq!(exit, Exit::Unavailable);
+    assert!(streams.out.is_empty(), "no listing on stdout");
+    assert!(
+        streams.err_text().contains("agent ghost:"),
+        "{}",
+        streams.err_text()
+    );
+}
+
+// [0012-057] A request no agent holds is not-found only when every agent answered. While an agent
+// is unreachable the request may live there, so the decision must not claim it does not exist.
+#[tokio::test]
+async fn req_0012_057_decide_is_not_not_found_while_an_agent_is_unreachable() {
+    let fx = Fixture::new();
+    let ghost = AgentId::parse("ghost").expect("ghost id");
+    let session = fx.session(vec![ghost], true);
+    let args = decide_args(None, true, None);
+    let mut streams = Streams::new("");
+    let exit = {
+        let mut io = streams.io(false, false);
+        approvals::decide(&session, &args, true, &mut io, NOW_MS)
+            .await
+            .expect("decide reports the failure")
+    };
+    assert_eq!(exit, Exit::Unavailable);
+    assert!(streams.out.is_empty(), "no decision output");
+    assert!(
+        streams.err_text().contains("agent ghost:"),
+        "{}",
+        streams.err_text()
+    );
+}
+
 // [0012-057] With `--yes` the decision is sent as a SendMessage naming the offered option, and
 // the resulting task is reported. Its envelope carries the operator's signature headers (0012-058).
 #[tokio::test]
