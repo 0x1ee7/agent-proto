@@ -16,6 +16,7 @@ use a2a_workspace::{
     WorkspaceMode, WorkspaceRef,
 };
 use bus_api::bus::Bus;
+use sha2::{Digest, Sha256};
 
 use crate::backend::Backend;
 use crate::config::WorkerConfig;
@@ -31,6 +32,42 @@ fn mode_token(mode: WorkspaceMode) -> &'static str {
         WorkspaceMode::PerTask => "per-task",
         WorkspaceMode::PerSession => "per-session",
     }
+}
+
+/// Domain separator of the workspace key derived from an opaque session id.
+const SESSION_KEY_DOMAIN: &[u8] = b"a2a-worker/session-workspace/v1\0";
+
+/// Workspace key of a session (RFC-0012 4.8). A canonical UUID session id is used as is, so
+/// existing workspace names do not change. Any other id, such as a peer's opaque context id
+/// (RFC-0001 keeps received ids verbatim), maps to a version-8 UUID derived from SHA-256 of a
+/// domain-separated copy of the id, so `a2a-workspace` names the workspace by its first twelve
+/// hex digits.
+fn session_key(context: &str) -> Result<WorkKey, &'static str> {
+    if let Ok(key) = WorkKey::parse(context) {
+        return Ok(key);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_KEY_DOMAIN);
+    hasher.update(context.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    for (dst, src) in bytes.iter_mut().zip(digest.iter()) {
+        *dst = *src;
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = |range: std::ops::Range<usize>| -> String {
+        bytes[range].iter().map(|b| format!("{b:02x}")).collect()
+    };
+    let canonical = format!(
+        "{}-{}-{}-{}-{}",
+        hex(0..4),
+        hex(4..6),
+        hex(6..8),
+        hex(8..10),
+        hex(10..16)
+    );
+    WorkKey::parse(&canonical).map_err(|err| err.kind().token())
 }
 
 /// Workspace settings of a worker (RFC-0012 sections 4.8 and 4.9).
@@ -95,10 +132,12 @@ impl WorkspaceHook {
     /// context is reused (RFC-0012 0012-067). A refusal returns the RFC token of the failure.
     fn acquire(&mut self, task: &str, context: &str) -> Result<(), &'static str> {
         let (slot, key) = match &self.workspace.config().mode {
-            WorkspaceMode::PerTask => (Slot::Task(task.to_owned()), task),
-            WorkspaceMode::PerSession => (Slot::Session(context.to_owned()), context),
+            WorkspaceMode::PerTask => (
+                Slot::Task(task.to_owned()),
+                WorkKey::parse(task).map_err(|err| err.kind().token())?,
+            ),
+            WorkspaceMode::PerSession => (Slot::Session(context.to_owned()), session_key(context)?),
         };
-        let key = WorkKey::parse(key).map_err(|err| err.kind().token())?;
         if !self.held.contains_key(&slot) {
             let scope = match &slot {
                 Slot::Task(_) => WorkScope::Task(key.clone()),
@@ -475,6 +514,48 @@ mod tests {
         let refused = hook.acquire("not-a-uuid", CONTEXT);
         assert!(refused.is_err());
         assert!(hook.held.is_empty());
+        drop(hook);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// RFC-0012 0012-067: a session whose context id is opaque (RFC-0001 keeps received ids
+    /// verbatim, so a peer's `ctx-` id is valid) still gets one session workspace, reused by
+    /// its tasks and distinct from other contexts.
+    #[test]
+    fn req_0012_067_opaque_context_id_gets_a_session_workspace() {
+        let (mut hook, base) = hook(WorkspaceMode::PerSession, "opaque");
+        let context = "ctx-9c1e0f4a2b7d3e58";
+        hook.acquire(TASK_1, context)
+            .expect("opaque context id is leased");
+        let first = hook.lease_of(TASK_1).expect("lease").path().to_path_buf();
+        hook.acquire(TASK_2, context).expect("second task");
+        assert_eq!(
+            hook.lease_of(TASK_2).expect("lease").path().to_path_buf(),
+            first
+        );
+        hook.acquire("task-other", "ctx-0000000000000001")
+            .expect("other opaque context");
+        let other = hook
+            .lease_of("task-other")
+            .expect("lease")
+            .path()
+            .to_path_buf();
+        assert_ne!(first, other);
+        drop(hook);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// RFC-0012 0012-067: a canonical UUID session id keeps its first twelve hex digits as the
+    /// workspace name, so existing workspaces keep their paths.
+    #[test]
+    fn req_0012_067_canonical_session_id_keeps_its_short_id() {
+        let (mut hook, base) = hook(WorkspaceMode::PerSession, "canonical");
+        hook.acquire(TASK_1, CONTEXT).expect("acquire");
+        let path = hook.lease_of(TASK_1).expect("lease").path().to_path_buf();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("0190a0a00000")
+        );
         drop(hook);
         let _ = fs::remove_dir_all(base);
     }

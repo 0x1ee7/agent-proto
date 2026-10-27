@@ -1691,6 +1691,35 @@ impl<S: TaskStore> Tasks<S> {
         }
     }
 
+    /// Cancels a task whose turn already ended and waits only for open children (0015-067).
+    /// No backend turn runs, so there is no grace window to wait out: CANCELED commits now and
+    /// the open children are cancelled through the usual effects.
+    pub fn cancel_deferred(
+        &mut self,
+        origin: &str,
+        task_id: &str,
+        now: u64,
+    ) -> Result<Vec<Effect>, TaskError> {
+        let mut plan = self.visible_plan(origin, task_id)?;
+        match plan.state() {
+            TaskState::Canceled => Ok(Vec::new()),
+            TaskState::Working => {
+                plan.move_to(
+                    Some(TaskState::Working),
+                    TaskState::Canceled,
+                    None,
+                    None,
+                    now,
+                )?;
+                self.commit(plan)
+            }
+            TaskState::Completed | TaskState::Failed | TaskState::Rejected => {
+                Err(TaskError::NotCancelable)
+            }
+            _ => Err(TaskError::Invalid("task is not waiting on children")),
+        }
+    }
+
     /// Checks the contextId of a follow-up against the task (0005-002).
     pub fn check_context(
         &self,

@@ -292,7 +292,23 @@ fn mesh_grants() -> Vec<Grant> {
 
 /// Runs `scenario` while both Workers serve. Each Worker runs as a long-lived future polled
 /// alongside the scenario, so a Worker waiting on its peer's reply never blocks the peer.
+/// Virtual time advances 25 ms per poll.
 pub(crate) fn drive_mesh<T>(mesh: &mut Mesh, scenario: impl Future<Output = T>) -> T {
+    run_mesh(mesh, Some(Duration::from_millis(25)), scenario)
+}
+
+/// Like [`drive_mesh`], but virtual time moves only when the scenario moves it through the
+/// bus control. Use it when an assertion counts events inside a virtual window while IPC
+/// calls run on real threads: under [`drive_mesh`] every poll advances the clock, so the
+/// real latency of a call turns into virtual time and can close the window early.
+pub(crate) fn drive_mesh_scenario_clock<T>(
+    mesh: &mut Mesh,
+    scenario: impl Future<Output = T>,
+) -> T {
+    run_mesh(mesh, None, scenario)
+}
+
+fn run_mesh<T>(mesh: &mut Mesh, step: Option<Duration>, scenario: impl Future<Output = T>) -> T {
     let Mesh {
         bus, parent, child, ..
     } = mesh;
@@ -301,9 +317,9 @@ pub(crate) fn drive_mesh<T>(mesh: &mut Mesh, scenario: impl Future<Output = T>) 
     let mut parent_loop = pin!(serve_forever(parent));
     let mut child_loop = pin!(serve_forever(child));
     for _ in 0..MAX_POLLS {
-        control
-            .advance(Duration::from_millis(25))
-            .expect("virtual clock advance");
+        if let Some(step) = step {
+            control.advance(step).expect("virtual clock advance");
+        }
         if let Poll::Ready(value) = poll_once(scenario.as_mut()) {
             return value;
         }

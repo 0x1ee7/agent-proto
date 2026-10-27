@@ -332,6 +332,43 @@ fn req_0015_055_child_usage_is_charged_from_terminal_metadata() {
     });
 }
 
+/// 0006-034: a settled child's reserve is released, so the unused part of the parent's allowance
+/// returns to the parent. After the first child spends 50 of 100, the second child is granted the
+/// remaining 50; a reserve still held would leave nothing and refuse its 49-token turn.
+#[test]
+fn req_0006_034_settled_child_reserve_returns_unused_allowance() {
+    let mut m = mesh(Spec {
+        parent_budget: Allowance {
+            max_tokens: 100,
+            ..Allowance::default()
+        },
+        ..Spec::default()
+    });
+    let h = m.handles();
+    m.child_mock.enqueue(vec![
+        usage(30, 20),
+        text("first"),
+        Step::Terminal(Outcome::Completed),
+    ]);
+    m.child_mock.enqueue(vec![
+        usage(30, 19),
+        text("second"),
+        Step::Terminal(Outcome::Completed),
+    ]);
+    m.parent_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "spend").await;
+        let tools = peer_tools(&h.parent).await;
+        let mut first = ipc_call(&tools, send_frame(CHILD, "x", "k1", Wait::Blocking));
+        expect_result(finished(&mut first).await);
+        let mut second = ipc_call(&tools, send_frame(CHILD, "y", "k2", Wait::Blocking));
+        expect_result(finished(&mut second).await);
+        h.parent.release();
+        until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
+    });
+}
+
 /// 0015-022 / 0015-055 / 0006-033: a child's wall share is the parent's remaining wall less the
 /// margin. A parent whose wall equals the margin derives a zero share; the zero-share refusal is
 /// pinned by `delegation::policy`. At mesh level the parent ends at its wall limit, so the send
@@ -412,13 +449,14 @@ fn req_0015_043_wrong_credential_is_unauthenticated() {
 }
 
 /// 0015-043: after five failed authentications the endpoint refuses even the right credential.
+/// Virtual time is held by the scenario: real IPC latency must not age failures out of the window.
 #[test]
 fn req_0015_043_lockout_refuses_the_correct_credential_over_ipc() {
     let mut m = mesh(Spec::default());
     let h = m.handles();
     m.parent_mock
         .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
-    drive_mesh(&mut m, async move {
+    drive_mesh_scenario_clock(&mut m, async move {
         let parent = submit_to(&h.bus, PARENT, "lockout").await;
         let tools = peer_tools(&h.parent).await;
         for _ in 0..5 {
@@ -430,6 +468,10 @@ fn req_0015_043_lockout_refuses_the_correct_credential_over_ipc() {
             };
             let mut call = ipc_call_with(config, send_frame(CHILD, "x", "k1", Wait::Blocking));
             assert_eq!(refusal(finished(&mut call).await), reason::UNAUTHENTICATED);
+            // A slow real round trip: 3000 polls is 75 s on the per-poll clock.
+            for _ in 0..3000 {
+                yield_now().await;
+            }
         }
         let mut call = ipc_call(&tools, send_frame(CHILD, "x", "k1", Wait::Blocking));
         assert_eq!(refusal(finished(&mut call).await), reason::UNAUTHENTICATED);
@@ -618,6 +660,47 @@ fn req_0015_067_parent_stays_open_until_child_terminal() {
         );
         h.child.release();
         until_state(&h.bus, PARENT, &parent.id, pb::TaskState::Completed).await;
+    });
+}
+
+/// 0015-067: a parent whose turn ended while a child runs has no backend turn to stop, so a cancel
+/// commits CANCELED at once (no grace window) and cancels the child.
+#[test]
+fn req_0015_067_cancel_of_a_deferred_parent_commits_canceled_at_once() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.child_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    m.parent_mock
+        .enqueue(vec![Step::Hold, Step::Terminal(Outcome::Completed)]);
+    drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "defer-cancel").await;
+        let tools = peer_tools(&h.parent).await;
+        let mut call = ipc_call(&tools, send_frame(CHILD, "x", "k1", Wait::Return));
+        expect_result(finished(&mut call).await);
+        h.parent.release();
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        let before = get_from(&h.bus, PARENT, &parent.id).await;
+        assert_eq!(
+            state(&before),
+            pb::TaskState::Working as i32,
+            "the parent waits for its child"
+        );
+        let after = cancel_on(&h.bus, PARENT, &parent.id).await;
+        assert_eq!(
+            state(&after),
+            pb::TaskState::Canceled as i32,
+            "a deferred parent is canceled at once, not after the grace window"
+        );
+        for _ in 0..500 {
+            if cancel_seen(&h.child) {
+                break;
+            }
+            yield_now().await;
+        }
+        assert!(cancel_seen(&h.child), "the open child is canceled");
     });
 }
 

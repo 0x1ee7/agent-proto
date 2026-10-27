@@ -20,6 +20,7 @@ Layer L3 worker (RFC-0001 section 4.2). Serves one agent's RPC subjects, runs ta
 
 - `bus-api` (the only bus dependency; no bus implementation outside tests).
 - `a2a-core`, `a2a-types`, `a2a-security`, `a2a-audit`, `a2a-workspace`, `a2a-mcp` (IPC server and grant trait) as L2 libraries.
+- `sha2` (SHA-256 for the derived session workspace key in `workspace`).
 - Dev only: `bus-mem`, `a2a-conformance`, tokio (tests drive peer helpers through it).
 
 ## Rules
@@ -50,6 +51,7 @@ Layer L3 worker (RFC-0001 section 4.2). Serves one agent's RPC subjects, runs ta
 - 0009-059 and 0009-060: crash ends the open turn as BACKEND_CRASHED and closes the backend. Guarded in `mock` tests.
 - 0009-072: reason tokens come from their producing protocol. Guarded in `backend` and `backend_contract` tests.
 - 0009-074: mock injects faults without a turn reference. Guarded in `mock` tests.
+- 0012-067: a session workspace is keyed by its context id. An opaque (non-UUID) context id maps to a derived version-8 UUID, so its workspace is leased; a canonical UUID keeps its short id. Guarded in `workspace` tests.
 - 0015-043: five authentication failures in 60 s lock out the endpoint, including the correct credential. Guarded in `delegation` and `tests::req_0015` tests.
 - 0015-054, 0015-058: refused and return-to-chain calls create no child. Guarded in `tests::req_0015`.
 - 0015-067: parent stays non-terminal until its children are terminal. Guarded in `tests::req_0015`.

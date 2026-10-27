@@ -537,7 +537,14 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         req: &pb::CancelTaskRequest,
         now: u64,
     ) -> Result<Handled, RpcError> {
-        let effects = self.tasks.cancel(&head.origin, &req.id, now)?;
+        let effects = if self.deferred_ends.contains_key(&req.id) {
+            // 0015-067: the turn already ended and only children remain; nothing is left to stop.
+            let effects = self.tasks.cancel_deferred(&head.origin, &req.id, now)?;
+            self.deferred_ends.remove(&req.id);
+            effects
+        } else {
+            self.tasks.cancel(&head.origin, &req.id, now)?
+        };
         self.run(effects, now).map_err(RpcError::Fatal)?;
         let view = self.tasks.task(&head.origin, &req.id)?;
         Ok(plain(Response::Task(wire::task_proto(&view))))
