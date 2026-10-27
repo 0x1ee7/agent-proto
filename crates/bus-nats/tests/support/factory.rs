@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use a2a_conformance::bus_contract::BusFactory;
+use a2a_conformance::bus_contract::{BusFactory, DeliveryPrincipal};
 use a2a_conformance::driver::Clock;
 use a2a_conformance::fixtures::Fixtures;
 use a2a_conformance::report::BindingInfo;
@@ -406,6 +406,11 @@ impl BusFactory for NatsFactory<'_> {
             name: "bus-nats",
             version: env!("CARGO_PKG_VERSION"),
         }
+    }
+
+    /// Stream deliveries carry the publisher only on owner-token subjects (`ev`, `audit`).
+    fn delivery_principal(&self) -> DeliveryPrincipal {
+        DeliveryPrincipal::OwnerToken
     }
 
     fn clock(&self) -> Clock {
