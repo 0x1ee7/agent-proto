@@ -1166,7 +1166,10 @@ impl<S: TaskStore> Tasks<S> {
                 StopReason::Backend(code) => Ending::Failed(code),
             }
         };
-        let detail = detail.map(|v| v.to_string());
+        let detail = detail.map(|v| match v {
+            serde_json::Value::String(text) => text,
+            other => other.to_string(),
+        });
         match ending {
             Ending::Completed => {
                 plan.move_to(Some(state), TaskState::Completed, None, None, now)?
@@ -1235,10 +1238,10 @@ impl<S: TaskStore> Tasks<S> {
         self.commit(plan)
     }
 
-    /// The `{"kind", "detail"}` cause recorded when the core itself ends a task (RFC-0005 0005-049).
+    /// The plain-text cause recorded when the core itself ends a task (RFC-0005 0005-049).
     /// Only fixed text is passed here, so nothing needs redaction.
     fn system_cause(kind: &str, text: &str) -> Option<String> {
-        Some(serde_json::json!({ "kind": kind, "detail": text }).to_string())
+        Some(format!("{kind}: {text}"))
     }
 
     /// Fails a WORKING task from the sender side when a peer-call send is refused with

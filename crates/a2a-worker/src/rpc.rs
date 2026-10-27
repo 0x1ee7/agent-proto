@@ -457,7 +457,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
 
     fn get_task(&self, head: &RequestHead, req: &pb::GetTaskRequest) -> Result<Handled, RpcError> {
         let view = self.tasks.task(&head.origin, &req.id)?;
-        Ok(plain(Response::Task(self.task_with_approval(&head.origin, &view)?)))
+        Ok(plain(Response::Task(
+            self.task_with_approval(&head.origin, &view)?,
+        )))
     }
 
     /// The task snapshot with its open approval request, when the task awaits one (0006-007).

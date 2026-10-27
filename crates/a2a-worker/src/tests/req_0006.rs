@@ -1,7 +1,7 @@
 //! RFC-0006 approvals: expiry, cancel, and the allow/deny decision paths.
 
 use super::*;
-use crate::backend::{Outcome, ReasonToken};
+use crate::backend::{Outcome, PermissionAnswer, ReasonToken};
 
 /// 0006-017: an approval whose `expires_at` passes while open is EXPIRED; the backend is
 /// answered `cancelled` and the task fails with APPROVAL_TIMEOUT. Boundary: 1 ms before expiry
@@ -197,6 +197,68 @@ fn req_0006_017_approval_timeout_fails_task_with_detail() {
     });
 }
 
+/// 0006-017: a backend failure that lands at the expiry instant does not win: the worker's
+/// expiry is authoritative, so the task fails APPROVAL_TIMEOUT, never BACKEND_CRASHED.
+#[test]
+fn req_0006_017_expiry_wins_over_backend_crash_at_same_instant() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![permission("p1", "edit"), completed()]);
+        let task = submit(bus, "write").await;
+        wait_for_state(bus, &task.id, pb::TaskState::InputRequired).await;
+
+        mock.crash("driver permission timeout");
+        advance(bus, APPROVAL_EXPIRY_MS);
+        let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        assert_eq!(failure_code(&failed).as_deref(), Some("APPROVAL_TIMEOUT"));
+    });
+}
+
+/// 0006-017: a backend failure that lands before the expiry instant is earlier and keeps its
+/// own end state; the expiry that follows does not rewrite it.
+#[test]
+fn req_0006_017_backend_crash_before_expiry_keeps_crash() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![permission("p1", "edit"), completed()]);
+        let task = submit(bus, "write").await;
+        wait_for_state(bus, &task.id, pb::TaskState::InputRequired).await;
+
+        mock.crash("driver exited");
+        advance(bus, APPROVAL_EXPIRY_MS - 1);
+        let failed = wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        assert_eq!(failure_code(&failed).as_deref(), Some("BACKEND_CRASHED"));
+    });
+}
+
+/// 0006-017: expiry answers the open permission `cancelled` before it stops the session.
+#[test]
+fn req_0006_017_expiry_cancels_permission_before_shutdown() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![permission("p1", "edit"), completed()]);
+        let task = submit(bus, "write").await;
+        wait_for_state(bus, &task.id, pb::TaskState::InputRequired).await;
+
+        advance(bus, APPROVAL_EXPIRY_MS);
+        wait_for_state(bus, &task.id, pb::TaskState::Failed).await;
+        let commands = mock.commands();
+        let resolve = commands
+            .iter()
+            .position(|c| matches!(c, Command::Resolve(_, PermissionAnswer::Cancelled)));
+        let shutdown = commands
+            .iter()
+            .position(|c| matches!(c, Command::Shutdown(_)));
+        assert!(
+            matches!((resolve, shutdown), (Some(r), Some(s)) if r < s),
+            "cancel must precede shutdown"
+        );
+    });
+}
+
 /// 0006-007: GetTask and ListTasks carry the open approval of an INPUT_REQUIRED task, so a
 /// client that missed the event can still answer it; once the task completes the snapshot no
 /// longer carries it.
@@ -229,7 +291,10 @@ fn req_0006_007_snapshots_carry_open_approval() {
         .await;
         let listed = envelope::decode_reply::<pb::ListTasksResponse>(&reply).unwrap();
         let [listed_task] = listed.tasks.as_slice() else {
-            panic!("expected exactly one listed task, got {}", listed.tasks.len());
+            panic!(
+                "expected exactly one listed task, got {}",
+                listed.tasks.len()
+            );
         };
         assert_eq!(
             snapshot_approval(listed_task).map(|r| r.request_id),

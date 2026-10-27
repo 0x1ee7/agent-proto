@@ -239,6 +239,11 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
     /// cancel kills, deadlines and approval expiry, then the outbox.
     pub async fn pump(&mut self) -> Result<(), WorkerError> {
         let now = self.now()?;
+        // Expiry is authoritative at its instant: it runs before backend output of the same
+        // instant, so a driver-side timeout or crash delivered with it cannot win (0006-017).
+        let effects = self.tasks.expire_due(now)?;
+        let effects = self.expire(effects, now)?;
+        self.run(effects, now)?;
         while let Ok(event) = self.events.try_recv() {
             let effects = self.on_backend_event(event, now)?;
             self.run(effects, now)?;
@@ -256,9 +261,6 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             let effects = self.kill(&task, StopReason::Cancelled, None, now)?;
             self.run(effects, now)?;
         }
-        let effects = self.tasks.expire_due(now)?;
-        let effects = self.expire(effects, now)?;
-        self.run(effects, now)?;
         self.release_held(now).await?;
         self.pump_delegation(now).await?;
         self.flush_outbox(now).await?;
@@ -616,6 +618,25 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         }
     }
 
+    /// Answers every open permission request with `cancelled` before the session is killed, so
+    /// the backend never waits on an answer the worker will not deliver (0006-017).
+    fn cancel_pending_permissions(&mut self) {
+        let pending = std::mem::take(&mut self.permissions);
+        for (approval_id, offers) in pending {
+            for offered in offers {
+                if let Err(err) = self.backend.resolve_permission(
+                    &RequestId::new(&offered.backend_id),
+                    PermissionAnswer::Cancelled,
+                ) {
+                    self.audit(
+                        None,
+                        format!("RESOLVE_PERMISSION_FAILED {approval_id}: {err}"),
+                    );
+                }
+            }
+        }
+    }
+
     /// Applies `expire_due` output. `KillBackend` is kill-then-commit (0005-037, 0005-041): the
     /// session stops first, then `commit_expired` records the end state. Queued work then starts.
     fn expire(&mut self, effects: Vec<Effect>, now: u64) -> Result<Vec<Effect>, WorkerError> {
@@ -624,6 +645,7 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         for effect in effects {
             match effect {
                 Effect::KillBackend { task_id } => {
+                    self.cancel_pending_permissions();
                     self.stop_session(&task_id);
                     self.publish_before_kill(&task_id, now)?;
                     out.extend(self.tasks.commit_expired(&task_id, now)?);
