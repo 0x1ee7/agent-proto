@@ -232,16 +232,22 @@ pub fn restrict_to_owner(path: &Path, is_dir: bool) -> Result<(), PlatformError>
     } else {
         format!("{user}:F")
     };
-    let status = std::process::Command::new(icacls_path())
+    let output = std::process::Command::new(icacls_path())
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
         .arg(grant)
-        .status()?;
-    if !status.success() {
+        .output()?;
+    if !output.status.success() {
+        // icacls prints its per-file progress to stdout; it is shown only when the call fails.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(PlatformError::Msg(format!(
-            "icacls failed on {}: {status}",
-            path.display()
+            "icacls failed on {}: {}: {} {}",
+            path.display(),
+            output.status,
+            stderr.trim(),
+            stdout.trim()
         )));
     }
     Ok(())
@@ -627,6 +633,37 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Re-runs this test in a child process so the child's stdout can be read. `icacls` must
+    /// not write to it on success (0012-025 ACL setup, the `run` command prints only its own output).
+    #[cfg(windows)]
+    #[test]
+    fn req_0012_025_icacls_output_stays_off_stdout() {
+        const CHILD_DIR: &str = "A2AD_ICACLS_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            restrict_to_owner(Path::new(&dir), true).expect("icacls succeeds");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("a2ad-icacls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "platform::tests::req_0012_025_icacls_output_stays_off_stdout",
+                "--nocapture",
+            ])
+            .env(CHILD_DIR, &dir)
+            .output()
+            .expect("run child test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "child test failed: {stdout}");
+        assert!(
+            !stdout.contains("processed file"),
+            "icacls wrote to stdout: {stdout}"
+        );
     }
 
     #[test]

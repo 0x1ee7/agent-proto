@@ -495,6 +495,17 @@ fn status_reports_not_running_when_no_supervisor_holds_the_lock() {
     assert_eq!(report["agents"], serde_json::json!([]));
 }
 
+/// A state directory with no `run/` yet (a fresh install) is not running, not an error (0012-055).
+#[test]
+fn req_0012_055_status_without_run_dir_reports_not_running() {
+    let setup = plain_setup("status-no-run-dir");
+    let cfg = setup.write_config("supervisor.toml", &setup.config(4292, 9496));
+    assert!(!setup.state.join("run").exists());
+    let report = status_json(&cfg);
+    assert_eq!(report["running"], false);
+    assert_eq!(report["agents"], serde_json::json!([]));
+}
+
 #[test]
 fn req_0012_055_stop_without_supervisor_exits_0() {
     let setup = plain_setup("stop-idle");

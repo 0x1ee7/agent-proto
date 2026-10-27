@@ -4,7 +4,7 @@
 //! child processes, readiness probes, bounded restarts and phased shutdown.
 //! Operational events are appended to `<state>/logs/supervisor.jsonl`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -16,13 +16,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use a2a_audit::clock::SystemClock as AuditClock;
+use a2a_audit::sink::JsonlSink;
+use a2a_audit::spool::SPOOL_CAP_BYTES;
 use fd_lock::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::broker::{self, Broker, BrokerError};
 use crate::config::{AgentSpec, Config, Probe, Readiness, Restart, is_provider_key};
-use crate::creds::{self, CredsError, DELEGATION_FILE, DelegationFile, Grant, LOGS_DIR, RUN_DIR};
+use crate::creds::{
+    self, AUDIT_DIR, CredsError, DELEGATION_FILE, DelegationFile, Grant, LOGS_DIR, RUN_DIR,
+};
 use crate::health::{HealthHandle, HealthServeError, HealthServer};
 use crate::host;
 use crate::platform::{self, Containment, PlatformError};
@@ -222,6 +227,9 @@ pub struct Supervisor {
     slots: Vec<Slot>,
     broker: Option<Broker>,
     health_stop: Arc<AtomicBool>,
+    health: HealthHandle,
+    /// Audit sink; `None` when it could not be opened, so `/readyz` reports `sink: unavailable`.
+    sink: Option<JsonlSink>,
 }
 
 impl fmt::Debug for Supervisor {
@@ -255,6 +263,8 @@ impl Supervisor {
             slots,
             broker: None,
             health_stop: Arc::new(AtomicBool::new(false)),
+            health: HealthHandle::new(),
+            sink: None,
         }
     }
 
@@ -279,10 +289,10 @@ impl Supervisor {
         let _ = fs::remove_file(stop_request_path(&state));
         let health_server = HealthServer::bind(self.config.health_listen())
             .map_err(|err| SupervisorError::Io(io::Error::other(err.to_string())))?;
+        self.sink = open_sink(&state);
         self.broker = Some(Broker::start(&self.config, &keys)?);
-        let health_handle = HealthHandle::new();
-        let health_thread = self.start_health(health_server, &health_handle);
-        health_handle.update(|health| health.bus_connected = true);
+        let health_thread = self.start_health(health_server);
+        self.health.update(|health| health.bus_connected = true);
         let _ = log_event(
             &state,
             "SUPERVISOR_STARTED",
@@ -290,20 +300,16 @@ impl Supervisor {
             json!({"pid": std::process::id()}),
         );
         let outcome = self.supervise();
-        health_handle.update(|health| health.bus_connected = false);
+        self.health.update(|health| health.bus_connected = false);
         self.shutdown();
         self.health_stop.store(true, Ordering::SeqCst);
         let _ = health_thread.join();
         outcome
     }
 
-    /// Serves `/healthz` and `/metrics` on a thread until `health_stop` is set (0013-033).
-    fn start_health(
-        &self,
-        server: HealthServer,
-        handle: &HealthHandle,
-    ) -> JoinHandle<Result<(), HealthServeError>> {
-        let thread_handle = handle.clone();
+    /// Serves `/healthz`, `/readyz` and `/metrics` until `health_stop` is set (0013-033).
+    fn start_health(&self, server: HealthServer) -> JoinHandle<Result<(), HealthServeError>> {
+        let thread_handle = self.health.clone();
         let stop = Arc::clone(&self.health_stop);
         thread::spawn(move || server.run(&thread_handle, &stop))
     }
@@ -370,6 +376,25 @@ impl Supervisor {
                 _ => {}
             }
         }
+        self.publish_health();
+    }
+
+    /// Publishes the readiness inputs to the health endpoints: sink, spool fill and each agent's
+    /// supervisor state (0013-036, 0013-037).
+    fn publish_health(&self) {
+        let state = self.config.state_dir();
+        let sink_writing = self.sink.as_ref().is_some_and(sink_writable);
+        let spool_ratio = spool_fill_ratio(&state.join(AUDIT_DIR).join("spool"), SPOOL_CAP_BYTES);
+        let agents: BTreeMap<String, String> = self
+            .slots
+            .iter()
+            .map(|slot| (slot.id.clone(), phase_name(slot.phase).to_owned()))
+            .collect();
+        self.health.update(|health| {
+            health.sink_writing = sink_writing;
+            health.spool_ratio = spool_ratio;
+            health.agents = agents;
+        });
     }
 
     fn reap(&mut self, i: usize, now: Instant) {
@@ -845,7 +870,13 @@ fn take_stop_request(state: &Path) -> bool {
 /// Reads all run records of the state directory.
 pub fn read_records(state: &Path) -> io::Result<Vec<RunRecord>> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(state.join(RUN_DIR))? {
+    let entries = match fs::read_dir(state.join(RUN_DIR)) {
+        Ok(entries) => entries,
+        // No `run/` yet: no supervisor has recorded an agent in this state directory.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(out),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
         let path = entry?.path();
         if !path.extension().is_some_and(|ext| ext == "json") {
             continue;
@@ -857,6 +888,50 @@ pub fn read_records(state: &Path) -> io::Result<Vec<RunRecord>> {
     }
     out.sort_by(|a, b| a.agent.cmp(&b.agent));
     Ok(out)
+}
+
+/// Opens the audit sink under `<state>/audit/` (RFC-0013 [0013-014], [0013-018]). A failure is
+/// logged and leaves the sink unavailable, so `/readyz` reports `sink: unavailable` (0013-036).
+fn open_sink(state: &Path) -> Option<JsonlSink> {
+    match JsonlSink::open(&state.join(AUDIT_DIR), Arc::new(AuditClock)) {
+        Ok(sink) => Some(sink),
+        Err(_) => {
+            let _ = log_event(state, "SINK_UNAVAILABLE", None, json!({}));
+            None
+        }
+    }
+}
+
+/// Whether a write would reach the sink's current file: the file opens for append. Nothing is
+/// written, so the probe leaves the audit trail unchanged.
+fn sink_writable(sink: &JsonlSink) -> bool {
+    OpenOptions::new()
+        .append(true)
+        .open(sink.current_path())
+        .is_ok()
+}
+
+/// Largest fill ratio of any `*.jsonl` spool file in `dir` against `cap` bytes (0013-036). A
+/// missing directory holds no spool. File length bounds the live bytes, so the ratio is an upper
+/// bound. A spool that cannot be inspected counts as full, so readiness fails closed.
+fn spool_fill_ratio(dir: &Path, cap: u64) -> f64 {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return 0.0,
+        Err(_) => return 1.0,
+    };
+    let mut worst = 0.0_f64;
+    for entry in entries {
+        let Ok(entry) = entry else { return 1.0 };
+        if !entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            return 1.0;
+        };
+        worst = worst.max(meta.len() as f64 / cap as f64);
+    }
+    worst
 }
 
 fn write_record(state: &Path, record: &RunRecord) -> io::Result<()> {
@@ -1382,5 +1457,95 @@ mod tests {
         let config = fixture(state.path(), &fake_agent("fake", ""));
         assert_eq!(config.drain(), Duration::from_millis(15_000));
         assert_eq!(config.grace(), Duration::from_millis(10_000));
+    }
+
+    fn supervisor(state: &Path, agents: &str) -> Supervisor {
+        let config = fixture(state, agents);
+        let stop = Arc::new(AtomicBool::new(false));
+        Supervisor::new(config, state.join("supervisor.toml"), stop)
+    }
+
+    /// A supervisor with its audit sink open and the bus connected.
+    fn ready_supervisor(state: &Path, agents: &str) -> Supervisor {
+        let mut sup = supervisor(state, agents);
+        sup.sink = open_sink(state);
+        sup.health.update(|health| health.bus_connected = true);
+        sup
+    }
+
+    /// Publishes the readiness inputs, then returns the `/readyz` status and parsed body.
+    fn readiness(sup: &Supervisor) -> (u16, Value) {
+        sup.publish_health();
+        let response = a2a_audit::health::readyz(&sup.health.snapshot());
+        let body = serde_json::from_str(&response.body).expect("readyz body is JSON");
+        (response.status, body)
+    }
+
+    #[test]
+    fn req_0013_036_readyz_is_200_when_bus_sink_and_spool_are_ready() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let sup = ready_supervisor(state.path(), &fake_agent("omp", ""));
+        let (status, body) = readiness(&sup);
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["bus"], "connected");
+        assert_eq!(body["sink"], "writing");
+    }
+
+    #[test]
+    fn req_0013_036_readyz_is_503_when_the_audit_dir_cannot_be_created() {
+        let state = tempfile::tempdir().expect("tempdir");
+        // A regular file where the audit directory belongs: the sink cannot open.
+        fs::write(state.path().join(AUDIT_DIR), b"blocked").expect("blocker");
+        let mut sup = supervisor(state.path(), &fake_agent("omp", ""));
+        sup.sink = open_sink(state.path());
+        sup.health.update(|health| health.bus_connected = true);
+        assert!(sup.sink.is_none());
+        let (status, body) = readiness(&sup);
+        assert_eq!(status, 503);
+        assert_eq!(body["sink"], "unavailable");
+    }
+
+    #[test]
+    fn req_0013_036_readyz_is_503_when_the_sink_file_is_gone() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let sup = ready_supervisor(state.path(), &fake_agent("omp", ""));
+        let current = sup
+            .sink
+            .as_ref()
+            .expect("sink open")
+            .current_path()
+            .to_path_buf();
+        fs::remove_file(&current).expect("remove sink file");
+        let (status, body) = readiness(&sup);
+        assert_eq!(status, 503);
+        assert_eq!(body["sink"], "unavailable");
+    }
+
+    #[test]
+    fn req_0013_036_spool_fill_ratio_is_the_fullest_jsonl_spool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("omp.jsonl"), vec![b'x'; 900]).expect("write");
+        fs::write(dir.path().join("worker.jsonl"), vec![b'x'; 100]).expect("write");
+        fs::write(dir.path().join("notes.txt"), vec![b'x'; 5000]).expect("write");
+        assert!((spool_fill_ratio(dir.path(), 1000) - 0.9).abs() < 1e-9);
+        assert_eq!(spool_fill_ratio(&dir.path().join("missing"), 1000), 0.0);
+    }
+
+    #[test]
+    fn req_0013_037_readyz_body_lists_each_agent_supervisor_state() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let agents = format!("{}{}", fake_agent("omp", ""), fake_agent("worker", ""));
+        let mut sup = ready_supervisor(state.path(), &agents);
+        sup.slots
+            .iter_mut()
+            .find(|slot| slot.id == "omp")
+            .expect("omp slot")
+            .phase = Phase::Ready;
+        let (status, body) = readiness(&sup);
+        // Agent state is reported but does not gate readiness (0013-036).
+        assert_eq!(status, 200);
+        assert_eq!(body["agents"]["omp"], "ready");
+        assert_eq!(body["agents"]["worker"], "pending");
     }
 }

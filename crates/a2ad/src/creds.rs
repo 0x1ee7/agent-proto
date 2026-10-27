@@ -24,6 +24,12 @@ pub const CREDS_DIR: &str = "creds";
 pub const RUN_DIR: &str = "run";
 /// Directory of per-agent log files.
 pub const LOGS_DIR: &str = "logs";
+/// Workspace directory under the state directory (RFC-0012 [0012-006]).
+pub const WS_DIR: &str = "ws";
+/// Artifact directory under the state directory (RFC-0012 [0012-006]).
+pub const ARTIFACTS_DIR: &str = "artifacts";
+/// Audit directory under the state directory: JSONL sink and worker spools (RFC-0013 [0013-014], [0013-018]).
+pub const AUDIT_DIR: &str = "audit";
 /// JetStream store directory of the broker, relative to the state directory.
 pub const NATS_STORE_DIR: &str = "nats/jetstream";
 /// Delegation file name inside `run/<agent>/` (RFC-0015 [0015-082]).
@@ -90,8 +96,11 @@ pub fn ensure_layout(state_dir: &Path) -> Result<(), CredsError> {
     let dirs = [
         state_dir.to_path_buf(),
         state_dir.join(CREDS_DIR),
+        state_dir.join(WS_DIR),
+        state_dir.join(ARTIFACTS_DIR),
         state_dir.join(RUN_DIR),
         state_dir.join(LOGS_DIR),
+        state_dir.join(AUDIT_DIR),
         state_dir.join(NATS_STORE_DIR),
     ];
     for dir in &dirs {
@@ -295,6 +304,15 @@ mod tests {
         assert!(first.starts_with('U'));
         let seed = load_seed(dir.path(), "alpha").expect("load");
         assert!(seed.starts_with("SU"));
+    }
+
+    #[test]
+    fn req_0012_006_ensure_layout_creates_every_state_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ensure_layout(dir.path()).expect("layout");
+        for name in [CREDS_DIR, "ws", "artifacts", AUDIT_DIR, RUN_DIR] {
+            assert!(dir.path().join(name).is_dir(), "{name} missing");
+        }
     }
 
     #[test]
