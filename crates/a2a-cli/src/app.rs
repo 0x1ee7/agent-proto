@@ -36,12 +36,10 @@ pub fn now_ms() -> Result<u64, CliError> {
 pub fn build_session<B: Bus>(
     bus: B,
     settings: &Settings,
-    signing: Option<Arc<dyn SigningHook>>,
+    operator: Option<Arc<dyn SigningHook>>,
     trust: Option<Arc<TrustStore>>,
 ) -> Result<Session<B>, CliError> {
-    let signed = signing.is_some();
     let config = Config {
-        signing,
         trust,
         ..Config::default()
     };
@@ -55,7 +53,7 @@ pub fn build_session<B: Bus>(
     Ok(Session {
         client,
         settings: settings.clone(),
-        signed,
+        operator,
     })
 }
 

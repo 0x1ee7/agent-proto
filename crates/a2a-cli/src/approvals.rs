@@ -1,5 +1,5 @@
 //! `a2a approvals`: lists open approval requests and records operator decisions.
-//! Decisions are signed by the client; the CLI never sends an unsigned decision.
+//! Decisions are signed by the operator hook; the CLI never sends an unsigned decision.
 
 use a2a_client::{SendReply, approval::PendingApproval};
 use a2a_types::ids::AgentId;
@@ -205,12 +205,12 @@ pub async fn decide<B: Bus>(
             "--note is not supported: ApprovalDecision carries no note field (RFC-0006)".to_owned(),
         ));
     }
-    if !session.signed {
+    let Some(operator) = session.operator.as_deref() else {
         return Err(CliError::Failed(
             "no operator signing key configured; decisions are never sent unsigned (0012-058)"
                 .to_owned(),
         ));
-    }
+    };
     let open = open_approvals(session, args.agent.as_deref()).await?;
     let found = open
         .into_iter()
@@ -230,7 +230,13 @@ pub async fn decide<B: Bus>(
     confirm(io, approve, args.yes)?;
     let reply = session
         .client
-        .decide(&found.agent, &found.pending, &option, &session.opts())
+        .decide_signed(
+            &found.agent,
+            &found.pending,
+            &option,
+            operator,
+            &session.opts(),
+        )
         .await?;
     match reply.value {
         SendReply::Task(task) => {

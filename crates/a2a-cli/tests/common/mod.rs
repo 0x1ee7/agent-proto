@@ -10,9 +10,11 @@ use std::time::Duration;
 use a2a_cli::commands::Session;
 use a2a_cli::config::Settings;
 use a2a_cli::output::Io;
+use a2a_client::signing::envelope_hook;
 use a2a_client::{Client, Config};
 use a2a_core::envelope::{self, Clock, Inbound, ReplyOptions};
 use a2a_core::subject::{self, Op};
+use a2a_security::identity::Ed25519Signer;
 use a2a_types::ids::{AgentId, TenantId};
 use bus_api::bus::{Bus, RequestStream};
 use bus_api::capabilities::Capabilities;
@@ -295,12 +297,17 @@ impl Fixture {
         }
     }
 
-    /// Session over a fresh client. `signed` states whether an operator signing hook exists.
+    /// Session over a fresh client. When `signed`, decisions carry an operator signature from a
+    /// fixed test key.
     pub fn session(&self, agents: Vec<AgentId>, signed: bool) -> Session<Shared> {
+        let operator = signed.then(|| {
+            let signer = Ed25519Signer::from_seed(&self.operator, &[9; 32]);
+            envelope_hook(Arc::new(signer), self.clock.clone())
+        });
         Session {
             client: self.client(),
             settings: self.settings(agents),
-            signed,
+            operator,
         }
     }
 
@@ -317,11 +324,21 @@ impl Fixture {
             .expect("serve")
     }
 
-    /// Receives one request and decodes it.
-    pub async fn next_inbound(&self, requests: &mut <MemBus as Bus>::Requests) -> Inbound {
-        let request: Request = requests.next().await.expect("request");
+    /// Receives one raw request, as the bus delivers it.
+    pub async fn next_request(&self, requests: &mut <MemBus as Bus>::Requests) -> Request {
+        requests.next().await.expect("request")
+    }
+
+    /// Decodes a raw request as the worker does.
+    pub fn decode(&self, request: Request) -> Inbound {
         envelope::receive(&envelope::Config::default(), self.clock.as_ref(), request)
             .expect("worker accepts request")
+    }
+
+    /// Receives one request and decodes it.
+    pub async fn next_inbound(&self, requests: &mut <MemBus as Bus>::Requests) -> Inbound {
+        let request = self.next_request(requests).await;
+        self.decode(request)
     }
 
     /// Replies to an inbound request with `message`.

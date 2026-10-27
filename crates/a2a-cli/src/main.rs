@@ -136,7 +136,7 @@ async fn run(cli: &Cli) -> Result<Exit, CliError> {
     .map_err(|error| CliError::Unavailable(format!("cannot connect to the bus: {error}")))?;
 
     let trust = Arc::new(load_trust(&settings.trust_file)?);
-    let signing: Option<Arc<dyn SigningHook>> = if needs_signing(&cli.command) {
+    let operator: Option<Arc<dyn SigningHook>> = if needs_signing(&cli.command) {
         let signer = a2a_security::storage::load_signer(
             &settings.security_dir,
             &trust,
@@ -153,6 +153,6 @@ async fn run(cli: &Cli) -> Result<Exit, CliError> {
     } else {
         None
     };
-    let session = app::build_session(bus, &settings, signing, Some(trust))?;
+    let session = app::build_session(bus, &settings, operator, Some(trust))?;
     app::dispatch(&cli.command, &session, &mut streams).await
 }

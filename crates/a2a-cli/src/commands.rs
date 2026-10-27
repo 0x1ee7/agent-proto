@@ -1,9 +1,11 @@
 //! Bus-facing commands. Everything here is generic over `bus_api::Bus`; only the binary
 //! names a concrete bus.
 
+use std::sync::Arc;
+
 use a2a_client::{
-    CallOptions, Client, Directory, Event, Outbound, Outcome, Query, SendReply, StreamStart,
-    stream::EventStream, text,
+    CallOptions, Client, Directory, Event, Outbound, Outcome, Query, SendReply, SigningHook,
+    StreamStart, stream::EventStream, text,
 };
 use a2a_types::ids::{AgentId, ContextId, TaskId};
 use a2a_types::proto::a2a as pb;
@@ -18,15 +20,15 @@ use crate::output::{Io, line, write_json};
 pub struct Session<B: Bus> {
     pub client: Client<B>,
     pub settings: Settings,
-    /// Whether the client holds an operator signing hook. Decisions require it.
-    pub signed: bool,
+    /// Operator signing hook for decisions; decisions are never sent without one (0012-058).
+    pub operator: Option<Arc<dyn SigningHook>>,
 }
 
 impl<B: Bus> std::fmt::Debug for Session<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("settings", &self.settings)
-            .field("signed", &self.signed)
+            .field("signed", &self.operator.is_some())
             .finish_non_exhaustive()
     }
 }

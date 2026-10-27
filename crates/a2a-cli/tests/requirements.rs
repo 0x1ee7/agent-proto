@@ -15,6 +15,7 @@ use a2a_client::{ApprovalError, ClientError};
 use a2a_core::approval::{ALLOW_ONCE_ID, REJECT_ONCE_ID};
 use a2a_core::envelope::RequestBody;
 use a2a_core::errors::WireError;
+use a2a_core::headers::{KID, SIG};
 use a2a_core::subject::Op;
 use a2a_types::proto::a2a as pb;
 use a2a_types::vocab::ext::APPROVAL;
@@ -352,7 +353,7 @@ async fn req_0012_057_non_tty_decision_needs_yes_and_sends_nothing() {
 }
 
 // [0012-057] With `--yes` the decision is sent as a SendMessage naming the offered option, and
-// the resulting task is reported. Signing itself is checked by req_0012_058.
+// the resulting task is reported. Its envelope carries the operator's signature headers (0012-058).
 #[tokio::test]
 async fn req_0012_057_yes_sends_the_decision_once() {
     let fx = Fixture::new();
@@ -369,9 +370,18 @@ async fn req_0012_057_yes_sends_the_decision_once() {
             inbound,
             &list_answer(vec![approval_task("t-9", EXPIRES_AT)]),
         );
-        let inbound = tokio::time::timeout(WORKER_WAIT, fx.next_inbound(&mut sends))
+        let request = tokio::time::timeout(WORKER_WAIT, fx.next_request(&mut sends))
             .await
             .expect("decision reached the worker");
+        assert!(
+            request.headers.get(KID).is_some(),
+            "decision names its signing key"
+        );
+        assert!(
+            request.headers.get(SIG).is_some(),
+            "decision carries a signature"
+        );
+        let inbound = fx.decode(request);
         let decision = decision_of(&inbound.body);
         fx.reply(inbound, &send_answer(task("t-9", pb::TaskState::Working)));
         decision

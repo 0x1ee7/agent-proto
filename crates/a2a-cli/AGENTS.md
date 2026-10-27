@@ -32,9 +32,9 @@ Uses: `a2a-client` (requester runtime, signing hook), `a2a-audit` (chain verific
   ([0012-056]).
 - Approval decisions show the request card on stderr before any prompt. Without a terminal, a
   decision needs `--yes`; otherwise nothing is decided ([0012-057]).
-- Decisions are sent only through an operator signing hook. The signer is loaded only for approve
-  and deny, so read-only commands work without a key. An unsigned session never decides
-  ([0012-058]).
+- Decisions go only through `Client::decide_signed`, with the operator hook the session holds. The
+  signer is loaded only for approve and deny, so read-only commands work without a key. An
+  unsigned session never decides ([0012-058]).
 - The crate never reads or names provider API keys ([0012-058]).
 - Color is ANSI only on a terminal, with `NO_COLOR` unset. There is no color flag ([0012-059]).
 - Audit verification exits 0 on a clean chain and 1 on the first broken line, naming that line
