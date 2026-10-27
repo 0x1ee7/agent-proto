@@ -356,7 +356,7 @@ class Page:
                 yy += line_h + 4
                 continue
             for i, line in enumerate(wrap(item, size, w - 44)):
-                self.text(x + 16, yy, ("• " if i == 0 else "  ") + line, size, SUB, fit=w - 30)
+                self.text(x + 16, yy, ("- " if i == 0 else "  ") + line, size, SUB, fit=w - 30)
                 yy += line_h
         if yy - line_h + 8 > y + h:
             raise LayoutError(f"{self.name}: card {title!r} needs {yy - line_h + 8 - y:.0f}px "
@@ -483,8 +483,8 @@ class Page:
             raise LayoutError(f"{self.name}: the matrix is {-spare:.0f}px too tall")
         heights = [h + spare / len(heights) for h in heights]
 
-        self.text(x + 8, y + 22, "user ↓", 9.5, DIM)
-        self.text(x + 8, y + 39, "provider →", 9.5, DIM)
+        self.text(x + 8, y + 22, "user v", 9.5, DIM)
+        self.text(x + 8, y + 39, "provider ->", 9.5, DIM)
         for j, col in enumerate(cols):
             cx = x + label_w + j * col_w
             fill, stroke = KINDS[kinds.get(col, "core")]
@@ -496,13 +496,13 @@ class Page:
             fill, stroke = KINDS[kinds.get(row, "core")]
             self.rect(x, yy + 2, label_w - 4, h - 4, fill, stroke=stroke, width=1, rx=6)
             self.text(x + 12, yy + h / 2 - 2, row, 12, WHITE, 700, fit=label_w - 24)
-            self.text(x + 12, yy + h / 2 + 14, "uses →", 9, SUB)
+            self.text(x + 12, yy + h / 2 + 14, "uses ->", 9, SUB)
             for j, col in enumerate(cols):
                 cx = x + label_w + j * col_w
                 lines = lines_of(row, col)
                 if row == col:
                     self.rect(cx + 2, yy + 2, col_w - 4, h - 4, UNDERLAY, rx=6)
-                    self.text(cx + col_w / 2, yy + h / 2 + 4, "—", 10, FAINT, anchor="middle")
+                    self.text(cx + col_w / 2, yy + h / 2 + 4, "-", 10, FAINT, anchor="middle")
                 elif lines:
                     self.rect(cx + 2, yy + 2, col_w - 4, h - 4, "rgba(6, 78, 59, 0.18)",
                               stroke="#34d399", width=0.8, rx=6)
@@ -510,7 +510,7 @@ class Page:
                     for item in cells[(row, col)]:
                         for k, line in enumerate(wrap(item, size, text_w)):
                             self.text(cx + pad + (0 if k == 0 else 12), ty,
-                                      ("· " if k == 0 else "") + line, size, TEXT,
+                                      ("- " if k == 0 else "") + line, size, TEXT,
                                       fit=col_w - 2 * pad)
                             ty += line_h
                 elif (row, col) in forbidden:
@@ -528,7 +528,7 @@ class Page:
                     self.rect(cx + 2, yy + 2, col_w - 4, h - 4, "rgba(15, 23, 42, 0.55)",
                               stroke="#1e293b", width=0.8, rx=6)
                     self.text(cx + col_w / 2, yy + h / 2 + 4,
-                              "× would point upwards" if upwards else "· allowed, not used",
+                              "x would point upwards" if upwards else "- allowed, not used",
                               9, FAINT if upwards else DIM, anchor="middle")
             yy += h
         return Box(x, y, self.W - MARGIN - x, yy - y)
@@ -546,7 +546,7 @@ class Page:
         self.text(self.W - MARGIN, 53, f"{self.number:02d} / {self.total:02d}", 14, DIM, 600,
                   "end")
         self.text(self.W - MARGIN, 76, f"{project} architecture", 10, FAINT, anchor="end")
-        self.text(MARGIN, self.H - 16, f"{project} · as of commit {commit} ({date}) · drawn by "
+        self.text(MARGIN, self.H - 16, f"{project} | as of commit {commit} ({date}) | drawn by "
                   f"{generator}", 9, FAINT)
         if footer_right:
             self.text(self.W - MARGIN, self.H - 16, footer_right, 9, FAINT, anchor="end")
@@ -608,7 +608,7 @@ def improvement_register(p, areas, order, order_notes, x0=590.0, area_kinds=None
         for ident in idents:
             priority = REGISTRY[ident].priority
             counts[priority] = counts.get(priority, 0) + 1
-        summary = " · ".join(f"{n} {priority}" for priority, n in counts.items())
+        summary = " | ".join(f"{n} {priority}" for priority, n in counts.items())
         p.text(MARGIN + left_w - 16, y + 32, summary, 9, SUB, anchor="end")
         y += 98
 
@@ -618,7 +618,7 @@ def improvement_register(p, areas, order, order_notes, x0=590.0, area_kinds=None
     for i, ident in enumerate(order):
         width = p.badge(x, card.b - 18, ident)
         if i + 1 < len(order):
-            p.text(x + width + 3, card.b - 19, "→", 9, DIM)
+            p.text(x + width + 3, card.b - 19, "->", 9, DIM)
         x += width + 12
     if x > card.r:
         raise LayoutError(f"{p.name}: the suggested order is wider than its card")
