@@ -31,7 +31,7 @@ Tests are named `req_0013_NNN_*` inside the module that implements the rule. Int
 - 0013-034, 035: `metrics.rs`
 - 0013-047: `coalesce.rs` and `tests/req_0013.rs`
 - 0013-050: `schema.rs` (SUBMISSION_DROPPED is worker-only)
-- 0013-051: `gaplog.rs` and `sink.rs` (`JsonlSink::report_gaps` writes a `warn` record; consumers never write `AUDIT_GAP`)
+- 0013-039, 0013-051: `gaplog.rs` (the `warn` gap record in `audit-gaps.log`, rotated at 10 MiB with five rotated copies) and `sink.rs` (`JsonlSink::report_gaps` writes it; consumers never write `AUDIT_GAP`)
 - 0013-003, 013, 014: `tests/req_0013.rs` (publish payload, retained-on-failure, reopen continuity)
 
-Not implemented here, owned by other crates or the listener/CLI: 0013-006 (bus fixture), 0013-009 to 0013-012 (bus transport), 0013-032 and 0013-038 to 0013-040 (logging; only the consumer gap warning in `gaplog.rs` exists, and log rotation under 0013-039 is not done), listener wiring for 0013-033/036/037, and the `audit verify` CLI.
+Not implemented here, owned by other crates or the listener/CLI: 0013-006 (bus fixture), 0013-009 to 0013-012 (bus transport), 0013-032 and 0013-038 to 0013-040 (logging; the gap log's rotation under 0013-039 is in `gaplog.rs`, the rest of the logging lives elsewhere), listener wiring for 0013-033/036/037, and the `audit verify` CLI.
