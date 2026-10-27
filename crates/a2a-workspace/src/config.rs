@@ -85,6 +85,10 @@ pub struct WorkspaceConfig {
     pub non_git: NonGitPolicy,
     /// Copy-mode limits.
     pub copy_limits: CopyLimits,
+    /// Operator glob patterns excluded from copy mode in addition to the built-in denylist
+    /// (RFC-0012 0012-074). A pattern without `/` matches a base name at any depth; a pattern
+    /// with `/` matches the path relative to the source root. Matching is case-insensitive.
+    pub copy_exclude: Vec<String>,
     /// Retention policy for retained workspaces.
     pub retention: Retention,
     /// Patch artifact cap in bytes. Default 16 MiB (RFC-0012 0012-041).
@@ -108,6 +112,7 @@ impl WorkspaceConfig {
             base_ref: "HEAD".to_string(),
             non_git: NonGitPolicy::Refuse,
             copy_limits: CopyLimits::default(),
+            copy_exclude: Vec::new(),
             retention: Retention::default(),
             patch_cap_bytes: PATCH_CAP_BYTES,
         }

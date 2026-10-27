@@ -2,7 +2,9 @@
 //! remote operations. Only the typed operations below are reachable; none of them fetch, push,
 //! pull or touch remotes, and none checks out or resets an operator branch.
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
@@ -80,6 +82,11 @@ fn run(dir: &Path, sub: &[&OsStr]) -> Result<Vec<u8>> {
     if out.status.success() {
         return Ok(out.stdout);
     }
+    Err(failed(sub, &out))
+}
+
+/// Error for a git invocation that exited unsuccessfully; carries the first line of stderr.
+fn failed(sub: &[&OsStr], out: &Output) -> WorkspaceError {
     let verb = sub
         .first()
         .map(|s| s.to_string_lossy().into_owned())
@@ -87,10 +94,31 @@ fn run(dir: &Path, sub: &[&OsStr]) -> Result<Vec<u8>> {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let first = stderr.lines().next().unwrap_or("").trim();
     let first: String = first.chars().take(300).collect();
-    Err(WorkspaceError::new(
+    WorkspaceError::new(
         ErrorKind::Git,
         format!("git {verb} failed ({}): {first}", out.status),
-    ))
+    )
+}
+
+/// Runs git with `input` written to its stdin. The write happens on a scoped thread so a large
+/// input cannot block against a full stdout pipe.
+fn run_with_input(dir: &Path, sub: &[&OsStr], input: &[u8]) -> Result<Output> {
+    let mut child = command(dir, sub)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| WorkspaceError::new(ErrorKind::Git, format!("cannot start git: {e}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| WorkspaceError::new(ErrorKind::Git, "git stdin pipe is missing"))?;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            // A closed pipe means git stopped reading; its exit status reports the failure.
+            let _ = stdin.write_all(input);
+        });
+        child.wait_with_output()
+    })
+    .map_err(|e| WorkspaceError::new(ErrorKind::Git, format!("cannot wait for git: {e}")))
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -344,18 +372,39 @@ pub(crate) fn init_repo(dir: &Path, branch: &str) -> Result<()> {
     .map(|_| ())
 }
 
-/// Stages every file, including ignored ones, for the copy baseline.
+/// Stages every file that is not git-ignored, for the copy baseline. Ignored files are never
+/// forced into the index (RFC-0012 0012-073).
 pub(crate) fn add_all(dir: &Path) -> Result<()> {
-    run(
-        dir,
-        &[
-            OsStr::new("add"),
-            OsStr::new("-A"),
-            OsStr::new("-f"),
-            OsStr::new("."),
-        ],
-    )
-    .map(|_| ())
+    run(dir, &[OsStr::new("add"), OsStr::new("-A"), OsStr::new(".")]).map(|_| ())
+}
+
+/// Returns the candidate paths that git ignores in `dir`. Paths are `/`-separated and relative to
+/// `dir`. `--no-index` makes the answer depend on ignore rules alone, not on the index.
+pub(crate) fn check_ignore(dir: &Path, paths: &[&str]) -> Result<HashSet<String>> {
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let sub = [
+        OsStr::new("check-ignore"),
+        OsStr::new("--no-index"),
+        OsStr::new("-z"),
+        OsStr::new("--stdin"),
+    ];
+    let out = run_with_input(dir, &sub, &input)?;
+    match out.status.code() {
+        // Exit 0: at least one path is ignored; the listed paths are NUL-terminated.
+        Some(0) => Ok(out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect()),
+        // Exit 1: nothing is ignored.
+        Some(1) => Ok(HashSet::new()),
+        _ => Err(failed(&sub, &out)),
+    }
 }
 
 /// Creates the copy baseline commit.

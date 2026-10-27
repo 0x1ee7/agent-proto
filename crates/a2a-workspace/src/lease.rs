@@ -42,6 +42,10 @@ pub(crate) struct LeaseRecord {
     pub branch: String,
     pub base_commit: String,
     pub source_dirty: bool,
+    /// Entries the copy excluded by denylist, `copy_exclude` or git ignore rules. Zero for
+    /// worktrees. Only the count is kept, never the names (RFC-0012 0012-074).
+    #[serde(default)]
+    pub excluded_count: usize,
 }
 
 /// Handle to a leased workspace. Release it with [`crate::Workspace::release`]. Dropping it does
@@ -113,6 +117,12 @@ impl Lease {
     /// Those changes are not part of the workspace, which starts from the base commit.
     pub fn source_dirty(&self) -> bool {
         self.record.source_dirty
+    }
+
+    /// Number of source entries excluded from a copy (RFC-0012 0012-074). Zero for worktrees.
+    /// Recorded as `excluded_count` in `WORKSPACE_CREATED`; names are never recorded.
+    pub fn excluded_count(&self) -> usize {
+        self.record.excluded_count
     }
 }
 

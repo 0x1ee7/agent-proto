@@ -12,6 +12,7 @@ mod artifacts;
 mod config;
 mod copy;
 mod error;
+mod exclude;
 mod git;
 mod ids;
 mod index;

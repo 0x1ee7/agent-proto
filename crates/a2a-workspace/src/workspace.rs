@@ -10,6 +10,7 @@ use crate::artifacts::{self, ArtifactSummary};
 use crate::config::{NonGitPolicy, WorkspaceConfig, WorkspaceMode, validate_base_ref};
 use crate::copy;
 use crate::error::{ErrorKind, Result, WorkspaceError, config_err, io_err};
+use crate::exclude::Excludes;
 use crate::git;
 use crate::ids::{WorkScope, WorkspaceRef, validate_slug};
 use crate::index::{self, RetainedEntry};
@@ -28,6 +29,7 @@ const REASON_REMOVAL_FAILED: &str = "removal_failed";
 pub struct Workspace {
     config: WorkspaceConfig,
     root: PathBuf,
+    excludes: Excludes,
 }
 
 /// Result of a garbage-collection pass.
@@ -73,6 +75,7 @@ impl Workspace {
                 "patch_cap_bytes must be at least {MIN_PATCH_CAP}"
             )));
         }
+        let excludes = Excludes::new(&config.copy_exclude)?;
         platform::check_budget(
             &config.root,
             platform::workspace_path_budget(),
@@ -83,7 +86,11 @@ impl Workspace {
         fs::create_dir_all(&config.artifacts_root)
             .map_err(|e| io_err("create artifacts root", e))?;
         let root = platform::normalize(&config.root)?;
-        Ok(Self { config, root })
+        Ok(Self {
+            config,
+            root,
+            excludes,
+        })
     }
 
     /// Configuration this registry was opened with.
@@ -174,6 +181,7 @@ impl Workspace {
             branch: branch.clone(),
             base_commit: String::new(),
             source_dirty: false,
+            excluded_count: 0,
         };
         match kind {
             LeaseKind::Worktree => {
@@ -182,7 +190,9 @@ impl Workspace {
                 record.source_dirty = dirty;
             }
             LeaseKind::Copy => {
-                record.base_commit = self.create_copy(&source_root, &branch, &path)?;
+                let (base, excluded) = self.create_copy(&source_root, &branch, &path)?;
+                record.base_commit = base;
+                record.excluded_count = excluded;
             }
         }
         if let Err(err) = write_lock(&lock, &record) {
@@ -366,13 +376,13 @@ impl Workspace {
         Ok((base, untracked || modified))
     }
 
-    fn create_copy(&self, source: &Path, branch: &str, path: &Path) -> Result<String> {
-        let plan = copy::plan(source, path, self.config.copy_limits)?;
-        let result = copy::materialize(source, path, &plan).and_then(|()| baseline(path, branch));
+    fn create_copy(&self, source: &Path, branch: &str, path: &Path) -> Result<(String, usize)> {
+        let plan = copy::plan(source, &self.excludes)?;
+        let result = copy::create(source, path, branch, plan, self.config.copy_limits);
         if result.is_err() {
             let _ = platform::remove_tree_within(&self.root, path);
         }
-        result
+        result.map(|created| (created.base_commit, created.excluded))
     }
 
     fn discard_partial(&self, checkout: &Path, branch: &str, path: &Path) {
@@ -575,11 +585,4 @@ fn ensure_parent(path: &Path) -> Result<()> {
         }
         None => Ok(()),
     }
-}
-
-fn baseline(path: &Path, branch: &str) -> Result<String> {
-    git::init_repo(path, branch)?;
-    git::add_all(path)?;
-    git::commit_baseline(path)?;
-    git::head(path)
 }

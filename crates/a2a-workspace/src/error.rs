@@ -16,10 +16,10 @@ pub enum ErrorKind {
     CopyLimit,
     /// Invalid policy, identifier, source directory or base reference (RFC-0012 `config`).
     Config,
-    /// Source is not a git checkout and the policy is `Refuse`. Not named by RFC-0012.
+    /// Source is not a git checkout and the policy is `Refuse` (RFC-0012 `non_git_refused`).
     NonGitRefused,
-    /// Copy mode met a symbolic link, junction, reparse point or special file. Not named by
-    /// RFC-0012.
+    /// Copy mode met a symbolic link, junction, reparse point or special file
+    /// (RFC-0012 `copy_link_rejected`).
     CopyLinkRejected,
     /// Target workspace path already exists and is not owned by the lease.
     PathOccupied,
@@ -40,8 +40,25 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    /// Stable token. The first four are RFC-0012 codes; the others are crate-level tokens that
-    /// the RFC does not name and are reported as RFC feedback.
+    /// Every kind, one per RFC-0012 sec 4.8 token. Tests check these against `a2a-types`.
+    pub const ALL: [ErrorKind; 14] = [
+        Self::SharedCheckout,
+        Self::PathTooLong,
+        Self::CopyLimit,
+        Self::Config,
+        Self::NonGitRefused,
+        Self::CopyLinkRejected,
+        Self::PathOccupied,
+        Self::BranchExists,
+        Self::LeaseLost,
+        Self::Busy,
+        Self::Git,
+        Self::Io,
+        Self::StateInvalid,
+        Self::PathEscape,
+    ];
+
+    /// Stable token, exactly as RFC-0012 sec 4.8 spells it.
     pub const fn token(self) -> &'static str {
         match self {
             Self::SharedCheckout => "shared_checkout",
