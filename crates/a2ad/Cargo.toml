@@ -1,0 +1,72 @@
+[package]
+name = "a2ad"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Explicit copy of the workspace lints (`[lints] workspace = true` cannot be combined
+# with a local override). `unsafe_code` is `deny`, not `forbid`, so that module
+# `platform` alone may `#[allow(unsafe_code)]` (RFC-0012 [0012-060]).
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[[bin]]
+name = "a2ad"
+path = "src/main.rs"
+
+[dependencies]
+a2a-audit = { path = "../a2a-audit" }
+a2a-security = { path = "../a2a-security" }
+a2a-types = { path = "../a2a-types" }
+a2a-worker = { path = "../a2a-worker" }
+a2a-workspace = { path = "../a2a-workspace" }
+bus-nats = { path = "../bus-nats" }
+driver-a2a-http = { path = "../driver-a2a-http" }
+driver-acp = { path = "../driver-acp" }
+gateway-http = { path = "../gateway-http" }
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = { version = "3.5.2", features = ["termination"] }
+fd-lock = "4.0.4"
+base64 = "0.22.1"
+getrandom = "0.4.3"
+nkeys = "0.4.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "process", "fs", "io-util", "net", "macros"] }
+toml = "1.1.8"
+a2a-client = { version = "0.1.0", path = "../a2a-client" }
+bus-api = { version = "0.1.0", path = "../bus-api" }
+bytes = "1.12.1"
+a2a-core = { version = "0.1.0", path = "../a2a-core" }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29.0", features = ["process", "signal", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
+[dev-dependencies]
+a2a-worker = { path = "../a2a-worker", features = ["testkit"] }
+bus-mem = { path = "../bus-mem" }
+tempfile = "3.27.0"
