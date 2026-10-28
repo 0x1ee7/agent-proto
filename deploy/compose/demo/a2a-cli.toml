@@ -1,0 +1,14 @@
+# Operator CLI settings for the demo stack (see demo-a2a). The CLI searches only the agents
+# listed here; the stub model servers are supervisor-managed externals, not bus agents.
+
+[paths]
+state_dir = "/state"
+
+[supervisor]
+operator_id = "tui"
+
+[[agent]]
+id = "omp"
+
+[[agent]]
+id = "claude"

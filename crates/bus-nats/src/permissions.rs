@@ -141,6 +141,7 @@ pub fn permissions(
             let mut read = Vec::new();
             for stream in [
                 audit.clone(),
+                ev.clone(),
                 kv_stream(&cards),
                 kv_stream(&presence),
                 kv_stream(&claims),
@@ -351,6 +352,18 @@ mod tests {
             &p.publish,
             "$JS.API.STREAM.CREATE.KV_a2ab-local-cards"
         ));
+    }
+
+    // 0010-063: the console follows task events (RFC-0012 4.10), so operators read the event
+    // stream, but never publish to it.
+    #[test]
+    fn req_0010_063_operator_reads_event_stream_but_cannot_write_it() {
+        let p = permissions(Role::Operator, "tui", &tenant()).expect("operator");
+        assert!(has(&p.publish, "$JS.API.STREAM.INFO.A2AB_EV_local"));
+        assert!(has(&p.publish, "$JS.API.CONSUMER.CREATE.A2AB_EV_local.>"));
+        assert!(has(&p.publish, "$JS.ACK.A2AB_EV_local.>"));
+        assert!(!p.publish.iter().any(|s| s.contains(".ev.")));
+        assert!(!has(&p.publish, "$JS.API.STREAM.CREATE.A2AB_EV_local"));
     }
 
     // 0010-064: supervisor creates and reads streams and runs the archiver only.

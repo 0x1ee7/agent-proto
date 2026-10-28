@@ -81,12 +81,12 @@ def _usage(output):
 
 
 class Stub:
-    def __init__(self, workdir, log_path):
+    def __init__(self, workdir, log_path, port=0):
         self.workdir = pathlib.Path(workdir)
         self.log = open(log_path, "w", encoding="utf-8")
         self.lock = threading.Lock()
         self.count = 0
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
         self.httpd.stub = self
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)

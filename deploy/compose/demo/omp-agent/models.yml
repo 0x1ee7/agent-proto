@@ -1,0 +1,12 @@
+providers:
+  stub:
+    baseUrl: http://127.0.0.1:18786/v1
+    apiKey: stub-local-key
+    api: openai-completions
+    models:
+      - id: stub-model
+        name: Stub Model
+        reasoning: false
+        input: [text]
+        contextWindow: 32000
+        maxTokens: 4096

@@ -475,7 +475,7 @@ fn help_lines() -> Vec<String> {
     .collect()
 }
 
-fn tier_label(raw: i32) -> &'static str {
+pub(crate) fn tier_label(raw: i32) -> &'static str {
     match ApprovalTier::try_from(raw) {
         Ok(ApprovalTier::Read) => "read",
         Ok(ApprovalTier::Write) => "write",

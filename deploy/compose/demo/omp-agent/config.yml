@@ -1,0 +1,9 @@
+modelRoles:
+  default: stub/stub-model
+  smol: stub/stub-model
+  slow: stub/stub-model
+  tiny: stub/stub-model
+  memory: stub/stub-model
+  task: stub/stub-model
+  plan: stub/stub-model
+  commit: stub/stub-model

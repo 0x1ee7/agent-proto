@@ -31,7 +31,39 @@ services:
       - a2ad-state:/state
     restart: "no"
 
+  # Full stack with two coding agents (omp, Claude Code) on stub models; no credentials.
+  #   docker compose --profile demo up -d --build
+  #   docker compose --profile demo logs -f
+  #   docker compose --profile demo exec demo demo-tui
+  #   docker compose --profile demo exec demo demo-a2a send omp "hello" --wait
+  demo:
+    profiles: ["demo"]
+    build:
+      context: .
+      target: demo
+    image: a2a-bus-demo:local
+    init: true
+    volumes:
+      - demo-state:/state
+    restart: "no"
+
+  # Streams the component logs and the audit tail of `demo` to its own stdout. It shares the
+  # network namespace of `demo` because the bus listens on that container's loopback only.
+  demo-logs:
+    profiles: ["demo"]
+    image: a2a-bus-demo:local
+    init: true
+    network_mode: "service:demo"
+    entrypoint: ["follow-logs", "/state"]
+    command: []
+    volumes:
+      - demo-state:/state
+    depends_on:
+      - demo
+    restart: "no"
+
 volumes:
   cargo-registry:
   cargo-cache:
   a2ad-state:
+  demo-state:

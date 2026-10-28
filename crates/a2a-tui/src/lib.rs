@@ -6,6 +6,7 @@
 pub mod app;
 pub mod audit_feed;
 pub mod driver;
+pub mod follow;
 pub mod model;
 pub mod operator;
 pub mod redact;

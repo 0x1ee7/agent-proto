@@ -1,0 +1,8 @@
+{
+  "name": "a2a-bus-demo-claude-acp",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.97.0"
+  }
+}

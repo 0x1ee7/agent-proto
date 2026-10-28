@@ -1,0 +1,67 @@
+# Demo runtime config: bus, two coding agents (omp and Claude Code) and the stub model servers
+# they talk to. Used by the `demo` service in compose.yaml (see DEV.md, "Demo stack").
+#
+# No real model is called and no credential is needed: the agent programs are the real omp and
+# Claude Code ACP adapter, but their model endpoints are the local stubs under /opt/a2a-demo.
+# The stubs run as `external` agents so the supervisor starts them first and logs them.
+#
+# The operator identity is "tui": the console (a2a-tui) and the CLI both connect as "tui".
+# sha256 is the digest of /usr/local/bin/nats-server in the image (same binary as the bus-only
+# config in a2ad.toml).
+
+config_version = 1
+
+[paths]
+state_dir = "/state"
+
+[supervisor]
+drain_ms = 5000
+grace_ms = 3000
+operator_id = "tui"
+
+[bus]
+port = 4222
+binary = "/usr/local/bin/nats-server"
+sha256 = "33f3fe3fed80b2b229bd9fe4b735257ad8583cd2349452a0c74f3d768b593e66"
+
+[log]
+level = "info"
+
+# Model stubs (external processes, loopback only).
+[[agent]]
+id = "omp-model"
+kind = "external"
+command = ["/usr/bin/python3", "/opt/a2a-demo/stubs/stub_openai.py", "18786", "/home/a2a/demo/stub-logs/omp"]
+readiness = { kind = "tcp", address = "127.0.0.1:18786" }
+
+[[agent]]
+id = "claude-model"
+kind = "external"
+command = ["/usr/bin/python3", "/opt/a2a-demo/stubs/serve_stub.py", "18777", "/home/a2a/demo/claude-work", "/home/a2a/demo/stub-logs/claude.jsonl"]
+readiness = { kind = "tcp", address = "127.0.0.1:18777" }
+
+# Coding agents (workers).
+[[agent]]
+id = "omp"
+kind = "worker"
+backend = "acp-omp"
+repo = "/home/a2a/repo"
+command = ["/usr/local/bin/omp"]
+approval_mode = "ask-exec"
+env = { HOME = "/home/a2a", PI_CODING_AGENT_DIR = "/home/a2a/demo/omp-agent" }
+env_passthrough = "all"
+depends_on = ["omp-model"]
+readiness = { kind = "bus-presence" }
+delegation = { peers = ["claude"] }
+
+[[agent]]
+id = "claude"
+kind = "worker"
+backend = "acp-claude"
+repo = "/home/a2a/repo"
+command = ["/usr/local/bin/node", "/opt/claude-acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"]
+approval_mode = "ask-all"
+env = { HOME = "/home/a2a", ANTHROPIC_BASE_URL = "http://127.0.0.1:18777", CLAUDE_CONFIG_DIR = "/home/a2a/demo/claude-cfg" }
+depends_on = ["claude-model"]
+readiness = { kind = "bus-presence" }
+delegation = { peers = ["omp"] }

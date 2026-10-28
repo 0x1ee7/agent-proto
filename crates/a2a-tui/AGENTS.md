@@ -15,6 +15,7 @@ Layer L5 operator console (RFC-0001 crate table). Binary plus library.
 - Binary `a2a-tui` (`main.rs`): the only place that names the concrete bus. It parses flags,
   connects two `bus-nats` connections as `tui`, supplies the audit stream, consumer, and filter
   names, and builds the envelope signing hook.
+- Headless follow mode: `a2a-tui --follow --seed-file <path>` prints one plain line per change to stdout (agent presence, task state or status text, artifacts, approvals, audit records) and needs no terminal, operator key or trust file. `follow::Follower` does the change detection on the driver's messages; the driver runs unsigned and its command channel is never used, so this mode cannot decide approvals. It uses its own durable audit consumer (`tui-audit-follow`) so it never splits deliveries with an open console. Guarded by `req_0012_follow_*`, `req_0004_follow_*`, `req_0013_follow_*` and `req_0013_log_line_*`. The demo stack streams it into `docker logs` (DEV.md).
 
 ## Uses
 - `a2a-client` for Directory sync, event streams, `PendingApproval`, `decide_signed` (operator

@@ -81,12 +81,13 @@ Binary built from `crates/a2a-mcp`, enabled with the `runtime` feature. It is an
 
 ## Docker dev environment
 
-The `Dockerfile` has four stages:
+The `Dockerfile` has these stages:
 
 - `nats`: official nats-server v2.15.2 tarball, SHA-256 checked.
 - `dev`: Rust 1.98.1 with clippy and rustfmt, python3, and `nats-server` on PATH (`NATS_SERVER_BIN` is set).
-- `build`: release binaries `a2ad`, `a2a` and `a2abus-mcp-shim`.
+- `build`: release binaries `a2ad`, `a2a`, `a2a-tui` and `a2abus-mcp-shim`.
 - `runtime`: Debian slim, user `a2a`, entrypoint `a2ad`.
+- `fetch` and `demo`: the demo stack, see below.
 
 The source is bind-mounted at `/work`. Build output goes to the `cargo-cache` volume, so Windows `target/` and Linux builds stay separate.
 
@@ -110,6 +111,36 @@ docker compose --profile stack run --rm --entrypoint sha256sum a2ad /usr/local/b
 ```
 
 The last command prints the digest that must match `sha256` in `deploy/compose/a2ad.toml`. To run workers in the container, mount a copy of the config that adds `[[agent]]` tables, and mount each agent's credentials. Credentials are never baked into the image.
+
+## Demo stack (two agents, no credentials)
+
+Runs the whole system in Docker: the bus, two real coding agents (omp 18.12.6 and Claude Code through `@agentclientprotocol/claude-agent-acp` 0.97.0) and the stub model servers they talk to. The agents are downloaded into the image at build time (omp by SHA-256, Node by SHA-256, the adapter by pinned npm version). Their profiles point at local stubs with fake keys, so no account, login or provider key is needed and no real model is called. Works on Linux, including Arch Linux under WSL.
+
+```
+docker compose --profile demo build
+docker compose up -d demo demo-logs
+docker compose logs -f demo-logs
+```
+
+Name the services in `up`: a bare `docker compose --profile demo up` also starts the `dev` shell container.
+
+`docker compose logs -f demo-logs` is the system view. Every line is prefixed with its source: `[bus]`, `[supervisor]`, `[omp]`, `[claude]`, `[omp-model]`, `[claude-model]` (component logs under `/state/logs`) and `[events]` (`a2a-tui --follow`: agent presence, task state changes, artifacts, approvals and audit records read from the bus).
+
+Operator console and CLI (both connect as the bus identity `tui`; run them in a second terminal):
+
+```
+docker compose exec demo demo-tui
+docker compose exec demo demo-a2a send omp "hello" --wait
+docker compose exec demo demo-a2a send omp "A2A_SEND:claude:review README.txt" --wait
+docker compose exec demo demo-a2a approvals list --pending
+docker compose exec demo demo-a2a approvals approve <request-id> --scope once --yes
+```
+
+`demo-tui` is `a2a-tui` with the demo paths; `demo-a2a` is `a2a` with the demo config and seed. Approvals can be decided in the console or with the CLI. The stub models act on prompt keywords: `hello` is a plain turn, `WRITE_FILE` makes omp write a file (approval card), and `A2A_SEND:<agent>:<text>` makes the agent call the peer through the delegation tool. Claude's stub uses `STUB:A2A:<agent>:<text>`, `STUB:WRITE:<name>` and `STUB:LONG`; see `spikes/claude-acp/README.md`.
+
+Stop with `docker compose down`; `docker compose down -v` also deletes the state volume (and every other named volume of the project, including the build cache `cargo-cache`).
+
+Files: `deploy/compose/a2ad.demo.toml` (supervisor config), `deploy/compose/demo/` (omp and Claude profiles, adapter manifest, wrapper and log-follower scripts), `spikes/claude-acp/serve_stub.py` (Claude stub server). The console and CLI are one identity because `[supervisor] operator_id` allows only `tui` or `cli`, and the console always connects as `tui`.
 
 ## Architecture diagrams
 

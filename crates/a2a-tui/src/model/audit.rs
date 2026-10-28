@@ -22,6 +22,29 @@ pub struct Row {
     pub reason: String,
 }
 
+impl Row {
+    /// One plain line for a log stream: `time seq=N emitter KIND agent=A task=T reason=R`.
+    /// Empty fields are left out. Fields are already escaped, so the line has no control
+    /// characters and no line break.
+    #[must_use]
+    pub fn log_line(&self) -> String {
+        let mut line = format!(
+            "{} seq={} {} {}",
+            self.time, self.seq, self.emitter, self.kind
+        );
+        for (label, value) in [
+            ("agent", &self.agent),
+            ("task", &self.task),
+            ("reason", &self.reason),
+        ] {
+            if !value.is_empty() {
+                line.push_str(&format!(" {label}={value}"));
+            }
+        }
+        line
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Tail {
     rows: VecDeque<Row>,
@@ -114,5 +137,27 @@ mod tests {
         assert!(!built.agent.chars().any(char::is_control));
         assert!(!built.time_valid);
         assert_eq!(built.kind, "AUDIT_EVENT_TYPE_UNSPECIFIED");
+    }
+
+    #[test]
+    fn req_0013_log_line_is_one_line_and_omits_empty_fields() {
+        let event = a2abus::AuditEvent {
+            time: "2026-10-28T21:05:00.000Z".to_owned(),
+            seq: 7,
+            emitter: "omp".to_owned(),
+            agent_id: "omp".to_owned(),
+            task_id: String::new(),
+            reason: "line one\nline\u{1b}[2J two".to_owned(),
+            ..Default::default()
+        };
+        let line = row_from(&event).log_line();
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(
+            line.starts_with("2026-10-28T21:05:00.000Z seq=7 omp "),
+            "{line}"
+        );
+        assert!(line.contains(" agent=omp"), "{line}");
+        assert!(!line.contains("task="), "{line}");
+        assert!(line.contains(" reason=line one"), "{line}");
     }
 }
