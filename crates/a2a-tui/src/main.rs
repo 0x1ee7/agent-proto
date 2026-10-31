@@ -175,6 +175,9 @@ fn run() -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
+    // Entered for the rest of `run`: async-nats handles drop inside the runtime on every early
+    // return (declared after `runtime`, so dropped before it, after the handles).
+    let _enter = runtime.enter();
     let (who, stream, filter) = audit_names(&tenant, identity.as_str())?;
     let control = runtime
         .block_on(bus_nats::connect(nats.clone()))

@@ -154,8 +154,9 @@ fn send_reply<M: WireMessage>(
     options: &ReplyOptions,
 ) -> Result<(), ReplyError> {
     if M::TYPE_NAME != inbound.head.op.reply_type() {
+        // An internal fault, not backpressure: INVALID_AGENT_RESPONSE (code 13) is not retried.
         // The refusal is best effort: the type mismatch is the error reported.
-        let _ = inbound.fail(WireError::Overloaded, &StatusExtras::default());
+        let _ = inbound.fail(WireError::InvalidAgentResponse, &StatusExtras::default());
         return Err(ReplyError::PayloadType);
     }
     inbound.reply(body, options)

@@ -9,6 +9,7 @@ use std::task::Poll;
 use super::peer::text;
 use crate::rpc::{Response, plain};
 use a2a_client::{CallOptions, Client, Config as ClientConfig};
+use a2a_core::errors::WireError;
 use a2a_types::ids::TaskId;
 use a2a_types::vocab::ext::SEQUENCE;
 use pbjson_types::{Struct, value::Kind};
@@ -328,10 +329,14 @@ fn req_0002_040_unanswerable_request_does_not_stop_the_worker() {
             yield_now().await;
         }
     });
-    assert!(
-        envelope::decode_reply::<pb::Task>(&reply).is_err(),
-        "the caller is answered with a failure"
-    );
+    match envelope::decode_reply::<pb::Task>(&reply) {
+        Err(envelope::ReplyDecodeError::Failed(status)) => assert_eq!(
+            status.code,
+            WireError::InvalidAgentResponse.code(),
+            "an internal fault is not answered as retryable backpressure"
+        ),
+        other => panic!("the caller is answered with a failure: {other:?}"),
+    }
     let note = rig
         .worker
         .audit
