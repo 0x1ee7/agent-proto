@@ -8,7 +8,8 @@
 #
 # Usage: follow-logs [state-dir]
 state="${1:-/state}"
-trap 'kill 0' TERM INT
+# `kill 0` signals this shell too: ignore TERM/INT first so the trap is not re-entered, then exit 0.
+trap 'trap "" TERM INT; kill -TERM 0; exit 0' TERM INT
 
 (
   while :; do

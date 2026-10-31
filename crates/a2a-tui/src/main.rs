@@ -8,6 +8,7 @@
 //! the console would show (agent presence, task states, artifacts, approvals, audit records) to
 //! stdout, one line per change, and needs only the bus seed.
 
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -153,6 +154,11 @@ where
 
 fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args().skip(1))?;
+    if !args.follow && !std::io::stdout().is_terminal() {
+        return Err(
+            "terminal: stdout is not a terminal (use --follow for plain output)".to_owned(),
+        );
+    }
     let tenant = TenantId::parse(&args.tenant).map_err(|e| format!("tenant: {e}"))?;
     let seed_text =
         std::fs::read_to_string(&args.seed_file).map_err(|e| format!("seed file: {e}"))?;
