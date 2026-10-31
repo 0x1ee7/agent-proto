@@ -29,14 +29,6 @@ M = kit.MARGIN
 # ---------------------------------------------------------------- improvement register
 kit.register(
     kit.Improvement(
-        "E-01", "high", "driver-acp (approval expiry)",
-        "Live S4c passes (APPROVAL_TIMEOUT with detail), but after the expiry the omp backend stays closed: "
-        "the next task fails BACKEND_CRASHED (BACKEND_START_FAILED: backend is closed) until the supervisor "
-        "restarts (docs/spikes/e2e-m1.md, re-run 2026-10-27).",
-        "Find where the backend is closed on approval expiry and why it is not respawned; fix it with a "
-        "regression test; rerun S4c and the next task live and record it.",
-        "backend not respawned after expiry"),
-    kit.Improvement(
         "G-01", "high", "gateway-http (tls.rs)",
         "The TLS key must be owner-only on Unix, but Windows ACLs are not inspected "
         "(crates/gateway-http/src/tls.rs lines 1-4; RFC-0008 [0008-066], [0008-068]).",
@@ -117,7 +109,7 @@ ROLE = {
     "a2a-conformance": "conformance scenarios",
 }
 # Crates that carry a register item; the ID is drawn as a badge on their box.
-BADGES = {"driver-acp": ["E-01"], "gateway-http": ["G-01"], "a2ad": ["D-01", "P-01"],
+BADGES = {"gateway-http": ["G-01"], "a2ad": ["D-01", "P-01"],
           "a2a-audit": ["A-01"], "a2a-core": ["R-01"]}
 
 _SCAN = None
@@ -412,7 +404,6 @@ def page_approvals(p):
     book_y = p.top + 120
     p.box(M + 336, book_y, 230, 96, "core", "ApprovalBook",
           ["one RequestState per request", "MAX_OPEN_PER_TASK open per task"], size=9)
-    p.badge(M + 336, book_y - 12, "E-01", fit=None)
     states_x = M + 700
     states = [("Open", "waiting for an answer"), ("Allowed", "ALLOW_ONCE_ID"),
               ("Denied", "REJECT_ONCE_ID"), ("Expired", "expiry has passed"),
@@ -435,7 +426,7 @@ def page_approvals(p):
         ]),
         ("Rule", "#34d399", [
             "Worker approval expiry is authoritative (commit 9a4172a). Live S4c confirms APPROVAL_TIMEOUT; "
-            "the backend respawn after expiry is open (E-01).",
+            "after expiry the backend is killed non-terminally and the next task starts a fresh one.",
         ]),
     ], bottom=p.bottom)
 
@@ -480,16 +471,14 @@ def page_audit(p):
 # ---------------------------------------------------------------- page 8: improvement register
 def page_register(p):
     areas = [
-        ("app", "driver-acp", ["E-01"]),
         ("app", "gateway-http", ["G-01"]),
         ("app", "a2ad", ["D-01", "P-01"]),
         ("core", "a2a-audit", ["A-01"]),
         ("core", "a2a-core", ["R-01"]),
     ]
-    order = ["E-01", "G-01", "D-01", "P-01", "A-01", "R-01"]
+    order = ["G-01", "D-01", "P-01", "A-01", "R-01"]
     notes = [
-        "E-01 first: after an approval expiry the omp backend stays closed (live, 2026-10-27).",
-        "G-01 next: RFC-0008 [0008-066] requires the owner-only key check on every platform.",
+        "G-01 first: RFC-0008 [0008-066] requires the owner-only key check on every platform.",
     ]
     kit.improvement_register(p, areas, order, notes)
 
