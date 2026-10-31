@@ -27,5 +27,5 @@
 ## Tests
 - `tests/requirements.rs` names each guarded requirement as `req_0008_0NN_*` with a `// [0008-0NN]` comment. Covered IDs: 001 through 006, 009 through 032, 035, 038, 043 through 046, 049 through 052, 059, 060. 0008-052 has a paused-time test for a wait above 10 s. It guards the gateway's own bound; the bus-nats per-call timeout cap is guarded in bus-nats.
 - `src/limits.rs` unit tests guard 0008-023 at the limiter level.
-- `src/tls.rs` unit tests guard 0008-066 (key file owner-only: Unix mode bits; Windows access list via `icacls`, where only the Windows cases run on Windows).
+- `src/tls.rs` unit tests guard 0008-066 (key file owner-only: Unix mode bits; Windows SDDL from `icacls /save` matched by SID against the current user from `whoami /user`, SYSTEM and Administrators, never by localized principal name). The SDDL and whoami parsers are pure and tested on every platform; only the real-file cases run on Windows.
 - `tests/common/mod.rs` holds the virtual clock, fixture, and HTTP call helpers. It adds no requirements of its own.

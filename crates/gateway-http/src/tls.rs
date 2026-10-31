@@ -2,9 +2,11 @@
 //!
 //! Only TLS 1.3 is offered. The certificate and key are read from PEM files. The key file must be
 //! owner-only: on Unix it must grant no group or other permission bits; on Windows every access
-//! entry must name the current user, `NT AUTHORITY\SYSTEM` or `BUILTIN\Administrators` (the
-//! principals of the default Windows ACL, inherited or not), checked with `icacls`. If the access
-//! list cannot be read, the key is refused.
+//! entry must name, by SID, the current user, SYSTEM (`S-1-5-18`) or the local Administrators
+//! group (`S-1-5-32-544`), the principals of the default Windows ACL, inherited or not. The check
+//! never compares principal names, so it does not depend on the display language: it reads the
+//! SDDL that `icacls /save` writes and the current user's SID from `whoami /user`. If the access
+//! list or the user SID cannot be read, the key is refused.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -123,24 +125,13 @@ fn check_key_permissions(path: &Path) -> Result<(), TlsError> {
 
 #[cfg(windows)]
 fn check_key_permissions(path: &Path) -> Result<(), TlsError> {
-    let read_error = |reason: &str| TlsError::Read {
+    let read_error = |source: io::Error| TlsError::Read {
         path: path.to_path_buf(),
-        source: io::Error::other(format!("access list could not be read: {reason}")),
+        source: io::Error::other(format!("access list could not be read: {source}")),
     };
-    let user = std::env::var("USERNAME").map_err(|_| read_error("USERNAME is not set"))?;
-    let output = std::process::Command::new(icacls_path())
-        .arg(path)
-        .output()
-        .map_err(|source| TlsError::Read {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(read_error("icacls failed"));
-    }
-    let listing = String::from_utf8_lossy(&output.stdout);
-    let path_text = path.to_string_lossy();
-    if owner_only_listing(&listing, &path_text, &user) {
+    let user_sid = current_user_sid().map_err(read_error)?;
+    let saved = saved_acl(path).map_err(read_error)?;
+    if owner_only_saved_acl(&saved, &user_sid) {
         Ok(())
     } else {
         Err(TlsError::KeyPermissions {
@@ -149,54 +140,209 @@ fn check_key_permissions(path: &Path) -> Result<(), TlsError> {
     }
 }
 
-/// `icacls.exe` from the system directory, so a key check never runs a binary found on PATH.
+/// `name` from the system directory, so a key check never runs a binary found on PATH.
 #[cfg(windows)]
-fn icacls_path() -> PathBuf {
+fn system_tool(name: &str) -> PathBuf {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
-    PathBuf::from(root).join("System32").join("icacls.exe")
+    PathBuf::from(root).join("System32").join(name)
 }
 
-/// Access-list principals of the default Windows ACL that may hold a key besides its owner: the
-/// SYSTEM account and the local Administrators group, by name and by SID (0008-066).
-#[cfg(any(windows, test))]
-const TRUSTED_PRINCIPALS: [&str; 4] = [
-    r"NT AUTHORITY\SYSTEM",
-    "*S-1-5-18",
-    r"BUILTIN\Administrators",
-    "*S-1-5-32-544",
-];
+/// SID of the user running this process, from `whoami /user`.
+#[cfg(windows)]
+fn current_user_sid() -> io::Result<String> {
+    let output = std::process::Command::new(system_tool("whoami.exe"))
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("whoami failed"));
+    }
+    parse_whoami_user_sid(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| io::Error::other("whoami printed no user SID"))
+}
 
-/// Decides whether an `icacls <path>` listing is owner-only (0008-066). The listing
-/// must hold at least one access entry, and every entry must name `user` (bare, or after a
-/// `DOMAIN\` prefix, compared case-insensitively) or a principal in [`TRUSTED_PRINCIPALS`].
-/// Inherited entries are allowed: the default ACL of a profile directory is inherited, and the
-/// principal decides.
+/// Private scratch directory for the `icacls /save` output; removed on drop.
+#[cfg(windows)]
+struct ScratchDir(PathBuf);
+
+#[cfg(windows)]
+impl ScratchDir {
+    fn create() -> io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "a2ab-acl-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir)?;
+        Ok(Self(dir))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        // Best effort: the directory only holds a copy of a public access list.
+        drop(std::fs::remove_dir_all(&self.0));
+    }
+}
+
+/// The file `icacls <path> /save` writes: the path, then the SDDL of the file.
+#[cfg(windows)]
+fn saved_acl(path: &Path) -> io::Result<String> {
+    let scratch = ScratchDir::create()?;
+    let saved = scratch.0.join("acl.txt");
+    let output = std::process::Command::new(system_tool("icacls.exe"))
+        .arg(path)
+        .arg("/save")
+        .arg(&saved)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("icacls failed"));
+    }
+    decode_utf16le(&std::fs::read(&saved)?)
+        .ok_or_else(|| io::Error::other("icacls wrote an unreadable access list"))
+}
+
+/// SID of the SYSTEM account.
 #[cfg(any(windows, test))]
-fn owner_only_listing(listing: &str, path: &str, user: &str) -> bool {
-    let mut entries = 0usize;
-    for line in listing.lines() {
-        let rest = line.strip_prefix(path).unwrap_or(line).trim();
-        let Some((principal, _rights)) = rest.split_once(":(") else {
-            continue;
-        };
-        entries += 1;
-        if !trusted_principal(principal, user) {
-            return false;
+const SYSTEM_SID: &str = "S-1-5-18";
+/// SID of the local Administrators group.
+#[cfg(any(windows, test))]
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// Decodes the UTF-16LE text `icacls /save` writes (with or without a byte-order mark).
+#[cfg(any(windows, test))]
+fn decode_utf16le(bytes: &[u8]) -> Option<String> {
+    let bytes = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
+/// Extracts the user SID from `whoami /user /fo csv /nh` output: one line `"<name>","<SID>"`.
+/// Only the SID is read; the (localized or domain-qualified) name is ignored.
+#[cfg(any(windows, test))]
+fn parse_whoami_user_sid(output: &str) -> Option<String> {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let (_name, sid) = line.rsplit_once(',')?;
+    let sid = sid.trim().strip_prefix('"')?.strip_suffix('"')?;
+    is_sid(sid).then(|| sid.to_ascii_uppercase())
+}
+
+/// `S-<revision>-<authority>(-<subauthority>)*`, decimal parts only.
+#[cfg(any(windows, test))]
+fn is_sid(text: &str) -> bool {
+    let mut parts = text.split('-');
+    let head = parts.next().is_some_and(|s| s.eq_ignore_ascii_case("S"));
+    let rest: Vec<&str> = parts.collect();
+    head && rest.len() >= 2
+        && rest
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Decides whether the file written by `icacls /save` is owner-only (0008-066). The text is the
+/// path on the first line and the SDDL on the next. The DACL must hold at least one ACE, and
+/// every ACE must name `user_sid`, SYSTEM or Administrators, by SID or by the SDDL aliases `SY`
+/// and `BA`. Inherited ACEs are allowed (the default ACL of a profile directory is inherited);
+/// the principal decides. A missing DACL (full access for everyone), an empty DACL, an ACE type
+/// other than allow or deny, and malformed text all fail closed.
+#[cfg(any(windows, test))]
+fn owner_only_saved_acl(saved: &str, user_sid: &str) -> bool {
+    let Some(sddl) = saved
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .find(|line| matches!(line.as_bytes(), [b'O' | b'G' | b'D' | b'S', b':', ..]))
+    else {
+        return false;
+    };
+    let Some(aces) = dacl_section(sddl).and_then(split_aces) else {
+        return false;
+    };
+    !aces.is_empty() && aces.iter().all(|ace| ace_principal_trusted(ace, user_sid))
+}
+
+/// The text of the `D:` section of an SDDL string (flags and ACEs), if it has one.
+#[cfg(any(windows, test))]
+fn dacl_section(sddl: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut start = None;
+    let bytes = sddl.as_bytes();
+    for (i, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.checked_sub(1)?,
+            b'O' | b'G' | b'D' | b'S' if depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                if let Some(from) = start {
+                    return Some(&sddl[from..i]);
+                }
+                if byte == b'D' {
+                    start = Some(i + 2);
+                }
+            }
+            _ => {}
         }
     }
-    entries > 0
+    start.map(|from| &sddl[from..])
 }
 
+/// Splits the ACEs `(...)` out of a DACL section. Flags may precede the first ACE; anything else
+/// outside parentheses, or unbalanced parentheses, is malformed.
 #[cfg(any(windows, test))]
-fn trusted_principal(principal: &str, user: &str) -> bool {
-    let names_user = principal.eq_ignore_ascii_case(user)
-        || principal
-            .rsplit_once('\\')
-            .is_some_and(|(_, name)| name.eq_ignore_ascii_case(user));
-    names_user
-        || TRUSTED_PRINCIPALS
-            .iter()
-            .any(|trusted| principal.eq_ignore_ascii_case(trusted))
+fn split_aces(dacl: &str) -> Option<Vec<&str>> {
+    let mut aces = Vec::new();
+    let mut depth = 0usize;
+    let mut from = 0usize;
+    for (i, byte) in dacl.bytes().enumerate() {
+        match byte {
+            b'(' => {
+                if depth == 0 {
+                    from = i + 1;
+                }
+                depth += 1;
+            }
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    aces.push(&dacl[from..i]);
+                }
+            }
+            _ if depth == 0 && !aces.is_empty() => return None,
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(aces)
+}
+
+/// One ACE `type;flags;rights;object;inherited object;account SID`: allow or deny, naming a
+/// trusted principal.
+#[cfg(any(windows, test))]
+fn ace_principal_trusted(ace: &str, user_sid: &str) -> bool {
+    let mut fields = ace.split(';');
+    if !matches!(fields.next(), Some("A" | "D")) {
+        return false;
+    }
+    let Some(principal) = fields.nth(4).map(str::trim) else {
+        return false;
+    };
+    ["SY", "BA", SYSTEM_SID, ADMINISTRATORS_SID, user_sid]
+        .iter()
+        .any(|trusted| principal.eq_ignore_ascii_case(trusted))
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -209,96 +355,174 @@ fn check_key_permissions(_path: &Path) -> Result<(), TlsError> {
 mod tests {
     use super::*;
 
-    const PATH: &str = r"C:\state\tls\key.pem";
-    const USER: &str = "svc-gateway";
+    const USER_SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+    /// First line of the `icacls /save` file: the path as given, here with a drive prefix that
+    /// looks like a DACL marker and localized characters.
+    const SAVED_PATH: &str = "D:\\Benutzer\\Zoe\\Schl\u{fc}ssel.pem";
 
-    #[test]
-    fn req_0008_066_listing_naming_only_the_user_is_owner_only() {
-        let listing = format!(
-            "{PATH} DESKTOP-1\\{USER}:(F)\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n"
-        );
-        assert!(owner_only_listing(&listing, PATH, USER));
-    }
-
-    #[test]
-    fn req_0008_066_bare_user_name_is_owner_only_and_case_insensitive() {
-        let listing = format!("{PATH} SVC-GATEWAY:(F)\n");
-        assert!(owner_only_listing(&listing, PATH, USER));
-    }
-
-    #[test]
-    fn req_0008_066_second_principal_makes_the_key_wide() {
-        let listing = format!(
-            "{PATH} DESKTOP-1\\{USER}:(F)\n                BUILTIN\\Users:(R)\n\nSuccessfully processed 1 files; Failed processing 0 files\n"
-        );
-        assert!(!owner_only_listing(&listing, PATH, USER));
-    }
-
-    #[test]
-    fn req_0008_066_inherited_entry_for_the_user_is_owner_only() {
-        let listing = format!("{PATH} DESKTOP-1\\{USER}:(I)(F)\n");
-        assert!(owner_only_listing(&listing, PATH, USER));
+    fn saved(sddl: &str) -> String {
+        format!("{SAVED_PATH}\r\n{sddl}\r\n\r\n")
     }
 
     #[test]
     fn req_0008_066_default_windows_acl_is_owner_only() {
-        let listing = format!(
-            "{PATH} NT AUTHORITY\\SYSTEM:(I)(F)\n                BUILTIN\\Administrators:(I)(F)\n                DESKTOP-1\\{USER}:(I)(F)\n\nSuccessfully processed 1 files; Failed processing 0 files\n"
-        );
-        assert!(owner_only_listing(&listing, PATH, USER));
+        let sddl = format!("D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{USER_SID})");
+        assert!(owner_only_saved_acl(&saved(&sddl), USER_SID));
     }
 
     #[test]
-    fn req_0008_066_system_and_administrators_by_sid_are_owner_only() {
-        let listing = format!(
-            "{PATH} *S-1-5-18:(F)\n                *S-1-5-32-544:(F)\n                {USER}:(F)\n"
+    fn req_0008_066_localized_account_names_do_not_matter() {
+        // A German host: icacls would list `NT-AUTORIT<A-umlaut>T\SYSTEM` and
+        // `VORDEFINIERT\Administratoren`; the saved SDDL holds only SIDs and aliases.
+        let sddl = format!(
+            "O:BAG:SYD:PAI(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-32-544)(A;;FA;;;{})",
+            USER_SID.to_ascii_lowercase()
         );
-        assert!(owner_only_listing(&listing, PATH, USER));
+        assert!(owner_only_saved_acl(&saved(&sddl), USER_SID));
     }
 
     #[test]
-    fn req_0008_066_other_principals_make_the_key_wide() {
+    fn req_0008_066_key_granted_only_to_the_user_is_owner_only() {
+        let sddl = format!("D:PAI(A;;FA;;;{USER_SID})");
+        assert!(owner_only_saved_acl(&saved(&sddl), USER_SID));
+    }
+
+    #[test]
+    fn req_0008_066_sections_after_the_dacl_are_ignored() {
+        let sddl = format!("D:(A;;FA;;;{USER_SID})S:(AU;SA;FA;;;WD)");
+        assert!(owner_only_saved_acl(&saved(&sddl), USER_SID));
+    }
+
+    #[test]
+    fn req_0008_066_everyone_and_users_make_the_key_wide() {
         for principal in [
-            "Everyone",
-            r"NT AUTHORITY\Authenticated Users",
-            r"BUILTIN\Users",
-            "*S-1-1-0",
-            "*S-1-5-11",
-            r"DESKTOP-1\Guest",
+            "WD",
+            "S-1-1-0",
+            "BU",
+            "S-1-5-32-545",
+            "AU",
+            "S-1-5-11",
+            "IU",
+            "S-1-5-21-1111111111-2222222222-3333333333-501",
         ] {
-            let listing = format!("{PATH} {USER}:(F)\n                {principal}:(I)(R)\n");
+            let sddl = format!(
+                "D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{USER_SID})(A;ID;FR;;;{principal})"
+            );
             assert!(
-                !owner_only_listing(&listing, PATH, USER),
+                !owner_only_saved_acl(&saved(&sddl), USER_SID),
                 "{principal} accepted"
             );
         }
     }
 
     #[test]
-    fn req_0008_066_look_alike_system_and_administrators_are_refused() {
+    fn req_0008_066_look_alike_names_and_sids_are_refused() {
         for principal in [
             r"DESKTOP-1\SYSTEM",
-            r"EVIL\Administrators",
-            r"NT AUTHORITY\Administrators",
+            "NT-AUTORIT\u{c4}T\\SYSTEM",
+            "Administrators",
+            "S-1-5-18-1",
+            "S-1-5-32-5440",
+            "S-1-5-1800",
+            "SYS",
+            "",
         ] {
-            let listing = format!("{PATH} {principal}:(F)\n");
+            let sddl = format!("D:(A;;FA;;;{USER_SID})(A;;FA;;;{principal})");
             assert!(
-                !owner_only_listing(&listing, PATH, USER),
-                "{principal} accepted"
+                !owner_only_saved_acl(&saved(&sddl), USER_SID),
+                "{principal:?} accepted"
             );
         }
     }
 
     #[test]
-    fn req_0008_066_principal_that_only_ends_in_the_user_name_is_refused() {
-        let listing = format!("{PATH} DESKTOP-1\\x{USER}:(R)\n");
-        assert!(!owner_only_listing(&listing, PATH, USER));
+    fn req_0008_066_user_name_in_place_of_a_sid_is_refused() {
+        assert!(!owner_only_saved_acl(
+            &saved("D:(A;;FA;;;svc-gateway)"),
+            USER_SID
+        ));
     }
 
     #[test]
-    fn req_0008_066_listing_without_access_entries_is_not_owner_only() {
-        let listing = "Successfully processed 1 files; Failed processing 0 files\n";
-        assert!(!owner_only_listing(listing, PATH, USER));
+    fn req_0008_066_another_users_sid_is_refused() {
+        let sddl = "D:(A;;FA;;;S-1-5-21-1111111111-2222222222-3333333333-1002)";
+        assert!(!owner_only_saved_acl(&saved(sddl), USER_SID));
+    }
+
+    #[test]
+    fn req_0008_066_untrusted_deny_and_unknown_ace_types_fail_closed() {
+        for ace in [
+            "(D;;FR;;;WD)",
+            "(OA;;CR;5f202010-79a5-11d0-9020-00c04fc2d4cf;;WD)",
+            "(XA;;FA;;;WD;(@User.x==1))",
+            "(A;;FA)",
+            "()",
+        ] {
+            let sddl = format!("D:(A;;FA;;;{USER_SID}){ace}");
+            assert!(
+                !owner_only_saved_acl(&saved(&sddl), USER_SID),
+                "{ace} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn req_0008_066_missing_empty_or_malformed_dacl_is_refused() {
+        for sddl in [
+            "O:BAG:SY",
+            "D:",
+            "D:PAI",
+            "S:(AU;SA;FA;;;WD)",
+            "D:(A;;FA;;;SY",
+            "D:(A;;FA;;;SY))",
+            "D:(A;;FA;;;SY)junk",
+            "",
+        ] {
+            assert!(
+                !owner_only_saved_acl(&saved(sddl), USER_SID),
+                "{sddl:?} accepted"
+            );
+        }
+        // Only the path line, no SDDL: a path starting `D:` must not be taken for a DACL.
+        assert!(!owner_only_saved_acl(SAVED_PATH, USER_SID));
+    }
+
+    #[test]
+    fn req_0008_066_saved_acl_decodes_from_utf16le_with_or_without_bom() {
+        let text = "k.pem\r\nD:(A;;FA;;;SY)\r\n";
+        let plain: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut with_bom = vec![0xFF, 0xFE];
+        with_bom.extend_from_slice(&plain);
+        assert_eq!(decode_utf16le(&plain).as_deref(), Some(text));
+        assert_eq!(decode_utf16le(&with_bom).as_deref(), Some(text));
+        assert_eq!(decode_utf16le(&plain[..plain.len() - 1]), None);
+        assert_eq!(decode_utf16le(&[0x00, 0xD8]), None);
+    }
+
+    #[test]
+    fn req_0008_066_whoami_csv_yields_the_user_sid() {
+        for output in [
+            "\"dx\\0x1de\",\"S-1-5-21-1-2-3-1001\"\r\n",
+            "\r\n\"NT-AUTORIT\u{c4}T\\SYSTEM\",\"S-1-5-18\"\r\n",
+            "\"a,b\\c\",\"s-1-5-21-1-2-3-1001\"\n",
+        ] {
+            let sid = parse_whoami_user_sid(output).unwrap();
+            assert!(sid.starts_with("S-1-5-"), "{sid}");
+        }
+        assert_eq!(
+            parse_whoami_user_sid("\"dx\\u\",\"S-1-5-21-1-2-3-1001\"").as_deref(),
+            Some("S-1-5-21-1-2-3-1001")
+        );
+        for output in [
+            "",
+            "ERROR: unexpected argument",
+            "\"dx\\u\",\"not-a-sid\"",
+            "\"dx\\u\",\"S-1\"",
+            "\"dx\\u\",\"S-1-5-x\"",
+            "\"dx\\u\",S-1-5-21-1-2-3-1001",
+        ] {
+            assert_eq!(parse_whoami_user_sid(output), None, "{output:?}");
+        }
     }
 
     #[cfg(unix)]
@@ -329,7 +553,7 @@ mod tests {
 
     #[cfg(windows)]
     fn run_icacls(key: &Path, args: &[&str]) {
-        let output = std::process::Command::new(icacls_path())
+        let output = std::process::Command::new(system_tool("icacls.exe"))
             .arg(key)
             .args(args)
             .output()
@@ -366,6 +590,32 @@ mod tests {
         assert!(matches!(
             check_key_permissions(&key),
             Err(TlsError::KeyPermissions { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn req_0008_066_windows_key_granted_to_users_group_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = windows_key(&dir);
+        let sid = current_user_sid().unwrap();
+        run_icacls(&key, &["/inheritance:r", "/grant:r", &format!("*{sid}:F")]);
+        assert!(check_key_permissions(&key).is_ok());
+        run_icacls(&key, &["/grant", "*S-1-5-32-545:(R)"]);
+        assert!(matches!(
+            check_key_permissions(&key),
+            Err(TlsError::KeyPermissions { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn req_0008_066_windows_unreadable_access_list_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.pem");
+        assert!(matches!(
+            check_key_permissions(&missing),
+            Err(TlsError::Read { .. })
         ));
     }
 }
