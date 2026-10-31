@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use a2a_client::{Client, Config, SigningHook};
 use a2a_core::envelope::SystemClock;
-use a2a_security::trust::TrustStore;
+use a2a_security::trust::{Role, TrustStore};
 use bus_api::bus::Bus;
 
 use crate::approvals;
@@ -29,7 +29,20 @@ pub fn now_ms() -> Result<u64, CliError> {
         .map_err(|_| CliError::Failed("system clock out of range".to_owned()))
 }
 
+/// Returns `trust` as the pinned card trust store only when it holds at least one `agent`-role
+/// key. Cards are signed by agent keys only ([0007-053]); a store without one (for example the
+/// M1 default, which lists only the operator key) pins nothing, so no unsigned card can be
+/// checked against it and discovery must not drop every card ([0003-042], [0007-050]).
+#[must_use]
+pub fn card_trust(trust: Option<Arc<TrustStore>>) -> Option<Arc<TrustStore>> {
+    trust.filter(|store| store.entries().any(|entry| entry.role() == Role::Agent))
+}
+
 /// Builds a session over an already connected bus.
+///
+/// `trust` becomes the discovery trust store only when it holds an agent signing key
+/// ([`card_trust`]); then unsigned or wrongly signed cards are dropped. Otherwise cards are
+/// listed and shown as unverified.
 ///
 /// # Errors
 /// Returns the mapped client error when the client rejects its configuration.
@@ -40,7 +53,7 @@ pub fn build_session<B: Bus>(
     trust: Option<Arc<TrustStore>>,
 ) -> Result<Session<B>, CliError> {
     let config = Config {
-        trust,
+        trust: card_trust(trust),
         ..Config::default()
     };
     let client = Client::new(

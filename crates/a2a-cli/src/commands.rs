@@ -150,36 +150,34 @@ pub async fn drain_events<B: Bus>(
     Ok(())
 }
 
-/// Builds the directory query from exactly one filter flag.
+/// Builds the directory query from the filter flag, if one is set. `None` lists every card
+/// ([0004-021]).
 ///
 /// # Errors
-/// Returns a usage error when no filter is set or the agent id is invalid.
-pub fn discover_query(args: &DiscoverArgs) -> Result<Query, CliError> {
+/// Returns a usage error when the agent id is invalid.
+pub fn discover_query(args: &DiscoverArgs) -> Result<Option<Query>, CliError> {
     if let Some(agent) = &args.agent {
-        return Ok(Query::Agent(parse_agent(agent)?));
+        return Ok(Some(Query::Agent(parse_agent(agent)?)));
     }
     if let Some(skill) = &args.skill {
-        return Ok(Query::Skill(skill.clone()));
+        return Ok(Some(Query::Skill(skill.clone())));
     }
     if let Some(tag) = &args.tag {
-        return Ok(Query::Tag(tag.clone()));
+        return Ok(Some(Query::Tag(tag.clone())));
     }
     if let Some(extension) = &args.extension {
-        return Ok(Query::Extension(extension.clone()));
+        return Ok(Some(Query::Extension(extension.clone())));
     }
     if let Some(mode) = &args.input_mode {
-        return Ok(Query::InputMode(mode.clone()));
+        return Ok(Some(Query::InputMode(mode.clone())));
     }
     if let Some(mode) = &args.output_mode {
-        return Ok(Query::OutputMode(mode.clone()));
+        return Ok(Some(Query::OutputMode(mode.clone())));
     }
-    Err(CliError::Usage(
-        "discover needs exactly one filter: --agent, --skill, --tag, --extension, --input-mode or --output-mode"
-            .to_owned(),
-    ))
+    Ok(None)
 }
 
-/// `a2a discover`: lists agents matching one filter.
+/// `a2a discover`: lists agents, all or matching one filter.
 ///
 /// # Errors
 /// Returns usage errors for bad filters and the mapped client error for bus failures.
@@ -191,7 +189,10 @@ pub async fn discover<B: Bus>(
     let query = discover_query(args)?;
     let mut directory = Directory::new(&session.client);
     directory.sync().await?;
-    let listings = directory.query(&query, args.include_offline)?;
+    let listings = match &query {
+        Some(query) => directory.query(query, args.include_offline)?,
+        None => directory.all(args.include_offline)?,
+    };
     if io.json {
         let cards: Vec<&serde_json::Value> =
             listings.iter().map(|listing| listing.card.card()).collect();

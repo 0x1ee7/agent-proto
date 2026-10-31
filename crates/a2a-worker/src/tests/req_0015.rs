@@ -888,3 +888,166 @@ fn req_0015_062_crash_between_accept_and_sent_leaves_exactly_one_child() {
         "the resumed child is recorded as sent once"
     );
 }
+
+/// Like [`drive_mesh`], but the child Worker is not polled during the first `silent_polls`
+/// polls (25 ms of virtual time each), so every request to it goes unanswered. Both Workers
+/// are long-lived futures, so no pump is dropped half way.
+fn drive_mesh_child_silent<T>(
+    m: &mut Mesh,
+    silent_polls: usize,
+    scenario: impl Future<Output = T>,
+) -> T {
+    let Mesh {
+        bus, parent, child, ..
+    } = m;
+    let control = bus.control();
+    let mut scenario = pin!(scenario);
+    let mut parent_loop = pin!(serve_one_forever(parent));
+    let mut child_loop = pin!(serve_one_forever(child));
+    for poll in 0..500_000 {
+        control.advance(Duration::from_millis(25)).unwrap();
+        if let Poll::Ready(value) = poll_once(scenario.as_mut()) {
+            return value;
+        }
+        let _ = poll_once(parent_loop.as_mut());
+        if poll >= silent_polls {
+            let _ = poll_once(child_loop.as_mut());
+        }
+    }
+    panic!("scenario did not complete");
+}
+
+/// Pumps and serves one Worker for the life of the scenario.
+async fn serve_one_forever(worker: &mut TestWorker) {
+    loop {
+        worker.pump().await.expect("pump failed");
+        let attempt = std::future::poll_fn(|cx| {
+            let mut serve = pin!(worker.serve_one());
+            Poll::Ready(serve.as_mut().poll(cx))
+        })
+        .await;
+        if let Poll::Ready(result) = attempt {
+            result.expect("serve_one failed");
+        }
+        yield_now().await;
+    }
+}
+
+/// Lets `polls` polls of virtual time pass.
+async fn wait_polls(polls: usize) {
+    for _ in 0..polls {
+        yield_now().await;
+    }
+}
+
+/// Crashes the parent after the child accepted its message and before `sent` is journaled,
+/// then restarts it on the same store (0015-062).
+fn crash_after_accept_and_restart() -> (Mesh, String) {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.child_mock.enqueue(vec![Step::Hold]);
+    m.parent_mock.enqueue(vec![Step::Hold]);
+    m.park_parent_after_accept();
+    let parent_id = drive_mesh(&mut m, async move {
+        let parent = submit_to(&h.bus, PARENT, "crash").await;
+        let tools = peer_tools(&h.parent).await;
+        let _call = ipc_call(&tools, send_frame(CHILD, "long", "k1", Wait::Blocking));
+        peer_tools(&h.child).await;
+        for _ in 0..200 {
+            yield_now().await;
+        }
+        parent.id
+    });
+    (restart_parent(m), parent_id)
+}
+
+/// 0015-117: a resend that gets no answer does not close the child, because the remote may
+/// already hold it. The child stays pending; once the child answers, the same message returns
+/// the child it holds and the parent's terminal state cancels it.
+#[test]
+fn req_0015_117_unanswered_resend_keeps_child_pending_then_cancels_it() {
+    let (mut m, parent_id) = crash_after_accept_and_restart();
+    assert_eq!(journal_count(&m.parent_store, "prepared"), 1);
+    // The child is silent for the first send (30 s timeout) and the start of the backoff.
+    let store = m.parent_store.clone();
+    let h = m.handles();
+    drive_mesh_child_silent(&mut m, 1_300, async move {
+        wait_polls(1_250).await;
+        assert_eq!(
+            journal_count(&store, "abandoned"),
+            0,
+            "an unanswered resend must not close the child unsent"
+        );
+        assert_eq!(journal_count(&store, "sent"), 0);
+        until_state(&h.bus, PARENT, &parent_id, pb::TaskState::Failed).await;
+        while !cancel_seen(&h.child) {
+            yield_now().await;
+        }
+    });
+    let count = |wanted: fn(&crate::mock::Command) -> bool| {
+        m.child_mock.commands().iter().filter(|c| wanted(c)).count()
+    };
+    assert_eq!(
+        count(|c| matches!(c, crate::mock::Command::Start(_))),
+        1,
+        "the repeated message reaches the one child that exists"
+    );
+    assert_eq!(
+        count(|c| matches!(c, crate::mock::Command::Cancel(_))),
+        1,
+        "the child is canceled once, after its id is known"
+    );
+    assert_eq!(journal_count(&m.parent_store, "sent"), 1);
+    assert_eq!(journal_count(&m.parent_store, "abandoned"), 0);
+}
+
+/// 0015-117: a child that never answers is given up after a bounded number of sends. The
+/// child is closed and the unconfirmed delivery is audited, not dropped.
+#[test]
+fn req_0015_117_resend_gives_up_and_audits_unconfirmed_child() {
+    let (mut m, _parent_id) = crash_after_accept_and_restart();
+    m.parent.take_audit();
+    drive_mesh_child_silent(&mut m, usize::MAX, wait_polls(12_000));
+    assert_eq!(journal_count(&m.parent_store, "abandoned"), 1);
+    assert_eq!(journal_count(&m.parent_store, "sent"), 0);
+    let notes = m.parent.take_audit();
+    let unconfirmed: Vec<_> = notes
+        .iter()
+        .filter(|n| n.reason.starts_with("DELEGATION_CHILD_UNCONFIRMED"))
+        .collect();
+    assert_eq!(unconfirmed.len(), 1, "one unconfirmed note: {notes:?}");
+    assert!(unconfirmed[0].reason.contains(CHILD));
+    assert!(unconfirmed[0].task_id.is_some());
+}
+
+/// 0015-118: a cancel the remote does not answer is audited with the child and target, not
+/// swallowed.
+#[test]
+fn req_0015_118_failed_child_cancel_is_audited() {
+    let mut m = mesh(Spec::default());
+    let h = m.handles();
+    m.child_mock.enqueue(vec![Step::Hold]);
+    m.parent_mock.enqueue(vec![Step::Hold]);
+    drive_mesh(&mut m, async move {
+        submit_to(&h.bus, PARENT, "restart").await;
+        let tools = peer_tools(&h.parent).await;
+        let _call = ipc_call(&tools, send_frame(CHILD, "long", "k1", Wait::Blocking));
+        peer_tools(&h.child).await;
+        for _ in 0..200 {
+            yield_now().await;
+        }
+    });
+    let mut m = restart_parent(m);
+    m.parent.take_audit();
+    // The restarted parent fails and queues a cancel; the child never answers it.
+    drive_mesh_child_silent(&mut m, usize::MAX, wait_polls(1_300));
+    let notes = m.parent.take_audit();
+    let failed: Vec<_> = notes
+        .iter()
+        .filter(|n| n.reason.starts_with("DELEGATION_CANCEL_FAILED"))
+        .collect();
+    assert_eq!(failed.len(), 1, "one cancel failure note: {notes:?}");
+    assert!(failed[0].reason.contains(CHILD), "names the target");
+    assert!(failed[0].reason.contains("child="), "names the child");
+    assert!(failed[0].task_id.is_some());
+}

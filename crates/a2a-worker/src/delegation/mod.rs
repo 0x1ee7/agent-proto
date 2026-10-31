@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
-use a2a_client::{CallOptions, Client, Config as ClientConfig, Outbound};
+use a2a_client::{CallOptions, Client, ClientError, Config as ClientConfig, Outbound};
 use a2a_core::budget::Usage;
 use a2a_core::envelope::{Clock, SystemClock};
 use a2a_core::task::{ChildEnd, Effect, TaskError, TaskStore};
@@ -40,6 +40,11 @@ use policy::Window;
 pub(crate) const IPC_POLL_MS: u64 = 100;
 /// Interval between `get` polls of a non-terminal remote child.
 pub(crate) const CHILD_POLL_MS: u64 = 250;
+/// Sends of a journaled child that end without an answer before the child is given up
+/// (0015-117). Each repeats the recorded message and transport identifier.
+pub(crate) const RESEND_ATTEMPTS: u32 = 5;
+/// Wait before the first repeat of an unanswered send; it doubles per attempt (0015-117).
+pub(crate) const RESEND_BACKOFF_MS: u64 = 1_000;
 
 /// Idempotency ledger keyed by (parent task id, idempotency key) (0015-048).
 pub(crate) type Ledger = BTreeMap<(String, String), String>;
@@ -54,6 +59,19 @@ fn journal_str<'a>(record: &'a serde_json::Value, name: &str) -> Result<&'a str,
 
 fn corrupt_journal() -> WorkerError {
     WorkerError::Config("delegation journal is corrupt")
+}
+
+/// Fixed, text-free label of a failed peer call for audit notes: the wire or local reason
+/// token, or the failure class. Never the remote's message text (0013-025).
+pub(crate) fn failure_label(err: &ClientError) -> String {
+    match err {
+        ClientError::Wire(wire, _) => format!("{wire:?}"),
+        ClientError::Local(local) => format!("{local:?}"),
+        ClientError::Bus(_) => "bus".to_owned(),
+        ClientError::Status(_) => "status".to_owned(),
+        ClientError::InvalidReply(_) => "invalid_reply".to_owned(),
+        _ => "local".to_owned(),
+    }
 }
 
 const DEFAULT_MAX_INFLIGHT: u32 = 4;
@@ -292,6 +310,7 @@ pub(crate) struct Delegation<B: Bus> {
 
 /// A child journaled as `prepared` whose send is not yet journaled as `sent` (0015-062). The
 /// recorded message and transport identifier let the send be repeated unchanged.
+#[derive(Clone)]
 pub(crate) struct Pending {
     child: String,
     parent: String,
@@ -301,6 +320,10 @@ pub(crate) struct Pending {
     chain_length: u32,
     deadline: u64,
     message: Outbound,
+    /// Sends already made without an answer (0015-117); not journaled.
+    attempts: u32,
+    /// Earliest time of the next send, in milliseconds (0015-117).
+    retry_at: u64,
 }
 
 impl Pending {
@@ -333,6 +356,8 @@ impl Pending {
                 .ok_or_else(corrupt_journal)?,
             message: Outbound::from_message(wire, transport, immediate)
                 .ok_or_else(corrupt_journal)?,
+            attempts: 0,
+            retry_at: 0,
         })
     }
 }
@@ -711,20 +736,51 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
 
     /// Sends queued cancels of children whose parents asked for them (0015-069).
     async fn flush_cancels(&mut self, d: &mut Delegation<B>) -> Result<(), WorkerError> {
+        let mut held = Vec::new();
+        let flushed = self.flush_cancels_into(d, &mut held).await;
+        // A cancel for a child whose send is still being repeated waits for its remote id
+        // (0015-117); it is queued again whether or not this pass failed.
+        self.peers.cancels.extend(held);
+        flushed
+    }
+
+    async fn flush_cancels_into(
+        &mut self,
+        d: &mut Delegation<B>,
+        held: &mut Vec<String>,
+    ) -> Result<(), WorkerError> {
         for child_id in std::mem::take(&mut self.peers.cancels) {
             let Some(child) = d.children.get(&child_id) else {
+                if d.pending.iter().any(|p| p.child == child_id) {
+                    held.push(child_id);
+                }
                 continue;
             };
             if child.settled.is_some() {
                 continue;
             }
-            let (target, remote) = (child.target.clone(), child.remote.clone());
-            let _ = self
+            let (parent, target, remote) = (
+                child.parent.clone(),
+                child.target.clone(),
+                child.remote.clone(),
+            );
+            let reply = self
                 .await_peer(
                     d.client
                         .cancel_task(&target, &remote, &CallOptions::default()),
                 )
                 .await?;
+            // A cancel the remote did not acknowledge is recorded, never dropped (0015-118).
+            if let Err(err) = reply {
+                self.audit(
+                    Some(&parent),
+                    format!(
+                        "DELEGATION_CANCEL_FAILED child={child_id} target={} reason={}",
+                        target.as_str(),
+                        failure_label(&err)
+                    ),
+                );
+            }
         }
         Ok(())
     }

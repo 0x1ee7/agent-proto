@@ -9,6 +9,7 @@
 mod peer;
 mod req_0002;
 mod req_0005;
+mod req_0005_operator;
 mod req_0006;
 mod req_0010;
 mod req_0014;
@@ -376,6 +377,7 @@ fn grants() -> Vec<Grant> {
         requester(REQUESTER),
         requester(OPERATOR),
         requester("cli"),
+        requester("tui"),
         Grant {
             principal: principal(OBSERVER),
             tenant: tenant(),

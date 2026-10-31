@@ -24,8 +24,8 @@ use super::policy::{
 };
 use super::result::{frame, state_name};
 use super::{
-    CHILD_POLL_MS, Child, Delegation, Pending, Waiter, current, respond_err, respond_outcome,
-    respond_value,
+    CHILD_POLL_MS, Child, Delegation, Pending, RESEND_ATTEMPTS, RESEND_BACKOFF_MS, Waiter, current,
+    respond_err, respond_outcome, respond_value,
 };
 use crate::backend::Backend;
 use crate::error::WorkerError;
@@ -37,6 +37,27 @@ const DEFAULT_DISCOVER_LIMIT: u32 = 20;
 const MAX_PEER_NAME_CHARS: usize = 128;
 /// Longest peer description shown by `a2a_discover`, in characters.
 const MAX_PEER_DESCRIPTION_CHARS: usize = 1024;
+
+/// How the remote answered one send of a child message.
+enum Attempt {
+    /// The remote holds the child; its first view is attached.
+    Accepted(Box<pb::Task>),
+    /// The remote answered and holds no child: an error reply, or a reply that is not a task.
+    Refused,
+    /// No usable answer arrived (timeout, no responder, bus or reply failure): the remote may
+    /// already hold the child under a task id this worker never saw (0015-117).
+    Unanswered,
+}
+
+/// Whether a failed send leaves it unknown if the remote received the message. A reply that
+/// carries a protocol error means the remote refused it; a failure before or without any
+/// reply does not.
+fn delivery_unknown(err: &ClientError) -> bool {
+    matches!(
+        err,
+        ClientError::Local(_) | ClientError::Bus(_) | ClientError::InvalidReply(_)
+    )
+}
 
 /// A send that passed every refusal and is ready to leave the worker.
 struct Prepared {
@@ -157,6 +178,8 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             chain_length: prepared.hop,
             deadline: prepared.deadline,
             message: prepared.message,
+            attempts: 0,
+            retry_at: 0,
         };
         let Some(remote) = self.send_pending(d, &pending, now, effects).await? else {
             return Ok(Err(unavailable()));
@@ -182,19 +205,45 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         now: u64,
         effects: &mut Vec<Effect>,
     ) -> Result<Option<pb::Task>, WorkerError> {
+        match self.attempt_send(d, pending).await? {
+            Attempt::Accepted(remote) => self.record_sent(d, pending, *remote, now, effects).await,
+            Attempt::Refused | Attempt::Unanswered => {
+                self.abandon(pending, now, effects)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Makes one send of a journaled child message and classifies the answer.
+    async fn attempt_send(
+        &mut self,
+        d: &mut Delegation<B>,
+        pending: &Pending,
+    ) -> Result<Attempt, WorkerError> {
         let sent = self
             .await_peer(
                 d.client
                     .send(&pending.target, &pending.message, &CallOptions::default()),
             )
             .await?;
-        let remote = match sent.map(|unary| unary.value) {
-            Ok(SendReply::Task(remote)) => remote,
-            _ => {
-                self.abandon(pending, now, effects)?;
-                return Ok(None);
-            }
-        };
+        Ok(match sent.map(|unary| unary.value) {
+            Ok(SendReply::Task(remote)) => Attempt::Accepted(Box::new(remote)),
+            Ok(SendReply::Message(_)) => Attempt::Refused,
+            Err(err) if delivery_unknown(&err) => Attempt::Unanswered,
+            Err(_) => Attempt::Refused,
+        })
+    }
+
+    /// Journals an accepted send as `sent` and tracks the child. A remote id that does not
+    /// parse abandons the child.
+    async fn record_sent(
+        &mut self,
+        d: &mut Delegation<B>,
+        pending: &Pending,
+        remote: pb::Task,
+        now: u64,
+        effects: &mut Vec<Effect>,
+    ) -> Result<Option<pb::Task>, WorkerError> {
         let Ok(remote_id) = TaskId::parse(&remote.id) else {
             self.abandon(pending, now, effects)?;
             return Ok(None);
@@ -233,8 +282,9 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         Ok(Some(remote))
     }
 
-    /// Closes a child whose send failed: `abandoned` stops a restart from resending it, then its
-    /// allowance is released (0015-062).
+    /// Closes a child that will not be sent: `abandoned` stops a restart from resending it, then
+    /// its allowance is released (0015-062). Only a send the remote refused, or one repeated
+    /// without an answer past its limit (0015-117), ends here.
     fn abandon(
         &mut self,
         pending: &Pending,
@@ -252,26 +302,68 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
     /// carries the recorded message and transport identifier, so the child worker answers with
     /// the child it already holds or creates it once. Runs before cancels flush, so a resumed
     /// child of a parent that failed at restart is canceled.
+    ///
+    /// A resend the remote answers with a refusal abandons the child. A resend that gets no
+    /// answer leaves the child `prepared` and is repeated with doubling backoff: the remote may
+    /// already hold the message but its task id is unknown, so the child can be neither closed
+    /// nor canceled yet (0015-117). After `RESEND_ATTEMPTS` unanswered sends, or past the
+    /// child's deadline, it is abandoned and audited as unconfirmed.
     pub(crate) async fn resume_sends(
         &mut self,
         d: &mut Delegation<B>,
         now: u64,
         effects: &mut Vec<Effect>,
     ) -> Result<(), WorkerError> {
-        for pending in std::mem::take(&mut d.pending) {
-            if self
-                .send_pending(d, &pending, now, effects)
-                .await?
-                .is_some()
-            {
-                self.audit(
-                    Some(pending.parent.as_str()),
-                    format!(
-                        "DELEGATION_CHILD_RESUMED child={} target={}",
-                        pending.child,
-                        pending.target.as_str()
-                    ),
-                );
+        // An entry leaves `d.pending` only once its outcome is decided, so a pass interrupted
+        // at the await still leaves the child to be repeated.
+        let mut index = 0;
+        while index < d.pending.len() {
+            let mut pending = d.pending[index].clone();
+            if pending.retry_at > now {
+                index += 1;
+                continue;
+            }
+            match self.attempt_send(d, &pending).await? {
+                Attempt::Accepted(remote) => {
+                    let recorded = self.record_sent(d, &pending, *remote, now, effects).await?;
+                    d.pending.remove(index);
+                    if recorded.is_some() {
+                        self.audit(
+                            Some(pending.parent.as_str()),
+                            format!(
+                                "DELEGATION_CHILD_RESUMED child={} target={}",
+                                pending.child,
+                                pending.target.as_str()
+                            ),
+                        );
+                    }
+                }
+                Attempt::Refused => {
+                    self.abandon(&pending, now, effects)?;
+                    d.pending.remove(index);
+                }
+                Attempt::Unanswered => {
+                    pending.attempts += 1;
+                    let after = self.clock.now_ms().ok_or(WorkerError::Clock)?;
+                    if pending.attempts >= RESEND_ATTEMPTS || after >= pending.deadline {
+                        self.audit(
+                            Some(pending.parent.as_str()),
+                            format!(
+                                "DELEGATION_CHILD_UNCONFIRMED child={} target={} attempts={}",
+                                pending.child,
+                                pending.target.as_str(),
+                                pending.attempts
+                            ),
+                        );
+                        self.abandon(&pending, after, effects)?;
+                        d.pending.remove(index);
+                    } else {
+                        let backoff = RESEND_BACKOFF_MS << (pending.attempts - 1).min(16);
+                        pending.retry_at = after.saturating_add(backoff);
+                        d.pending[index] = pending;
+                        index += 1;
+                    }
+                }
             }
         }
         Ok(())

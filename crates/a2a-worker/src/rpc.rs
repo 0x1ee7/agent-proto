@@ -5,8 +5,11 @@
 use std::collections::BTreeSet;
 
 use a2a_core::budget::{self, Allowance};
-use a2a_core::envelope::{Inbound, ReplyOptions, RequestBody, RequestHead};
+use a2a_core::envelope::{
+    Inbound, ReplyError, ReplyOptions, RequestBody, RequestHead, WireMessage,
+};
 use a2a_core::errors::{StatusExtras, WireError};
+use a2a_core::subject::Op;
 use a2a_core::task::{
     Admission, Effect, EventBody, Incoming, ListQuery, Submission, TaskError, TaskStore, TaskView,
 };
@@ -112,7 +115,7 @@ impl From<TaskError> for RpcError {
     }
 }
 
-fn plain(response: Response) -> Handled {
+pub(crate) fn plain(response: Response) -> Handled {
     Handled {
         response,
         last_seq: None,
@@ -126,6 +129,36 @@ fn send_response(task: pb::Task) -> pb::SendMessageResponse {
     pb::SendMessageResponse {
         payload: Some(pb::send_message_response::Payload::Task(task)),
     }
+}
+
+/// The reply to a send-like request carrying `view`: `SendMessage` answers with a
+/// `SendMessageResponse`, `SendStreamingMessage` with the first `StreamResponse` element and
+/// the task sequence the requester resumes from (RFC-0002 0002-052).
+fn task_reply(op: Op, view: &TaskView) -> (Response, Option<u64>) {
+    let task = wire::task_proto(view);
+    if op == Op::Stream {
+        let first = pb::StreamResponse {
+            payload: Some(pb::stream_response::Payload::Task(task)),
+        };
+        (Response::Stream(first), Some(view.seq))
+    } else {
+        (Response::Send(send_response(task)), None)
+    }
+}
+
+/// Sends the one reply of `inbound`. A body whose type is not the operation's reply type is
+/// answered with a failure instead, so the requester never waits for a reply that cannot come.
+fn send_reply<M: WireMessage>(
+    inbound: Inbound,
+    body: &M,
+    options: &ReplyOptions,
+) -> Result<(), ReplyError> {
+    if M::TYPE_NAME != inbound.head.op.reply_type() {
+        // The refusal is best effort: the type mismatch is the error reported.
+        let _ = inbound.fail(WireError::Overloaded, &StatusExtras::default());
+        return Err(ReplyError::PayloadType);
+    }
+    inbound.reply(body, options)
 }
 
 /// Reads extension data under `uri`, gated by activation. Malformed data is refused.
@@ -191,19 +224,25 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         inbound: Inbound,
         result: Result<Handled, RpcError>,
     ) -> Result<(), WorkerError> {
+        let op = inbound.head.op;
+        // A reply that cannot be written ends that one request, never the worker: the error is
+        // recorded with its text and the serving loop continues.
         match result {
             Ok(handled) => {
                 let options = ReplyOptions {
                     last_seq: handled.last_seq,
                     applied_extensions: handled.applied,
                 };
-                match &handled.response {
-                    Response::Send(body) => inbound.reply(body, &options),
-                    Response::Task(body) => inbound.reply(body, &options),
-                    Response::Tasks(body) => inbound.reply(body, &options),
-                    Response::Stream(body) => inbound.reply(body, &options),
+                let sent = match &handled.response {
+                    Response::Send(body) => send_reply(inbound, body, &options),
+                    Response::Task(body) => send_reply(inbound, body, &options),
+                    Response::Tasks(body) => send_reply(inbound, body, &options),
+                    Response::Stream(body) => send_reply(inbound, body, &options),
+                };
+                if let Err(err) = sent {
+                    self.audit(None, format!("REPLY_FAILED: op {}: {err}", op.token()));
+                    return Ok(());
                 }
-                .map_err(WorkerError::Reply)?;
                 for outgoing in handled.replay {
                     if let Err(err) = self.publish(outgoing).await {
                         self.audit(None, format!("REPLAY_PUBLISH_FAILED: {err}"));
@@ -218,16 +257,23 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                         .metadata
                         .insert("detail".to_owned(), detail.to_owned());
                 }
-                inbound.fail(error, &extras).map_err(WorkerError::Bus)
+                if let Err(err) = inbound.fail(error, &extras) {
+                    self.audit(None, format!("REPLY_FAILED: op {}: {err}", op.token()));
+                }
+                Ok(())
             }
-            Err(RpcError::Security(err)) => inbound
-                .fail_status(&err.to_status())
-                .map_err(WorkerError::Bus),
+            Err(RpcError::Security(err)) => {
+                if let Err(err) = inbound.fail_status(&err.to_status()) {
+                    self.audit(None, format!("REPLY_FAILED: op {}: {err}", op.token()));
+                }
+                Ok(())
+            }
             Err(RpcError::Fatal(err)) => {
                 // No internal-error wire code exists (RFC-0002); OVERLOADED tells the caller to retry.
-                inbound
-                    .fail(WireError::Overloaded, &StatusExtras::default())
-                    .map_err(WorkerError::Bus)?;
+                if let Err(refusal) = inbound.fail(WireError::Overloaded, &StatusExtras::default())
+                {
+                    self.audit(None, format!("REPLY_FAILED: op {}: {refusal}", op.token()));
+                }
                 Err(err)
             }
         }
@@ -248,12 +294,16 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
                 self.held.push(entry);
                 continue;
             }
-            let result = view.map_err(RpcError::from).map(|v| Handled {
-                response: Response::Send(send_response(wire::task_proto(&v))),
-                last_seq: None,
-                applied: Vec::new(),
-                replay: Vec::new(),
-                hold: None,
+            let op = entry.inbound.head.op;
+            let result = view.map_err(RpcError::from).map(|v| {
+                let (response, last_seq) = task_reply(op, &v);
+                Handled {
+                    response,
+                    last_seq,
+                    applied: Vec::new(),
+                    replay: Vec::new(),
+                    hold: None,
+                }
             });
             self.answer(entry.inbound, result).await?;
         }
@@ -411,14 +461,16 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
             .as_ref()
             .is_some_and(|config| config.return_immediately);
         let settled = view.state.is_terminal() || view.state.is_interrupted();
-        let hold = (!immediate && !settled).then(|| Wait {
+        // A streaming send replies with the first stream element at once (0002-052).
+        let hold = (!immediate && !settled && head.op != Op::Stream).then(|| Wait {
             origin: head.origin.clone(),
             task_id: task_id.clone(),
             until: head.deadline_ms.min(view.deadline_ms),
         });
+        let (response, last_seq) = task_reply(head.op, &view);
         Ok(Handled {
-            response: Response::Send(send_response(wire::task_proto(&view))),
-            last_seq: None,
+            response,
+            last_seq,
             applied,
             replay: Vec::new(),
             hold,
@@ -463,9 +515,10 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         )?;
         self.run(effects, now).map_err(RpcError::Fatal)?;
         let view = self.tasks.task(&owner.origin, &decision.task_id)?;
+        let (response, last_seq) = task_reply(head.op, &view);
         Ok(Handled {
-            response: Response::Send(send_response(wire::task_proto(&view))),
-            last_seq: None,
+            response,
+            last_seq,
             applied: vec![APPROVAL.to_owned()],
             replay: Vec::new(),
             hold: None,
@@ -610,16 +663,18 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         req: &pb::CancelTaskRequest,
         now: u64,
     ) -> Result<Handled, RpcError> {
+        // 0005-004: an operator identity cancels a task of any origin; others only their own.
+        let origin = self.read_origin(head, &req.id);
         let effects = if self.deferred_ends.contains_key(&req.id) {
             // 0015-067: the turn already ended and only children remain; nothing is left to stop.
-            let effects = self.tasks.cancel_deferred(&head.origin, &req.id, now)?;
+            let effects = self.tasks.cancel_deferred(&origin, &req.id, now)?;
             self.deferred_ends.remove(&req.id);
             effects
         } else {
-            self.tasks.cancel(&head.origin, &req.id, now)?
+            self.tasks.cancel(&origin, &req.id, now)?
         };
         self.run(effects, now).map_err(RpcError::Fatal)?;
-        let view = self.tasks.task(&head.origin, &req.id)?;
+        let view = self.tasks.task(&origin, &req.id)?;
         Ok(plain(Response::Task(wire::task_proto(&view))))
     }
 
@@ -632,10 +687,11 @@ impl<B: Bus, D: Backend, S: TaskStore> Worker<B, D, S> {
         now: u64,
     ) -> Result<Handled, RpcError> {
         let _ = now;
+        let origin = self.read_origin(head, &req.id);
         let events = self
             .tasks
-            .subscribe(&head.origin, &req.id, head.after_seq.unwrap_or(0))?;
-        let view = self.tasks.task(&head.origin, &req.id)?;
+            .subscribe(&origin, &req.id, head.after_seq.unwrap_or(0))?;
+        let view = self.tasks.task(&origin, &req.id)?;
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
         let mut replay = Vec::with_capacity(events.len());
         for event in &events {

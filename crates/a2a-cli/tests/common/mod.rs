@@ -356,6 +356,22 @@ impl Fixture {
             .reply(message, &ReplyOptions::default())
             .expect("reply");
     }
+
+    /// Writes a value into the cards or presence bucket as the worker.
+    pub async fn kv_put(&self, bucket: &str, key: &str, value: &[u8]) {
+        let bucket = Bucket::new(&self.tenant, bucket).expect("bucket");
+        let key = Key::parse(key).expect("key");
+        self.bus
+            .kv_put(
+                &self.worker,
+                &bucket,
+                &key,
+                Bytes::copy_from_slice(value),
+                None,
+            )
+            .await
+            .expect("kv_put");
+    }
 }
 
 impl Default for Fixture {

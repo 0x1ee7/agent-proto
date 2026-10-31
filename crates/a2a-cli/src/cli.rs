@@ -45,7 +45,7 @@ pub struct Cli {
 /// Top-level commands ([0012-054]).
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// List agents whose card matches one filter.
+    /// List agents, optionally only those whose card matches one filter.
     Discover(DiscoverArgs),
     /// Send a message to an agent.
     Send(SendArgs),
@@ -77,9 +77,9 @@ pub enum Command {
     },
 }
 
-/// Filter for `discover`; exactly one must be given.
+/// Filter for `discover`; at most one may be given. Without one, every card is listed.
 #[derive(Debug, Args)]
-#[command(group(ArgGroup::new("filter").required(true).multiple(false)))]
+#[command(group(ArgGroup::new("filter").required(false).multiple(false)))]
 pub struct DiscoverArgs {
     /// Exact agent id.
     #[arg(long, value_name = "ID", group = "filter")]

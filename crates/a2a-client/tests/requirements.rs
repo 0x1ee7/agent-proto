@@ -15,7 +15,8 @@ use a2a_client::{
 use a2a_core::approval::ALLOW_ONCE_ID;
 use a2a_core::envelope::{ReplyOptions, RequestBody};
 use a2a_core::subject::Op;
-use a2a_security::clock::Clock as SecurityClock;
+use a2a_security::card::sign_card;
+use a2a_security::clock::{Clock as SecurityClock, ManualClock};
 use a2a_security::decision::{
     ApprovalBook, DecisionOrigin, decision_from_json, request_digest, verify_decision,
 };
@@ -472,6 +473,108 @@ async fn req_0004_014_draining_agent_is_not_routable() {
         .query(&Query::Skill("echo".to_owned()), false)
         .expect("query");
     assert!(listed.is_empty(), "draining agents are not routed to");
+}
+
+/// Client with a pinned card trust store (or none).
+fn client_with_trust(
+    fx: &Fixture,
+    trust: Option<TrustStore>,
+) -> a2a_client::Client<common::Shared> {
+    a2a_client::Client::new(
+        common::Shared(fx.bus.clone()),
+        fx.clock.clone(),
+        a2a_client::Config {
+            trust: trust.map(Arc::new),
+            ..a2a_client::Config::default()
+        },
+        fx.tenant.clone(),
+        fx.client_id.clone(),
+    )
+    .expect("client")
+}
+
+fn worker_card_signer() -> Ed25519Signer {
+    Ed25519Signer::from_seed(&AgentId::parse("worker-a").expect("agent"), &[3; 32])
+}
+
+/// Trust store pinning the key `worker-a` signs its card with.
+fn card_trust_store() -> TrustStore {
+    let signer = worker_card_signer();
+    let body = format!(
+        "schema = \"a2abus.trust/1\"\n\
+         [[key]]\nkid = \"{}\"\nagent = \"worker-a\"\nrole = \"agent\"\ntenants = [\"{TENANT}\"]\npublic_key = \"{}\"\n",
+        signer.kid(),
+        encode_public_key(&signer.public_key()),
+    );
+    TrustStore::parse(&body).expect("trust loads")
+}
+
+async fn publish_ready(fx: &Fixture, card: &[u8]) {
+    fx.kv_put("cards", "worker-a", card).await;
+    fx.kv_put(
+        "presence",
+        "worker-a",
+        &presence_json("PRESENCE_STATE_READY"),
+    )
+    .await;
+}
+
+// [0007-053] [0003-042] Without a pinned trust store an unsigned card is listed, unverified.
+#[tokio::test]
+async fn req_0007_053_unsigned_card_is_listed_unverified_without_trust() {
+    let fx = Fixture::new();
+    publish_ready(&fx, &card_json("1.0.0")).await;
+    let client = client_with_trust(&fx, None);
+    let mut directory = Directory::new(&client);
+    directory.sync().await.expect("sync");
+    let listed = directory.all(false).expect("all");
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].card.verified());
+}
+
+// [0003-042] [0007-050] With a pinned trust store an unsigned card is not listed.
+#[tokio::test]
+async fn req_0003_042_unsigned_card_is_dropped_with_trust() {
+    let fx = Fixture::new();
+    publish_ready(&fx, &card_json("1.0.0")).await;
+    let client = client_with_trust(&fx, Some(card_trust_store()));
+    let mut directory = Directory::new(&client);
+    directory.sync().await.expect("sync");
+    assert!(directory.all(false).expect("all").is_empty());
+    assert!(
+        directory
+            .query(&Query::Skill("echo".to_owned()), true)
+            .expect("query")
+            .is_empty()
+    );
+}
+
+// [0007-053] With a pinned trust store a card with a valid signature is listed, verified.
+#[tokio::test]
+async fn req_0007_053_signed_card_is_listed_verified_with_trust() {
+    let fx = Fixture::new();
+    let trust = card_trust_store();
+    let mut card: serde_json::Value = serde_json::from_slice(&card_json("1.0.0")).expect("json");
+    sign_card(
+        &mut card,
+        &worker_card_signer(),
+        &trust,
+        &ManualClock::new(NOW_MS as i64),
+    )
+    .expect("signed");
+    publish_ready(&fx, &serde_json::to_vec(&card).expect("json")).await;
+    let client = client_with_trust(&fx, Some(trust));
+    let mut directory = Directory::new(&client);
+    directory.sync().await.expect("sync");
+    let listed = directory.all(false).expect("all");
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].card.verified());
+
+    // A change to a signed member invalidates the signature: the card is dropped.
+    card["name"] = json!("Worker B");
+    publish_ready(&fx, &serde_json::to_vec(&card).expect("json")).await;
+    directory.sync().await.expect("sync");
+    assert!(directory.all(false).expect("all").is_empty());
 }
 
 // [0008-094] historyLength passed to get_task_with_history reaches the worker unchanged.

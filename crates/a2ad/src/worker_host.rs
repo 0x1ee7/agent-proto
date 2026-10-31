@@ -770,8 +770,16 @@ async fn drive<B: Bus, D: Backend, S: task::TaskStore>(
         }
         step(worker).await?;
         reporter.publish(worker);
-        // Audit records reach the pipeline through the sink; the buffered notes are not needed.
-        let _ = worker.take_audit();
+        // Mapped notes also reach the pipeline through the sink; every note is logged with its
+        // text, so an operational failure (for example a reply that could not be written) shows
+        // its cause in the host log.
+        for note in worker.take_audit() {
+            tracing::warn!(
+                task = note.task_id.as_deref().unwrap_or(""),
+                reason = %note.reason,
+                "worker note"
+            );
+        }
         if last_flush.elapsed() >= FLUSH_EVERY {
             flush(pipeline)?;
             last_flush = Instant::now();

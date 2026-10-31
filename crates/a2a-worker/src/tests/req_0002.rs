@@ -1,11 +1,13 @@
 //! RFC-0002 approval wire shape: the request is an INPUT_REQUIRED event, the decision is a send.
 
 use super::*;
+use bus_api::bus::RequestStream;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
 
 use super::peer::text;
+use crate::rpc::{Response, plain};
 use a2a_client::{CallOptions, Client, Config as ClientConfig};
 use a2a_types::ids::TaskId;
 use a2a_types::vocab::ext::SEQUENCE;
@@ -190,5 +192,162 @@ fn req_0002_050_blocking_send_holds_reply_until_deadline() {
             other => panic!("unexpected payload {other:?}"),
         };
         assert_eq!(state(&task), pb::TaskState::Working as i32);
+    });
+}
+
+/// A `SendMessageRequest` body that is not `return_immediately`, as `SendStreamingMessage` carries it.
+fn stream_body(text: &str) -> RequestBody {
+    RequestBody::SendMessage(pb::SendMessageRequest {
+        tenant: TENANT.to_owned(),
+        message: Some(pb::Message {
+            message_id: MessageId::generate().as_str().to_owned(),
+            role: pb::Role::User as i32,
+            parts: vec![a2a_client::text(text)],
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// 0002-052: the `stream` reply is a `StreamResponse` whose first element is the Task, it is not
+/// held until the task settles, and it carries `A2AB-Last-Seq` that matches the Task's sequence.
+#[test]
+fn req_0002_052_stream_reply_is_first_stream_element_with_last_seq() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold, completed()]);
+        let reply = call(
+            bus,
+            REQUESTER,
+            Op::Stream,
+            stream_body("streamed"),
+            Vec::new(),
+        )
+        .await;
+        let first = envelope::decode_reply::<pb::StreamResponse>(&reply)
+            .expect("stream reply decodes as StreamResponse");
+        let Some(pb::stream_response::Payload::Task(task)) = first.payload else {
+            panic!("expected a Task as the first stream element, got {first:?}");
+        };
+        assert_eq!(state(&task), pb::TaskState::Working as i32);
+        let last_seq = a2a_core::headers::optional(&reply.headers, a2a_core::headers::LAST_SEQ)
+            .expect("stream reply carries A2AB-Last-Seq");
+        assert_eq!(
+            sequence_field(task.metadata.as_ref()),
+            Some(last_seq.parse::<u64>().unwrap()),
+            "Last-Seq matches the Task's sequence"
+        );
+    });
+}
+
+/// 0002-053: a client that sends with `stream` follows the task's events to the terminal one.
+/// This is the `a2a send --follow` path.
+#[test]
+fn req_0002_053_client_stream_follows_events_to_completion() {
+    let mut rig = rig();
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![Step::Hold, text("answer"), completed()]);
+        let client = Client::new(
+            bus.clone(),
+            Arc::new(VirtualClock(bus.control())),
+            ClientConfig::default(),
+            tenant(),
+            agent(REQUESTER),
+        )
+        .unwrap();
+        let outbound = a2a_client::Outbound::new(vec![a2a_client::text("follow")]);
+        let started = client
+            .stream(&agent(WORKER), &outbound, &CallOptions::default())
+            .await
+            .unwrap();
+        let a2a_client::StreamStart::Follow { task, mut events } = started else {
+            panic!("expected a followable stream");
+        };
+        assert_eq!(state(&task), pb::TaskState::Working as i32);
+
+        mock.release();
+        let last = loop {
+            let event = events
+                .next()
+                .await
+                .unwrap()
+                .expect("stream stays open until the terminal event");
+            if event.stream_end {
+                break event.response.payload;
+            }
+        };
+        let Some(pb::stream_response::Payload::StatusUpdate(update)) = last else {
+            panic!("the stream ends on a status update, got {last:?}");
+        };
+        assert_eq!(
+            update.status.as_ref().map(|s| s.state),
+            Some(pb::TaskState::Completed as i32)
+        );
+    });
+}
+
+/// A reply that cannot be written ends that one request, never the Worker: a body that is not
+/// the operation's reply type is answered with a failure, the error text is audited, and the
+/// Worker serves the next request.
+#[test]
+fn req_0002_040_unanswerable_request_does_not_stop_the_worker() {
+    let mut rig = rig();
+    let bus = rig.bus.clone();
+    let get = RequestBody::GetTask(pb::GetTaskRequest {
+        tenant: TENANT.to_owned(),
+        id: "t".to_owned(),
+        history_length: None,
+    });
+    let mut caller = pin!(call_ttl(&bus, REQUESTER, Op::Get, get, Vec::new(), TTL_MS));
+    assert!(poll_once(caller.as_mut()).is_pending());
+    let request = block_on(async {
+        loop {
+            let requests = rig.worker.requests.as_mut().expect("worker is serving");
+            let mut next = pin!(requests.next());
+            if let Poll::Ready(request) = poll_once(next.as_mut()) {
+                break request.unwrap();
+            }
+            yield_now().await;
+        }
+    });
+    let Ok(inbound) =
+        envelope::receive(&rig.worker.config.wire, rig.worker.clock.as_ref(), request)
+    else {
+        panic!("request is accepted");
+    };
+    // `GetTask` is answered with a Task; a SendMessageResponse cannot be its reply.
+    let wrong = plain(Response::Send(pb::SendMessageResponse::default()));
+    block_on(rig.worker.answer(inbound, Ok(wrong))).expect("an unanswerable request is not fatal");
+    let reply = block_on(async {
+        loop {
+            if let Poll::Ready(reply) = poll_once(caller.as_mut()) {
+                break reply;
+            }
+            yield_now().await;
+        }
+    });
+    assert!(
+        envelope::decode_reply::<pb::Task>(&reply).is_err(),
+        "the caller is answered with a failure"
+    );
+    let note = rig
+        .worker
+        .audit
+        .iter()
+        .find(|note| note.reason.starts_with("REPLY_FAILED"))
+        .expect("the failure is audited");
+    assert!(
+        note.reason.contains("does not match the operation"),
+        "the audit note carries the error text: {}",
+        note.reason
+    );
+
+    let (bus, mock) = (&rig.bus, &rig.mock);
+    drive(&mut rig.worker, async {
+        mock.enqueue(vec![completed()]);
+        let task = submit(bus, "after").await;
+        wait_for_state(bus, &task.id, pb::TaskState::Completed).await;
     });
 }

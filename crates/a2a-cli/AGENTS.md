@@ -42,6 +42,9 @@ Uses: `a2a-client` (requester runtime, signing hook), `a2a-audit` (chain verific
   the a2ad config. An operator whose a2ad config sets `[security] trust_file` must pass `--trust`
   with the same path, or `--config <a2ad.toml>`; otherwise the CLI signs with a key a2ad does not
   trust ([0007-020]).
+- Discovery pins the trust file only when it holds an `agent`-role key (`app::card_trust`). The M1
+  trust file lists the operator key only, so cards are listed and shown `unverified`; once an agent
+  key is trusted, unsigned or wrongly signed cards are dropped ([0003-042], [0007-050], [0007-053]).
 - The crate never reads or names provider API keys ([0012-058]).
 - Color is ANSI only on a terminal, with `NO_COLOR` unset. There is no color flag ([0012-059]).
 - Audit verification exits 0 on a clean chain and 1 on the first broken line, naming that line
