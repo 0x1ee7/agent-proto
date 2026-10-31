@@ -134,7 +134,7 @@ impl Workspace {
         let _mutex = RootLock::acquire(&self.root.join(MUTEX_FILE))?;
         let sweep = self.sweep_locks()?;
         if let Some(live) = sweep.live.iter().find(|live| live.lock == lock) {
-            return reuse(live, &source_root, kind);
+            return reuse(live, &source_root, kind, key.canonical());
         }
         if platform::overlaps(&path, &source_root) {
             return Err(WorkspaceError::new(
@@ -532,7 +532,19 @@ impl Workspace {
     }
 }
 
-fn reuse(live: &LiveLease, source_root: &Path, kind: LeaseKind) -> Result<Lease> {
+/// Reuses a live lease. The directory name is the 48-bit short key, so two canonical keys can
+/// map to one directory (a UUIDv7 short key is its millisecond timestamp). The lease is shared
+/// only when the canonical key is equal; a different canonical key is refused.
+fn reuse(live: &LiveLease, source_root: &Path, kind: LeaseKind, canonical: &str) -> Result<Lease> {
+    if live.lease.key != canonical {
+        return Err(WorkspaceError::new(
+            ErrorKind::SharedCheckout,
+            format!(
+                "short id {} is leased for a different session or task key",
+                live.lease.short_id
+            ),
+        ));
+    }
     if !live.owner.is_self() {
         return Err(WorkspaceError::new(
             ErrorKind::SharedCheckout,

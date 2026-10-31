@@ -24,6 +24,10 @@ Uses: `globset` (copy exclusion patterns), `sha2` (artifact digest), `sysinfo` (
 - Copy mode never stages or copies git-ignored files; `git add` never uses `-f`.
 - Copy mode never copies entries matched by the built-in denylist or by `copy_exclude`. Only the
   count is kept (`excluded_count`); names are never recorded.
+- The directory and branch name is the 48-bit short key. A live lease is reused only when the
+  canonical key is equal; a different canonical key with the same short key is refused with
+  `shared_checkout` and never shares the workspace (a UUIDv7 short key is its millisecond
+  timestamp, so two keys created in one millisecond collide).
 
 ## Requirements guarded by tests
 
@@ -48,3 +52,5 @@ Uses: `globset` (copy exclusion patterns), `sha2` (artifact digest), `sysinfo` (
   hardening), `req_0012_041_*` (default patch cap), `req_0012_021_*` (pid and start-time owner
   liveness), `req_0012_074_*` (exclusion matching, case-insensitive, `copy_exclude` validation).
 - Requirement IDs `req_0012_033_*` (serialization) are the worker's job and are not guarded here.
+- `tests/key_collision.rs`: `req_0012_031_*` (short-key collision refused, original holder
+  unaffected).
