@@ -20,6 +20,46 @@ On one host it runs as a set of processes started by the supervisor `a2ad`:
 
 A typical flow: the operator sends a task to omp; omp's model asks to call Claude; the worker raises an approval; after approval the child task runs on Claude through the bus; Claude's result returns to omp wrapped as untrusted tool output; omp completes and the operator gets the reply artifact.
 
+## Verification loop
+
+Every piece of agent work passes through the same checks at runtime, whether the operator started it or another agent delegated it. The checks are done by the worker, the security layer and the supervisor, not by the agents. An agent cannot skip them. Requirement IDs point to the RFC rule; each has tests named after it.
+
+```mermaid
+flowchart TD
+  A[Task arrives] --> B{Admission: origin, budget, loop guard}
+  B -- refused --> F[FAILED with reason]
+  B --> C[Agent turn in its own workspace]
+  C --> T{Tool call: tier}
+  T -- read --> C
+  T -- write, exec, delete, peer call --> P[Approval card: INPUT_REQUIRED]
+  P -- allow --> C
+  P -- deny --> C
+  P -- expires --> F
+  C -- peer call approved --> D[Child task: carved budget, same loop]
+  D -- result framed as untrusted --> C
+  D -- child failed --> F
+  C --> W[Terminal: diff.patch and workspace-summary]
+  W --> R[Operator reviews artifacts]
+  F --> L[Audit record, hash-chained]
+  W --> L
+```
+
+1. **Admission.** A task without a budget gets a root allowance from the agent's configuration: wall time, hops, depth and number of children; tokens and cost are unlimited by default (0006-031). A delegated task whose (agent, fingerprint) pair is already in the chain, or whose receiving agent is already in it, is created FAILED with `LOOP_DETECTED` and no backend starts (0006-045, 0006-059). A circuit breaker stops repeated failures from one origin (0006-048).
+2. **Tool tiers.** Every tool call gets exactly one tier: `read`, `write`, `exec` or `delete_or_move` (0006-002). Unknown tools count as `exec`. The drivers relay every ACP permission request and never answer one themselves (0009-088); omp always runs in `always-ask-cached` mode (0006-025).
+3. **Approval.** A gated call turns the task `INPUT_REQUIRED` with an approval card naming the tool, tier and summary. Only the operator identities `cli` and `tui` can decide (0006-014). The worker checks origin, open state, nonce, chosen option and digest, in that order (0006-013), and each decision is single-use (0006-015). Allow-always is never offered for `exec` or `delete_or_move` (0006-010). If nobody decides within 300 s the request expires, the backend is stopped, and the task fails with `APPROVAL_TIMEOUT` (0006-017); the next task starts a fresh backend.
+4. **Delegation.** An agent calls a peer through the `a2abus-mcp-shim` tool, which is itself a gated tool call. The child task gets a budget carved from the parent's and runs through this same loop on the peer's worker (0006-033). While the child waits for an approval, the parent stays `WORKING` (0015-065). The parent cannot complete while a child is still running (0015-067), and a failed child fails the parent with `CHILD_FAILED` (0015-070). Child sends are journaled and resent after a crash (0015-062); unanswered resends are retried and then abandoned with an audit note (0015-117).
+5. **Untrusted output.** Peer replies, tool output and anything else not from the operator are wrapped in `A2ABUS-UNTRUSTED` markers with their trust class and origin before a model sees them (0007-124). Secrets are redacted before output is hashed, spooled or published (0013-022).
+6. **Workspace review.** Each agent works in its own `git worktree`, never the operator's checkout (0012-031). When a mutating task ends, the worker writes `diff.patch` (the binary diff against the base commit plus untracked files) and attaches a `workspace-summary` artifact with files changed, insertions, deletions and the patch's SHA-256 (0012-040, 0012-042). Clean workspaces are removed and dirty ones are kept for review (0012-035).
+7. **Observation.** Every task event carries a contiguous sequence number assigned by the worker. Replies carry `A2AB-Last-Seq` (0002-051), so `a2a watch`, `a2a send --follow` and the console can resume without gaps.
+8. **Audit.** Every event is recorded and hash-chained per emitter (0013-026); the supervisor writes signed checkpoints hourly and at shutdown (0013-027). `a2a audit verify <file>` recomputes the chain and checkpoints, reports the first broken line, and exits 0 only when the file verifies (0013-028).
+
+Not yet in Milestone 1:
+- **Audit sink consumer.** Records reach the bus and the per-agent spool, but nothing writes the sink files yet, so `a2a audit verify` has no sink data to check on a live stack.
+- **Signing.** Approval decisions and agent cards are unsigned by default (0012-043). Decisions arriving over the bus are accepted unsigned. Verification happens only when signing is turned on, and a2ad has no configuration to turn it on.
+- **Readiness gating.** `/readyz` reports each agent's state in its body but does not gate on it (0013-036).
+
+The demo stack shows the whole loop with no credentials. `send omp "WRITE_FILE" --wait` raises an approval card. `send omp "A2A_SEND:claude:review README.txt" --wait` sends a gated peer call, after which Claude's reply comes back framed as untrusted. See [Demo stack](DEV.md#demo-stack-two-agents-no-credentials).
+
 ## Layout
 
 | Path | Contents |
@@ -34,9 +74,9 @@ A typical flow: the operator sends a task to omp; omp's model asks to call Claud
 | `spikes/` | Reproducible spike scripts, probes and stub model servers |
 | `deploy/compose/` | Supervisor configs and profiles for the Docker stacks |
 
-## Verification loop
+## Development checks
 
-The repository is spec-first, so verification runs from the RFC requirement down to a live run. A change is done when every layer below that it touches passes.
+This is how changes to this repository are checked, as opposed to the runtime checks on agent work described under [Verification loop](#verification-loop). The repository is spec-first, so checks run from the RFC requirement down to a live run. A change is done when every layer below that it touches passes.
 
 ```mermaid
 flowchart LR
